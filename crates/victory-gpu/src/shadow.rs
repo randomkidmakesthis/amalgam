@@ -3222,6 +3222,12 @@ impl Shadow {
         // inside this one with a copy of its own, a texture in it) is not
         // told: the card's writes are not seen by write watching.
         if self.place.is_some() {
+            // (VICTORY_INPLACE_TEXTURES) ... unless it is: a placed texture
+            // over these bytes keeps its copy, and the card wrote title memory
+            // under it. The page-written pass two frames on makes it due again,
+            // as it does for DirectStorage's own writes (`page_written`).
+            let n = len.min(self.left(address));
+            crate::descriptor::host::page_written(address as usize, n as usize);
             return;
         }
         // Write-combined title memory, which the title's CPU does not read

@@ -36,6 +36,10 @@ param(
     [switch]$FrameGen,
     [ValidateRange(1, 1000)][int]$Fps = 0,
     [ValidateSet('off', 'small', 'buffers', 'both')][string]$OneHome = 'off',
+    # With -OneHome: place windows that descriptor slots show as texture memory
+    # too. Their placed copies are made due again after the card writes the
+    # home (the reference's after-wait rule), two frames on.
+    [switch]$OneHomeTextures,
     [ValidateRange(1, 64)][int]$JoinParts = 8,
     [ValidateRange(0, 1000)][int]$StageMs = 16,
     [ValidateRange(0, 64)][int]$InPlaceMb = 4096,
@@ -120,6 +124,10 @@ switch ($OneHome) {
         $settings.VICTORY_INPLACE = '2'; $settings.VICTORY_INPLACE_MB = "$InPlaceMb"
         $settings.VICTORY_WC_BAR = '1'; $settings.VICTORY_WINDOWS_BAR_MB = '2048'
     }
+}
+if ($OneHomeTextures -and $OneHome -ne 'off') {
+    $settings.VICTORY_INPLACE_TEXTURES = '1'
+    Write-Host 'one-home: texture windows placed too (placed copies re-uploaded after card writes)'
 }
 if ($OneHome -ne 'off' -and -not $More.ContainsKey('VICTORY_RELAY')) {
     # shadow::relay() is on by default: 0 turns it off, removing it would not.
