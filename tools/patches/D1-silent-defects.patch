@@ -1,0 +1,1580 @@
+diff -ruN '--exclude=target' '--exclude=bin-counters' '--exclude=bin-fixes' '--exclude=*.log' D1base/crates/victory-gpu/src/descriptor/host.rs D1/crates/victory-gpu/src/descriptor/host.rs
+--- D1base/crates/victory-gpu/src/descriptor/host.rs	2026-11-26 09:15:13.065355900 +0200
++++ D1/crates/victory-gpu/src/descriptor/host.rs	2026-11-26 09:46:14.377551400 +0200
+@@ -912,6 +912,35 @@
+     })
+ }
+ 
++/// (D1, cool_fox f4b48ad, `VICTORY_D16_VIEW_KINDS`) The format-kind bits of a typed buffer
++/// view's slot word in the strides table ([`victory_shader::emit::VIEW_INTEGER`],
++/// `VIEW_SIGNED`): 0 for float, normalised, raw and structured views, and for anything
++/// that is not a buffer view.
++pub(crate) fn view_kind_bits(view: &View) -> u32 {
++    let Some((_, _, _, stride, _, raw, _)) = buffer_fields(view) else {
++        return 0;
++    };
++    let words: &[u32] = match view {
++        View::Shader(_, Some(d)) | View::Unordered(_, _, Some(d)) => &d[..],
++        View::Placed(_, _, d) => &d[..10],
++        _ => return 0,
++    };
++    if stride != 0 || raw {
++        return 0;
++    }
++    integer_kind(words[0])
++}
++
++/// The kind bits of DXGI format `format`: unsigned or signed integer, or 0.
++fn integer_kind(format: u32) -> u32 {
++    use victory_shader::emit::{VIEW_INTEGER, VIEW_SIGNED};
++    match format {
++        3 | 7 | 12 | 17 | 25 | 30 | 36 | 42 | 50 | 57 | 62 => VIEW_INTEGER,
++        4 | 8 | 14 | 18 | 32 | 38 | 43 | 52 | 59 | 64 => VIEW_INTEGER | VIEW_SIGNED,
++        _ => 0,
++    }
++}
++
+ /// Host heaps' GPU ranges (start, bytes, bytes per slot, sampler), for
+ /// device-removed reports: a shader indexing a heap past its end faults.
+ static GPU_RANGES: Mutex<Vec<(u64, u64, u64, bool)>> = Mutex::new(Vec::new());
+@@ -2061,9 +2090,11 @@
+         if let Some((_, _, data)) = &self.strides
+             && index < victory_shader::emit::SLOT_STRIDES_COUNT
+         {
++            // (D1, `VICTORY_D16_VIEW_KINDS`) With the format kind in the top two bits.
++            let kind = if victory_shader::emit::d16_view_kinds() { view.map_or(0, view_kind_bits) } else { 0 };
+             // SAFETY: inside the mapping; shaders read it while we write (a
+             // dword, either value is one the slot had).
+-            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0)) };
++            unsafe { (*data as *mut u32).add(index as usize).write_volatile(stride.unwrap_or(0) | kind) };
+         }
+         // The set is written only here: with its flag set a slot is in it,
+         // and the lock is taken only to put one in or take one out.
+@@ -2123,15 +2154,34 @@
+         if kept.is_none() {
+             null_for(view, self.cpu(index));
+         }
++        self.write_stride(index, view_stride(view).unwrap_or(0) | view_kind_bits(view));
+         self.keep(index, kept.flatten());
+     }
+ 
++    /// (D1, cool_fox f4b48ad / H3-6, `VICTORY_D16_VIEW_KINDS`) The strides table's word for
++    /// DYNAMIC slot `index` (stride and format kind): a shader reading a table copied there
++    /// looks its views' kinds up by host slot (`victory_shader::emit::SLOT_TABLE_STRIDES`).
++    /// Title slots are written where their views are noted ([`HostHeap::note_buffer`]).
++    /// A dynamic slot is the list's alone until its submission has run.
++    pub(crate) fn write_stride(&self, index: u32, word: u32) {
++        if !victory_shader::emit::d16_view_kinds() || index < self.count {
++            return;
++        }
++        if let Some((_, _, data)) = &self.strides
++            && index < victory_shader::emit::SLOT_STRIDES_COUNT
++        {
++            // SAFETY: inside the mapping (`SLOT_STRIDES_COUNT` dwords); one aligned dword.
++            unsafe { (*data as *mut u32).add(index as usize).write_volatile(word) };
++        }
++    }
++
+     /// Makes slot `index` read nothing: a null view, or a plain sampler.
+     pub(crate) fn make_null(&self, index: u32) {
+         if self.sampler {
+             self.null_sampler(index);
+         } else {
+             null_view(self.cpu(index));
++            self.write_stride(index, 0);
+         }
+         self.keep(index, None);
+     }
+@@ -2202,6 +2252,7 @@
+             host.device
+                 .CreateShaderResourceView(buffer, Some(&desc), self.cpu(index))
+         };
++        self.write_stride(index, 1);
+         self.keep(index, Some(buffer.clone()));
+     }
+ 
+@@ -2209,6 +2260,7 @@
+     /// zeros.
+     pub(crate) fn null_raw_at(&self, index: u32) {
+         null_buffer_view(self.cpu(index));
++        self.write_stride(index, 1);
+         self.keep(index, None);
+     }
+ 
+@@ -2241,12 +2293,14 @@
+                 self.cpu(index),
+             )
+         };
++        self.write_stride(index, 1);
+         self.keep(index, Some(buffer.clone()));
+     }
+ 
+     /// Makes slot `index` (a dynamic one) a raw unordered access view of
+     /// nothing: reads give zeros, writes are dropped.
+     pub(crate) fn null_raw_uav_at(&self, index: u32) {
++        self.write_stride(index, 1);
+         self.keep(index, None);
+         let Some(host) = host() else { return };
+         let desc = D3D12_UNORDERED_ACCESS_VIEW_DESC {
+@@ -2283,6 +2337,7 @@
+     /// Makes slot `index` (a dynamic one) a constant buffer view of host
+     /// memory (the list's own, which it holds).
+     pub(crate) fn constant_at(&self, index: u32, gpu: u64, size: u32) {
++        self.write_stride(index, 0);
+         self.keep(index, None);
+         let Some(host) = host() else { return };
+         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+@@ -3569,6 +3624,15 @@
+         once!(view, own, "view format of another family");
+         return false;
+     }
++    // (D1) Counted: a view whose sRGB conversion the texture's format changes, and sRGB
++    // views made as such on a typeless copy (`VICTORY_SRGB_VIEWS`).
++    if !unordered {
++        if !typeless && crate::silent::srgb_differs(view, own) {
++            crate::silent::add(crate::silent::k::SRGB_LOST, 1);
++        } else if typeless && crate::silent::SRGB_PAIRS.iter().any(|&(_, s)| s == view) {
++            crate::silent::add(crate::silent::k::SRGB_KEPT, 1);
++        }
++    }
+     if let Some(format) = format
+         && !typeless
+     {
+@@ -3577,6 +3641,53 @@
+     true
+ }
+ 
++/// (D1, `VICTORY_SRGB_VIEWS`) The shader view the host makes of `texture` when given no
++/// description (all levels and slices, the resource's own dimension), in `format`: for
++/// a typeless host copy, which takes no view without a format.
++fn whole_srv(texture: &ID3D12Resource, format: u32) -> Option<D3D12_SHADER_RESOURCE_VIEW_DESC> {
++    // SAFETY: a live resource.
++    let d = unsafe { texture.GetDesc() };
++    let layers = u32::from(d.DepthOrArraySize);
++    let mut view = D3D12_SHADER_RESOURCE_VIEW_DESC {
++        Format: DXGI_FORMAT(format as i32),
++        Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
++        ..Default::default()
++    };
++    match (d.Dimension, layers > 1, d.SampleDesc.Count > 1) {
++        (D3D12_RESOURCE_DIMENSION_TEXTURE1D, false, _) => {
++            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1D;
++            view.Anonymous.Texture1D = D3D12_TEX1D_SRV { MipLevels: u32::MAX, ..Default::default() };
++        }
++        (D3D12_RESOURCE_DIMENSION_TEXTURE1D, true, _) => {
++            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE1DARRAY;
++            view.Anonymous.Texture1DArray =
++                D3D12_TEX1D_ARRAY_SRV { MipLevels: u32::MAX, ArraySize: layers, ..Default::default() };
++        }
++        (D3D12_RESOURCE_DIMENSION_TEXTURE2D, false, false) => {
++            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++            view.Anonymous.Texture2D = D3D12_TEX2D_SRV { MipLevels: u32::MAX, ..Default::default() };
++        }
++        (D3D12_RESOURCE_DIMENSION_TEXTURE2D, true, false) => {
++            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
++            view.Anonymous.Texture2DArray =
++                D3D12_TEX2D_ARRAY_SRV { MipLevels: u32::MAX, ArraySize: layers, ..Default::default() };
++        }
++        (D3D12_RESOURCE_DIMENSION_TEXTURE2D, false, true) => {
++            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMS;
++        }
++        (D3D12_RESOURCE_DIMENSION_TEXTURE2D, true, true) => {
++            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DMSARRAY;
++            view.Anonymous.Texture2DMSArray = D3D12_TEX2DMS_ARRAY_SRV { ArraySize: layers, ..Default::default() };
++        }
++        (D3D12_RESOURCE_DIMENSION_TEXTURE3D, ..) => {
++            view.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE3D;
++            view.Anonymous.Texture3D = D3D12_TEX3D_SRV { MipLevels: u32::MAX, ..Default::default() };
++        }
++        _ => return None,
++    }
++    Some(view)
++}
++
+ /// The title's unordered access view of a depth texture, as a view of the
+ /// texture's colour twin `twin` ([`crate::resource::Twin`]): the same mip
+ /// and slices, in the colour format of the twin's family for a depth or
+@@ -3654,10 +3765,30 @@
+             let shadow = crate::shadow::find(address, u64::from(size))?;
+             let gpu = shadow.gpu(address);
+             if gpu % 256 != 0 {
++                crate::silent::add(crate::silent::k::CBV_UNALIGNED, 1);
+                 once!(
+                     address = format_args!("{address:#x}"),
+                     "constant buffer not 256-byte aligned on the host"
+                 );
++                // (D1, `VICTORY_CBV_OWN_COPY`) On a copy of its own bytes, which starts on
++                // 256 (`crate::shadow::exact`), filled from title memory now.
++                // shortcut: filled when the slot is made, not per list: bytes the title
++                // changes later without writing the slot again are not seen.
++                if crate::silent::cbv_own_copy()
++                    && let Some(own) = crate::shadow::exact(address, u64::from(size))
++                    && own.gpu(address) % 256 == 0
++                {
++                    own.fill_now();
++                    let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
++                        BufferLocation: own.gpu(address),
++                        SizeInBytes: cbv_size(size),
++                    };
++                    // SAFETY: a slot of our heap; the copy holds `cbv_size` bytes (made in
++                    // whole 256-byte steps).
++                    unsafe { device.CreateConstantBufferView(Some(&desc), at) };
++                    crate::silent::add(crate::silent::k::CBV_OWN, 1);
++                    return Some(Some(own.buffer.clone()));
++                }
+                 return None;
+             }
+             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
+@@ -3696,6 +3827,18 @@
+                     }
+                 }
+                 let mut desc = desc.as_ref().map(srv_desc);
++                // (D1, `VICTORY_SRGB_VIEWS`) A typeless host copy of a texture the title made
++                // typed: a view without a format (or without a description) in the title's.
++                if crate::silent::srgb_views()
++                    && let Some(own) = crate::resource::view_format(resource)
++                    && crate::silent::srgb_typeless(own).is_some()
++                {
++                    match desc.as_mut() {
++                        Some(d) if d.Format.0 == 0 => d.Format = DXGI_FORMAT(own as i32),
++                        Some(_) => {}
++                        None => desc = whole_srv(texture, own),
++                    }
++                }
+                 if let Some(d) = desc.as_mut() {
+                     shift_view_levels(crate::resource::dropped(resource), d);
+                 }
+@@ -3830,9 +3973,25 @@
+             }
+             const BUFFER: u32 = 1;
+             if resource[0] != BUFFER {
+-                // shortcut: unordered access to a texture the title placed
+-                // itself is not mirrored; give it a resource as shader
+-                // views of such textures get when a dispatch writes one.
++                // (D1, `VICTORY_PLACED_UAV`) Unordered access to a texture the title
++                // placed itself: on the resource made for that memory, the one its shader
++                // views read ([`placed_texture`]), so what shaders store there is what
++                // later reads find. (Off: not mirrored, the stores went nowhere.)
++                let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
++                // Address 0: the title's null view (run 98: every one of them, BC formats
++                // a UAV cannot have, flags without unordered access): null, as on the
++                // console.
++                if address == 0 {
++                    crate::silent::add(crate::silent::k::PLACED_UAV_ZERO, 1);
++                    return None;
++                }
++                let made = placed_unordered_texture(view).and_then(|view| make(&view, at));
++                crate::silent::placed_uav_seen(address, resource, made.is_some());
++                if made.is_some() {
++                    crate::silent::add(crate::silent::k::PLACED_UAV_MADE, 1);
++                    return made;
++                }
++                crate::silent::add(crate::silent::k::PLACED_UAV_NULL, 1);
+                 once!(dimension = resource[0], "placed unordered texture view not mirrored");
+                 return None;
+             }
+@@ -4013,6 +4172,26 @@
+     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
+ }
+ 
++/// (D1, `VICTORY_PLACED_UAV`) An unordered access view of a texture the title placed in
++/// memory itself, as a view of the resource made for that memory: the same resource
++/// [`placed_texture`] gives its shader views (`crate::resource::texture_at`, keyed by
++/// address and description). `None` with the switch off and for buffers.
++pub(crate) fn placed_unordered_texture(view: &View) -> Option<View> {
++    const BUFFER: u32 = 1;
++    let View::Placed(true, resource, desc) = view else {
++        return None;
++    };
++    // Word 12: the resource flags; without the unordered access one (4) the host copy has
++    // none either (it is filled from title memory), and the view stays null.
++    const UNORDERED: u32 = 4;
++    if resource[0] == BUFFER || resource[12] & UNORDERED == 0 || !crate::silent::placed_uav() {
++        return None;
++    }
++    let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
++    let texture = crate::resource::texture_at(address, resource)?;
++    Some(View::Unordered(texture as usize, 0, desc[..10].try_into().ok()))
++}
++
+ /// A null view of the kind `view` is, for a slot whose view the host
+ /// cannot make: unordered access (to a buffer or a 2D texture) or a shader
+ /// view. Writes to it are dropped, reads give zeros.
+diff -ruN '--exclude=target' '--exclude=bin-counters' '--exclude=bin-fixes' '--exclude=*.log' D1base/crates/victory-gpu/src/draw/probe.rs D1/crates/victory-gpu/src/draw/probe.rs
+--- D1base/crates/victory-gpu/src/draw/probe.rs	2026-11-25 22:08:29.629172400 +0200
++++ D1/crates/victory-gpu/src/draw/probe.rs	2026-11-26 09:46:56.838631100 +0200
+@@ -628,6 +628,7 @@
+     let ours = [
+         victory_shader::emit::SLOT_MEMORY,
+         victory_shader::emit::SLOT_STRIDES,
++        victory_shader::emit::SLOT_TABLE_STRIDES,
+         victory_shader::emit::SLOT_HEAP_MARKS,
+         victory_shader::emit::SLOT_FAULTS,
+     ];
+diff -ruN '--exclude=target' '--exclude=bin-counters' '--exclude=bin-fixes' '--exclude=*.log' D1base/crates/victory-gpu/src/draw.rs D1/crates/victory-gpu/src/draw.rs
+--- D1base/crates/victory-gpu/src/draw.rs	2026-11-26 09:15:29.126881900 +0200
++++ D1/crates/victory-gpu/src/draw.rs	2026-11-26 09:46:42.280216100 +0200
+@@ -1834,6 +1834,12 @@
+             // Its geometry stage would turn each triangle into a rectangle.
+             once!("a rectangle pipeline drawn with another topology");
+         }
++        // (D1, `VICTORY_DEPTH_TWIN_SYNC`) The depth plane this draw uses, given what this
++        // list's shaders wrote into its twin before anything of the draw is set: the pass
++        // that does it sets state of its own, so the title's is set again after it.
++        if self.depth != 0 && crate::silent::depth_twin_sync() && list.plane_now(self.depth as This) {
++            self.replay(list);
++        }
+         if !self.bind(list, p, false) {
+             return false;
+         }
+@@ -2089,6 +2095,24 @@
+                         }
+                         continue;
+                     }
++                    // (D1, T2) The same table for the kinds of a shader's table views:
++                    // bound without the whole-heap pass.
++                    if srv && slot == victory_shader::emit::SLOT_TABLE_STRIDES {
++                        match self.heap_strides(list) {
++                            Some(gpu) if self.issued.root(list, compute, param, Given::View(GIVEN_SRV, gpu), F_VIEWS) => {}
++                            // SAFETY: an open list; the table lives as long as the heap the
++                            // list holds (and the list keeps its buffer).
++                            Some(gpu) => unsafe {
++                                if compute {
++                                    l.SetComputeRootShaderResourceView(param, gpu);
++                                } else {
++                                    l.SetGraphicsRootShaderResourceView(param, gpu);
++                                }
++                            },
++                            None => once!("a shader looks up its table views' kinds with no view heap set"),
++                        }
++                        continue;
++                    }
+                     if srv && slot == victory_shader::emit::SLOT_STRIDES {
+                         // Ours, not the title's: the shader picks buffers
+                         // from the view heap by an index it computes.
+@@ -2447,6 +2471,26 @@
+     /// `VICTORY_HEAP_MARKS=0` it stays in the host copy).
+     /// A list refreshes them where it first runs such a shader;
+     /// title writes recorded later in the same list are not seen.
++    /// (D1, T2) The strides table's address for [`victory_shader::emit::SLOT_TABLE_STRIDES`],
++    /// the buffer kept by the list; no pass over the heap.
++    fn heap_strides(&self, list: &HostList) -> Option<u64> {
++        let heap = self
++            .heaps
++            .iter()
++            .filter(|&&h| h != 0)
++            .map(|&h| crate::descriptor::heap(h as This))
++            .find(|h| !h.samplers())?;
++        let host = heap.host()?;
++        let gpu = host.strides_gpu()?;
++        const ONCE: usize = usize::MAX - 0x5d;
++        if list.first_use(ONCE)
++            && let Some(buffer) = host.strides_buffer()
++        {
++            list.keep(buffer);
++        }
++        Some(gpu)
++    }
++
+     fn heap_buffers(&self, list: &HostList) -> Option<u64> {
+         let heap = self
+             .heaps
+@@ -3320,6 +3364,10 @@
+         }
+         #[cfg(feature = "diagnostics")]
+         probe::after(probed, list);
++        // (D1, `VICTORY_DISPATCH_SIZES=1`) Thread groups of the named heavy programs.
++        if crate::silent::dispatch_sizes() {
++            crate::silent::dispatch_size(self.pipeline, &p.name, [x, y, z]);
++        }
+         crate::readback::terrain::dispatch_end(shape, "");
+         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+     }
+@@ -4375,6 +4423,18 @@
+             ));
+             return false;
+         }
++        // (D1, `VICTORY_DISPATCH_SIZES=1`) The named heavy programs' indirect dispatches:
++        // the first record's groups as title memory holds them now (the card may write it
++        // before it runs).
++        if kind == DISPATCH && crate::silent::dispatch_sizes() {
++            let mut words = [0u8; 12];
++            let read = crate::host::read_into(arguments as *const u8, &mut words);
++            let groups = read.then(|| {
++                let w = |k: usize| u32::from_le_bytes([words[4 * k], words[4 * k + 1], words[4 * k + 2], words[4 * k + 3]]);
++                [w(0), w(1), w(2)]
++            });
++            crate::silent::dispatch_size_indirect(self.pipeline, &p.name, groups, max, count.is_some());
++        }
+         let len = u64::from(stride) * u64::from(max.max(1));
+         let Some(args) = crate::shadow::find_any(arguments, len) else {
+             why("arguments outside title buffers");
+@@ -5072,7 +5132,19 @@
+ /// diagnostics of views refused or given their own bytes.
+ fn readable(list: &HostList, kind: ResourceType, view: &View, record: u64) {
+     const UNORDERED_ACCESS: u32 = 0x8;
+-    let placed = crate::descriptor::host::placed_texture(view);
++    // (D1) Unordered views of textures the title placed in memory: counted, and with
++    // `VICTORY_PLACED_UAV` the resource made for that memory, brought to the unordered
++    // access state as any other texture's below.
++    let mut placed = crate::descriptor::host::placed_texture(view);
++    if let View::Placed(true, resource, desc) = view
++        && resource[0] != 1
++    {
++        crate::silent::add(crate::silent::k::PLACED_UAV_BINDS, 1);
++        let unordered = crate::descriptor::host::placed_unordered_texture(view);
++        let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
++        crate::silent::placed_uav_seen(address, resource, unordered.is_some());
++        placed = unordered;
++    }
+     // (F11) The texture views draws bind, meter only.
+     #[cfg(feature = "diagnostics")]
+     if kind == ResourceType::Srv {
+diff -ruN '--exclude=target' '--exclude=bin-counters' '--exclude=bin-fixes' '--exclude=*.log' D1base/crates/victory-gpu/src/host.rs D1/crates/victory-gpu/src/host.rs
+--- D1base/crates/victory-gpu/src/host.rs	2026-11-26 09:19:15.250794600 +0200
++++ D1/crates/victory-gpu/src/host.rs	2026-11-26 09:27:56.218201100 +0200
+@@ -8324,6 +8324,7 @@
+         if copy && !colour && twin.plane.is_some() {
+             u.late = true;
+             crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
++            crate::silent::add(crate::silent::k::DEPTH_LATE, 1);
+         }
+         drop(twins);
+         // (Neptune) Anything but a read with nothing to bring over changes what a later
+@@ -8343,6 +8344,40 @@
+         true
+     }
+ 
++    /// (D1, `VICTORY_DEPTH_TWIN_SYNC`) Before a draw that uses depth texture `resource` as
++    /// its depth target: if this list's shaders wrote its depth plane's twin since the
++    /// plane was last given what they wrote, the twin is copied and drawn into the plane
++    /// now, as [`HostList::twins_to_depth`] does when the list closes. True if the pass was
++    /// recorded: it set the list's descriptor heaps, graphics root signature, pipeline,
++    /// targets, viewport, scissor and topology, which the caller sets again before the
++    /// title's draw (`draw.rs` `State::replay`).
++    pub(crate) fn plane_now(&self, resource: crate::object::This) -> bool {
++        let Some(twin) = crate::resource::twin(resource) else {
++            return false;
++        };
++        if twin.plane.is_none() {
++            return false;
++        }
++        let Some(depth) = crate::resource::host_copy(resource) else {
++            return false;
++        };
++        {
++            let mut twins = self.twins.lock().unwrap_or_else(|e| e.into_inner());
++            let Some(u) = twins.get_mut(&(std::sync::Arc::as_ptr(&twin) as usize)) else {
++                return false;
++            };
++            if u.behind[0] != Some(true) {
++                return false;
++            }
++            u.behind[0] = Some(false);
++        }
++        self.changes.fetch_add(1, Ordering::Relaxed);
++        self.twin_copy(&depth, &twin, false);
++        self.pass_plane(&depth, &twin);
++        crate::silent::add(crate::silent::k::DEPTH_SYNCED, 1);
++        true
++    }
++
+     /// Records the pass that draws the twin of the depth plane of `depth`
+     /// into the plane, if `twin` has one, with the moves to the states the
+     /// pass needs; the twin is left in the unordered access state. Only
+@@ -10794,6 +10829,8 @@
+                 placed = crate::descriptor::host::PLACED_TEXTURE_SLOTS.load(Ordering::Relaxed),
+                 objects = crate::descriptor::host::OBJECT_TEXTURE_SLOTS.load(Ordering::Relaxed)
+             );
++            // (D1) Silent defects, per frame (always on).
++            crate::silent::line(frames);
+             #[cfg(feature = "diagnostics")]
+             crate::copystat::log(std::mem::take(&mut self.copy_stats_frames) as f64);
+             // Which shaders and pipelines the dropped draws are for, most
+diff -ruN '--exclude=target' '--exclude=bin-counters' '--exclude=bin-fixes' '--exclude=*.log' D1base/crates/victory-gpu/src/lib.rs D1/crates/victory-gpu/src/lib.rs
+--- D1base/crates/victory-gpu/src/lib.rs	2026-11-26 09:10:51.372401300 +0200
++++ D1/crates/victory-gpu/src/lib.rs	2026-11-26 09:27:39.446130400 +0200
+@@ -87,6 +87,8 @@
+ #[cfg(windows)]
+ mod sampler;
+ #[cfg(windows)]
++mod silent;
++#[cfg(windows)]
+ pub mod shader_cache;
+ #[cfg(windows)]
+ mod memory;
+diff -ruN '--exclude=target' '--exclude=bin-counters' '--exclude=bin-fixes' '--exclude=*.log' D1base/crates/victory-gpu/src/pipeline/host.rs D1/crates/victory-gpu/src/pipeline/host.rs
+--- D1base/crates/victory-gpu/src/pipeline/host.rs	2026-11-26 08:40:32.398944700 +0200
++++ D1/crates/victory-gpu/src/pipeline/host.rs	2026-11-26 09:46:42.278151500 +0200
+@@ -574,6 +574,7 @@
+                             || slot == victory_shader::emit::SLOT_HEAP_MARKS
+                     } else {
+                         slot == victory_shader::emit::SLOT_STRIDES
++                            || slot == victory_shader::emit::SLOT_TABLE_STRIDES
+                             || slot == victory_shader::emit::SLOT_MEMORY
+                     };
+                     if (uav || kind == D3D12_ROOT_PARAMETER_TYPE_SRV) && !ours && bounded_root_srvs() {
+diff -ruN '--exclude=target' '--exclude=bin-counters' '--exclude=bin-fixes' '--exclude=*.log' D1base/crates/victory-gpu/src/resource.rs D1/crates/victory-gpu/src/resource.rs
+--- D1base/crates/victory-gpu/src/resource.rs	2026-11-26 03:46:04.036760600 +0200
++++ D1/crates/victory-gpu/src/resource.rs	2026-11-26 09:34:51.831996600 +0200
+@@ -3961,6 +3961,17 @@
+     if d.flags & UNORDERED != 0 && SRGB.iter().any(|&(srgb, _)| srgb == d.format) {
+         d.format = family(d.format);
+     }
++    // (D1, `VICTORY_SRGB_VIEWS`) A plain texture in a format with an sRGB twin: typeless, so
++    // a shader view in either format reads as the title asked (with or without the sRGB
++    // conversion); views that name no format take the title's
++    // (`descriptor/host.rs` `make`).
++    const TARGET_OR_DEPTH: u32 = 1 | 2;
++    if crate::silent::srgb_views()
++        && d.flags & (TARGET_OR_DEPTH | UNORDERED) == 0
++        && let Some(typeless) = crate::silent::srgb_typeless(d.format)
++    {
++        d.format = typeless;
++    }
+     // The clear value names the format too: format, then color or depth
+     // and stencil (5 words).
+     let clear_value = (!clear.is_null()).then(|| {
+diff -ruN '--exclude=target' '--exclude=bin-counters' '--exclude=bin-fixes' '--exclude=*.log' D1base/crates/victory-gpu/src/shader_cache.rs D1/crates/victory-gpu/src/shader_cache.rs
+--- D1base/crates/victory-gpu/src/shader_cache.rs	2026-11-26 09:14:59.291246900 +0200
++++ D1/crates/victory-gpu/src/shader_cache.rs	2026-11-26 09:36:42.970420400 +0200
+@@ -68,7 +68,8 @@
+         }
+     });
+     let mut h = blake3::Hasher::new();
+-    h.update(b"victory shader cache key 2\0");
++    // (D1) 3: d16 integer bits, NaN guard off stores, view kinds, tracer guards.
++    h.update(b"victory shader cache key 3\0");
+     if let Some(exe) = exe {
+         h.update(exe);
+     }
+diff -ruN '--exclude=target' '--exclude=bin-counters' '--exclude=bin-fixes' '--exclude=*.log' D1base/crates/victory-gpu/src/shadow.rs D1/crates/victory-gpu/src/shadow.rs
+--- D1base/crates/victory-gpu/src/shadow.rs	2026-11-26 08:28:49.943151000 +0200
++++ D1/crates/victory-gpu/src/shadow.rs	2026-11-26 09:28:26.357625400 +0200
+@@ -3428,6 +3428,18 @@
+         self.gpu + (address - self.start)
+     }
+ 
++    /// (D1, `VICTORY_CBV_OWN_COPY`) The copy's bytes read from title memory now; for a copy
++    /// in upload memory ([`exact`]) that no list may be reading yet. False if a page of
++    /// it is not readable or the copy has no CPU side.
++    pub(crate) fn fill_now(&self) -> bool {
++        if self.data.is_null() || self.len == 0 {
++            return false;
++        }
++        // SAFETY: `data` maps the copy's `len` bytes; only the caller writes them now.
++        let to = unsafe { std::slice::from_raw_parts_mut(self.data, self.len as usize) };
++        crate::host::read_into(self.start as *const u8, to)
++    }
++
+     /// The title memory the copy is of: its start and length.
+     pub(crate) fn span(&self) -> (u64, u64) {
+         (self.start, self.len)
+diff -ruN '--exclude=target' '--exclude=bin-counters' '--exclude=bin-fixes' '--exclude=*.log' D1base/crates/victory-gpu/src/silent.rs D1/crates/victory-gpu/src/silent.rs
+--- D1base/crates/victory-gpu/src/silent.rs	1970-01-01 02:00:00.000000000 +0200
++++ D1/crates/victory-gpu/src/silent.rs	2026-11-26 09:44:29.632572600 +0200
+@@ -0,0 +1,318 @@
++//! (D1, docs/silent-defects-audit.md) Counters of the places where the layer hands
++//! shaders zeros or altered bits without a word, and the switches of their fixes. The
++//! counters are always on (a relaxed add each) and go out with the periodic frame line
++//! ([`line`]), per frame over its period.
++
++use std::sync::Mutex;
++use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
++
++/// Indices into [`C`].
++pub(crate) mod k {
++    /// A draw tested a depth plane whose twin this list's shaders wrote, before the pass
++    /// that draws the twin into the plane (finding C4): the test saw the plane as it was.
++    pub const DEPTH_LATE: usize = 0;
++    /// Of those, the plane brought up to date at that first use (`VICTORY_DEPTH_TWIN_SYNC`).
++    pub const DEPTH_SYNCED: usize = 1;
++    /// Binds (a draw's or dispatch's table entry) of an unordered view of a texture the
++    /// title placed in memory itself (finding B1).
++    pub const PLACED_UAV_BINDS: usize = 2;
++    /// Host slots made for such views: mirrored (`VICTORY_PLACED_UAV`).
++    pub const PLACED_UAV_MADE: usize = 3;
++    /// Host slots left null for such views (switch off, no texture, or a view the host
++    /// does not allow).
++    pub const PLACED_UAV_NULL: usize = 4;
++    /// Shader views made in another format of the texture's family where one side is sRGB
++    /// and the other not: the read lacks (or adds) the sRGB conversion (finding A7).
++    pub const SRGB_LOST: usize = 5;
++    /// Of those views, made in their sRGB format on a typeless host copy
++    /// (`VICTORY_SRGB_VIEWS`).
++    pub const SRGB_KEPT: usize = 6;
++    /// Constant buffer views made whose host address is not on 256 bytes (finding B4):
++    /// null, they read zeros.
++    pub const CBV_UNALIGNED: usize = 7;
++    /// Of those, served by an aligned copy of their own bytes (`VICTORY_CBV_OWN_COPY`).
++    pub const CBV_OWN: usize = 8;
++    /// Unordered views of placed textures at address 0: the title's null views (null here
++    /// too, as on the console; run 98: every view of finding B1 was one).
++    pub const PLACED_UAV_ZERO: usize = 9;
++    pub const COUNT: usize = 10;
++}
++
++/// The counters, since the last [`line`].
++pub(crate) static C: [AtomicU64; k::COUNT] = [const { AtomicU64::new(0) }; k::COUNT];
++
++pub(crate) fn add(i: usize, n: u64) {
++    C[i].fetch_add(n, Relaxed);
++}
++
++fn switch(name: &str, default: bool) -> bool {
++    match std::env::var(name) {
++        Ok(v) => v.trim() == "1",
++        Err(_) => default,
++    }
++}
++
++/// `VICTORY_PLACED_UAV` (default 1; =0: such views left null, as before): an unordered
++/// view of a texture the title placed in memory is made on the resource made for that
++/// memory, the one its shader views read ([`crate::descriptor::host::placed_texture`]), so
++/// what shaders store there is what later reads of the texture find, as on the console.
++pub(crate) fn placed_uav() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| switch("VICTORY_PLACED_UAV", true))
++}
++
++/// `VICTORY_DEPTH_TWIN_SYNC` (default 0; =1 on): a draw that tests a depth plane whose
++/// twin this list's shaders wrote first has the twin drawn into the plane, at that draw
++/// (the title's state is set again after the pass); off, the plane is drawn when the list
++/// closes and the draw tests the plane as it was.
++pub(crate) fn depth_twin_sync() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| switch("VICTORY_DEPTH_TWIN_SYNC", false))
++}
++
++/// `VICTORY_SRGB_VIEWS` (default 0; =1 on): plain textures (no target, depth or unordered
++/// access) in a UNORM format with an sRGB twin get a typeless host copy, so a shader view
++/// in the sRGB format is made in it and reads with the conversion, as on the console.
++pub(crate) fn srgb_views() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| switch("VICTORY_SRGB_VIEWS", false))
++}
++
++/// `VICTORY_CBV_OWN_COPY` (default 0; =1 on): a constant buffer view not on 256 bytes of
++/// its host copy is made on a copy of its own bytes (which starts on 256), filled from
++/// title memory when the view is made (not per list: later changes without a new write of
++/// the slot are not seen); off, it is null and reads zeros, as before.
++pub(crate) fn cbv_own_copy() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| switch("VICTORY_CBV_OWN_COPY", false))
++}
++
++/// UNORM formats with an sRGB twin, and the twin: R8G8B8A8, BC1, BC2, BC3, B8G8R8A8,
++/// B8G8R8X8, BC7.
++pub(crate) const SRGB_PAIRS: [(u32, u32); 7] = [(28, 29), (71, 72), (74, 75), (77, 78), (87, 91), (88, 93), (98, 99)];
++
++/// Whether a view in `view` of a typed texture in `own` (same family) changes the sRGB
++/// conversion: one of them sRGB, the other not.
++pub(crate) fn srgb_differs(view: u32, own: u32) -> bool {
++    let srgb = |f: u32| SRGB_PAIRS.iter().any(|&(_, s)| s == f);
++    view != own && srgb(view) != srgb(own)
++}
++
++/// The typeless format a host copy in `format` takes for [`srgb_views`]: a UNORM format of
++/// [`SRGB_PAIRS`] (or its sRGB twin) becomes its family's typeless one.
++pub(crate) fn srgb_typeless(format: u32) -> Option<u32> {
++    SRGB_PAIRS
++        .iter()
++        .any(|&(l, s)| l == format || s == format)
++        .then(|| crate::resource::family(format))
++        .filter(|&t| t != format)
++}
++
++/// Distinct placed textures (by address) bound through unordered views in this period;
++/// and the ones described so far (the first few are logged with format and size).
++static PLACED_SEEN: Mutex<Option<std::collections::HashSet<u64>>> = Mutex::new(None);
++static DESCRIBED: AtomicU64 = AtomicU64::new(0);
++
++/// A placed texture at `address` (resource description words `resource`) was bound or
++/// made through an unordered view; `mirrored` whether its host slot shows it.
++pub(crate) fn placed_uav_seen(address: u64, resource: &[u32; 14], mirrored: bool) {
++    if address == 0 {
++        return;
++    }
++    let new = PLACED_SEEN
++        .lock()
++        .unwrap_or_else(|e| e.into_inner())
++        .get_or_insert_with(Default::default)
++        .insert(address);
++    if new && DESCRIBED.fetch_add(1, Relaxed) < 8 {
++        tracing::info!(
++            address = format_args!("{address:#x}"),
++            dimension = resource[0],
++            width = resource[4],
++            height = resource[6],
++            depth_or_layers = resource[7] & 0xffff,
++            levels = resource[7] >> 16,
++            format = resource[8],
++            flags = format_args!("{:#x}", resource[12]),
++            mirrored,
++            "unordered view of a texture the title placed in memory (first few; VICTORY_PLACED_UAV)"
++        );
++    }
++}
++
++/// `VICTORY_DISPATCH_SIZES=1` (default 0): the thread groups of the direct dispatches of
++/// the programs in [`SIZED`] are summed per period and logged with [`line`] (indirect
++/// dispatches have their sizes on the card only, and are not seen here).
++pub(crate) fn dispatch_sizes() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| switch("VICTORY_DISPATCH_SIZES", false))
++}
++
++/// The programs whose dispatch sizes are logged (docs/heavy-passes.md: ray binning, shadow
++/// masks), as hash prefixes in their pipeline's name.
++const SIZED: [&str; 2] = ["cb6adcc6da2613ff", "5cf00dc39042edaf"];
++
++/// Per program of [`SIZED`], this period: dispatches, groups, fewest and most groups in
++/// one, and up to four distinct shapes.
++#[derive(Default)]
++struct Sized {
++    dispatches: u64,
++    groups: u64,
++    least: u64,
++    most: u64,
++    shapes: Vec<[u32; 3]>,
++    /// Indirect: dispatches, the groups of their first record as title memory held it
++    /// when recorded, records that were not readable, the most records one asked for, and
++    /// how many had a count in a buffer.
++    indirect: u64,
++    indirect_groups: u64,
++    unread: u64,
++    max_records: u32,
++    counted: u64,
++}
++
++/// By pipeline object: which of [`SIZED`] it runs (looked up once); then the sums.
++#[allow(clippy::type_complexity)]
++static SIZES: Mutex<Option<(std::collections::HashMap<usize, Option<usize>>, [Sized; 2])>> = Mutex::new(None);
++
++/// Which of [`SIZED`] pipeline `pipeline` (named `name`) runs, with the sums.
++fn sized_of<R>(pipeline: usize, name: &str, f: impl FnOnce(&mut Sized) -> R) -> Option<R> {
++    let mut sizes = SIZES.lock().unwrap_or_else(|e| e.into_inner());
++    let (which, sums) = sizes.get_or_insert_with(Default::default);
++    let k = (*which.entry(pipeline).or_insert_with(|| {
++        let name = name.to_ascii_lowercase();
++        SIZED.iter().position(|h| name.contains(h))
++    }))?;
++    Some(f(&mut sums[k]))
++}
++
++/// An indirect dispatch by pipeline `pipeline` named `name`: its first record's groups
++/// as read now (`None`: not readable), the most records it may run, whether a buffer
++/// holds their count.
++pub(crate) fn dispatch_size_indirect(pipeline: usize, name: &str, groups: Option<[u32; 3]>, max: u32, counted: bool) {
++    sized_of(pipeline, name, |s| {
++        s.indirect += 1;
++        s.max_records = s.max_records.max(max);
++        s.counted += u64::from(counted);
++        match groups {
++            Some(g) => {
++                s.indirect_groups += g.iter().map(|&n| u64::from(n)).product::<u64>();
++                if s.shapes.len() < 4 && !s.shapes.contains(&g) {
++                    s.shapes.push(g);
++                }
++            }
++            None => s.unread += 1,
++        }
++    });
++}
++
++/// A direct dispatch of `groups` by pipeline `pipeline` named `name`.
++pub(crate) fn dispatch_size(pipeline: usize, name: &str, groups: [u32; 3]) {
++    sized_of(pipeline, name, |s| direct(s, groups));
++}
++
++fn direct(s: &mut Sized, groups: [u32; 3]) {
++    let n = groups.iter().map(|&g| u64::from(g)).product::<u64>();
++    s.least = if s.dispatches == 0 { n } else { s.least.min(n) };
++    s.most = s.most.max(n);
++    s.dispatches += 1;
++    s.groups += n;
++    if s.shapes.len() < 4 && !s.shapes.contains(&groups) {
++        s.shapes.push(groups);
++    }
++}
++
++/// The dispatch sizes' line ([`dispatch_sizes`]), per frame over `frames`.
++fn sizes_line(frames: f64) {
++    let mut sizes = SIZES.lock().unwrap_or_else(|e| e.into_inner());
++    let Some((_, sums)) = sizes.as_mut() else {
++        tracing::info!("dispatch sizes (VICTORY_DISPATCH_SIZES=1): none of {SIZED:?} dispatched directly this period");
++        return;
++    };
++    for (k, s) in sums.iter_mut().enumerate() {
++        let s = std::mem::take(s);
++        let per = |n: u64| n as f64 / frames.max(1.0);
++        tracing::info!(
++            "dispatch sizes (VICTORY_DISPATCH_SIZES=1) {}: {:.1} direct dispatches per frame, {:.0} thread groups per \
++             frame, {} to {} groups each; {:.1} indirect per frame ({} with a count buffer, up to {} records), first \
++             records as title memory held them when recorded {:.0} groups per frame ({} not readable); shapes {:?}",
++            SIZED[k],
++            per(s.dispatches),
++            per(s.groups),
++            s.least,
++            s.most,
++            per(s.indirect),
++            s.counted,
++            s.max_records,
++            per(s.indirect_groups),
++            s.unread,
++            s.shapes
++        );
++    }
++}
++
++/// The counters' line, per frame over `frames`, and the period starts again.
++pub(crate) fn line(frames: f64) {
++    if dispatch_sizes() {
++        sizes_line(frames);
++    }
++    let c: [u64; k::COUNT] = std::array::from_fn(|i| C[i].swap(0, Relaxed));
++    let distinct = PLACED_SEEN
++        .lock()
++        .unwrap_or_else(|e| e.into_inner())
++        .as_mut()
++        .map_or(0, |s| std::mem::take(s).len());
++    let f = |i: usize| c[i] as f64 / frames.max(1.0);
++    let on = |b: bool| u8::from(b);
++    tracing::info!(
++        "silent defects per frame: depth planes used (tested, read, copied) before their twin's writes reached them {:.2}, \
++         brought up to date at that use {:.2} (VICTORY_DEPTH_TWIN_SYNC={}); unordered views of placed textures: \
++         {:.1} binds, {distinct} distinct textures this period, {:.2} slots mirrored, {:.2} left null, \
++         {:.2} the title's null views (address 0) (VICTORY_PLACED_UAV={}); shader views whose sRGB conversion differs from the texture's {:.2} made, \
++         {:.2} sRGB views on typeless copies (VICTORY_SRGB_VIEWS={}); title-slot constant buffer views not on 256 \
++         bytes {:.2} made, {:.2} of them on an own copy, the rest null (tables a draw reads them through are made \
++         afresh, aligned; these slots are read only past a table's used entries or picked by index) \
++         (VICTORY_CBV_OWN_COPY={})",
++        f(k::DEPTH_LATE),
++        f(k::DEPTH_SYNCED),
++        on(depth_twin_sync()),
++        f(k::PLACED_UAV_BINDS),
++        f(k::PLACED_UAV_MADE),
++        f(k::PLACED_UAV_NULL),
++        f(k::PLACED_UAV_ZERO),
++        on(placed_uav()),
++        f(k::SRGB_LOST),
++        f(k::SRGB_KEPT),
++        on(srgb_views()),
++        f(k::CBV_UNALIGNED),
++        f(k::CBV_OWN),
++        on(cbv_own_copy()),
++    );
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn srgb_pairs_tell_conversion_changes() {
++        assert!(srgb_differs(29, 28));
++        assert!(srgb_differs(28, 29));
++        assert!(srgb_differs(72, 71));
++        assert!(srgb_differs(99, 98));
++        assert!(!srgb_differs(28, 28));
++        // Both linear (UNORM and UINT views of one family): no conversion either way.
++        assert!(!srgb_differs(30, 28));
++    }
++
++    #[test]
++    fn srgb_typeless_is_the_family() {
++        assert_eq!(srgb_typeless(28), Some(27));
++        assert_eq!(srgb_typeless(29), Some(27));
++        assert_eq!(srgb_typeless(71), Some(70));
++        assert_eq!(srgb_typeless(98), Some(97));
++        assert_eq!(srgb_typeless(87), Some(90));
++        assert_eq!(srgb_typeless(88), Some(92));
++        assert_eq!(srgb_typeless(2), None);
++    }
++}
+diff -ruN '--exclude=target' '--exclude=bin-counters' '--exclude=bin-fixes' '--exclude=*.log' D1base/crates/victory-shader/src/emit/lower.rs D1/crates/victory-shader/src/emit/lower.rs
+--- D1base/crates/victory-shader/src/emit/lower.rs	2026-11-26 09:15:47.921147500 +0200
++++ D1/crates/victory-shader/src/emit/lower.rs	2026-11-26 09:46:42.275149800 +0200
+@@ -134,6 +134,28 @@
+ }
+ 
+ const TWO_PI: f32 = std::f32::consts::TAU;
++/// (D1) `VICTORY_NAN_GUARD_STORES` (default 0; =1 as before): the NaN guard also on typed
++/// image and buffer stores, not only on float colour exports.
++fn nan_guard_stores() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_NAN_GUARD_STORES").is_some_and(|v| v == "1"))
++}
++
++/// (D1) `VICTORY_D16_BITS` (default 1; =0 as before): d16 loads through views of integer
++/// formats keep their 16 bits ([`Lower::d16_bits`]).
++fn d16_bits_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_D16_BITS").is_none_or(|v| v != "0"))
++}
++
++/// (D1) `VICTORY_D16_VIEW_KINDS` (default 1; =0 as before): d16 stores through buffer views
++/// picked from the heap store integers' 16 bits where the host's slot word says the view is
++/// of an integer format. The host reads the same switch for the words it writes.
++pub fn d16_view_kinds() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_D16_VIEW_KINDS").is_none_or(|v| v != "0"))
++}
++
+ /// `s_sendmsg` id of a mesh or NGG stage's output allocation request.
+ const GS_ALLOC_REQ: u16 = 9;
+ 
+@@ -3704,6 +3726,12 @@
+         if !*ON.get_or_init(|| std::env::var_os("VICTORY_NAN_GUARD").is_none_or(|v| v != "0")) {
+             return f;
+         }
++        // (D1) Typed image and buffer stores (`strict` false) only with
++        // `VICTORY_NAN_GUARD_STORES=1`: they may carry an integer's bits (a packed colour
++        // 0xFF800000 became -65504.0), which the console stores as they are.
++        if !strict && !nan_guard_stores() {
++            return f;
++        }
+         let c = self.cur;
+         let bits = self.as_int(f);
+         let mag = self.s.m.i32(0x7FFF_FFFF);
+@@ -3726,6 +3754,30 @@
+         self.as_float(r)
+     }
+ 
++    /// (D1, `VICTORY_D16_BITS`) A d16 load's 16 bits from `x`, the 32-bit value a
++    /// float-typed load returned. Through a view of an integer format the host passes the
++    /// integer's bits unconverted: a 16-bit unsigned (or non-negative signed) value is a
++    /// tiny denormal there (bits up to 0xFFFF), a negative signed one sign-extended (bits
++    /// from 0xFFFF8000), and the console's d16 load gives its low 16 bits; converting them
++    /// as a float gave 0 (or NaN). Every other value is converted to a half as before. No
++    /// float, UNORM or SNORM view returns such bits but +0.0 (whose half is 0 both ways)
++    /// and 32-bit float denormals (which round to 0 as halves; here their low bits).
++    fn d16_bits(&mut self, x: V) -> V {
++        let c = self.cur;
++        let i32t = self.s.t.i32;
++        let half = self.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x]);
++        if !d16_bits_on() {
++            return half;
++        }
++        let bits = self.as_int(x);
++        let (top, neg) = (self.s.m.i32(0xFFFF), self.s.m.i32(0xFFFF_7FFF));
++        let small = self.s.m.cmp(c, pred::IULE, bits, top);
++        let negative = self.s.m.cmp(c, pred::IUGT, bits, neg);
++        let integer = self.s.m.bin(c, Bin::Or, small, negative);
++        let low = self.s.m.bin(c, Bin::And, bits, top);
++        self.s.m.select(c, integer, low, half)
++    }
++
+     /// `0 × anything = 0`, as in D3D9.
+     fn legacy_mul(&mut self, a: V, b: V) -> V {
+         let c = self.cur;
+@@ -6541,17 +6593,45 @@
+     /// `ResourceHeap`): read from the host's table by heap slot in the
+     /// current block.
+     fn slot_stride(&mut self, src: &Source) -> Result<Option<V>, Why> {
+-        let Source::Loaded { load, first } = src else {
++        let word = self.slot_word(src, false)?;
++        Ok(word.map(|word| {
++            // (D1) The stride bits; the top two say the format kind ([`Self::integer_view`]).
++            let bits = self.s.m.i32(super::shader::VIEW_STRIDE_BITS);
++            self.s.m.bin(self.cur, Bin::And, word, bits)
++        }))
++    }
++
++    /// (D1, cool_fox f4b48ad) Whether the typed buffer view `src` names, picked from the
++    /// heap, is of an integer format, and whether a signed one, from the host's word for
++    /// its slot ([`super::shader::VIEW_INTEGER`]); `None` for a view not picked so.
++    fn integer_view(&mut self, src: &Source) -> Result<Option<(V, V)>, Why> {
++        let Some(word) = self.slot_word(src, true)? else {
+             return Ok(None);
+         };
+-        let heap = self
+-            .scalar
+-            .get(load)
+-            .and_then(|a| self.x.native.layout.get(a.param))
+-            .is_some_and(|p| p.root == RootType::ResourceHeap);
+-        if !heap {
++        let c = self.cur;
++        let zero = self.s.m.i32(0);
++        let [int, signed] = [super::shader::VIEW_INTEGER, super::shader::VIEW_SIGNED].map(|bit| {
++            let bit = self.s.m.i32(bit);
++            let x = self.s.m.bin(c, Bin::And, word, bit);
++            self.s.m.cmp(c, pred::NE, x, zero)
++        });
++        Ok(Some((int, signed)))
++    }
++
++    /// The host's word for the buffer view `src` names, if the program picks it from the
++    /// view heap at an index it computes ([`super::shader::SLOT_STRIDES`]): its stride and
++    /// format kind; with `allow_table` (T2) also of a view a table holds, from the same
++    /// table by host slot ([`super::shader::SLOT_TABLE_STRIDES`]).
++    fn slot_word(&mut self, src: &Source, allow_table: bool) -> Result<Option<V>, Why> {
++        let Source::Loaded { load, first } = src else {
+             return Ok(None);
+-        }
++        };
++        let root = self.scalar.get(load).and_then(|a| self.x.native.layout.get(a.param)).map(|p| p.root);
++        let srv_slot = match root {
++            Some(RootType::ResourceHeap) => super::shader::SLOT_STRIDES,
++            Some(RootType::Table) if allow_table => super::shader::SLOT_TABLE_STRIDES,
++            _ => return Ok(None),
++        };
+         let key = (self.cur, *load, *first);
+         if let Some(&v) = self.strides.get(&key) {
+             return Ok(Some(v));
+@@ -6566,7 +6646,7 @@
+         self.s.m.tag(slot, Tag::Clamp);
+         let two = self.s.m.i32(2);
+         let byte = self.s.m.bin(c, Bin::Shl, slot, two);
+-        let h = self.s.root_srv_handle(super::shader::SLOT_STRIDES);
++        let h = self.s.root_srv_handle(srv_slot);
+         let iu = self.s.m.undef(self.s.t.i32);
+         let mask = self.s.m.i8(1);
+         let align = self.s.m.i32(4);
+@@ -10101,11 +10181,16 @@
+                 None => self.s.m.extract(c, r, ch),
+             };
+             xs.push(if *d16 {
+-                // shortcut: d16 results are taken as floats (rounded to
+-                // nearest even); integer formats would keep 16 bits.
+-                let i32t = self.s.t.i32;
+-                self.s
+-                    .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
++                // d16 results are taken as floats (rounded to nearest even); (D1) a load
++                // or gather through an integer view keeps its 16 bits ([`Self::d16_bits`]).
++                // shortcut: samples are always floats.
++                if matches!(op, 66 | 73) {
++                    self.d16_bits(x)
++                } else {
++                    let i32t = self.s.t.i32;
++                    self.s
++                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[x])
++                }
+             } else {
+                 self.as_int(x)
+             });
+@@ -10504,6 +10589,11 @@
+                 // keep 16 bits), widened for the 32-bit float store.
+                 // (fxceless #927) Through a view of a table that moves halves each half is
+                 // stored as it is.
++                // (D1, cool_fox f4b48ad / VIctory 4243a96a, `VICTORY_D16_VIEW_KINDS`) Through
++                // a view the program picks from the heap, the host's word for its slot says
++                // whether its format is an integer one: then the 16 bits, zero- or
++                // sign-extended, which the float handle passes as they are.
++                let integer = if typed && !halves && d16_view_kinds() { self.integer_view(src)? } else { None };
+                 let mut wide = Vec::new();
+                 for k in 0..count {
+                     let mut x = vals[(k / 2) as usize];
+@@ -10520,7 +10610,16 @@
+                     let f = self
+                         .s
+                         .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+-                    wide.push(self.as_int(f));
++                    let mut w = self.as_int(f);
++                    if let Some((int, signed)) = integer {
++                        let (k16, low) = (self.s.m.i32(16), self.s.m.i32(0xFFFF));
++                        let zero_ext = self.s.m.bin(c, Bin::And, x, low);
++                        let up = self.s.m.bin(c, Bin::Shl, x, k16);
++                        let sign_ext = self.s.m.bin(c, Bin::AShr, up, k16);
++                        let n = self.s.m.select(c, signed, sign_ext, zero_ext);
++                        w = self.s.m.select(c, int, n, w);
++                    }
++                    wide.push(w);
+                 }
+                 vals = wide;
+             }
+@@ -10678,6 +10777,10 @@
+                     let h = if halves {
+                         let low = self.s.m.i32(0xffff);
+                         self.s.m.bin(c, Bin::And, f, low)
++                    } else if typed {
++                        // (D1) Through a view of an integer format, its 16 bits: views
++                        // picked by index and table places the halves rule leaves out.
++                        self.d16_bits(f)
+                     } else {
+                         self.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
+                     };
+diff -ruN '--exclude=target' '--exclude=bin-counters' '--exclude=bin-fixes' '--exclude=*.log' D1base/crates/victory-shader/src/emit/mod.rs D1/crates/victory-shader/src/emit/mod.rs
+--- D1base/crates/victory-shader/src/emit/mod.rs	2026-11-26 09:15:48.008318100 +0200
++++ D1/crates/victory-shader/src/emit/mod.rs	2026-11-26 09:46:42.267035200 +0200
+@@ -119,6 +119,8 @@
+ pub use link::{link_mesh, mesh_fits};
+ pub use sampler::StaticSampler;
+ pub use lower::set_host_max_wave;
++pub use lower::d16_view_kinds;
++pub use shader::{SLOT_TABLE_STRIDES, VIEW_INTEGER, VIEW_SIGNED, VIEW_STRIDE_BITS};
+ pub use rect::rect_list_gs;
+ pub use shader::{
+     MEMORY_FAULTS, MEMORY_PAGES, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
+@@ -471,7 +473,21 @@
+             return Ok(shader);
+         }
+     }
+-    r.map(|(shader, _)| shader)
++    // (D1, cool_fox 8cc31ab, T3) A program no form brings to the host's 32 lanes is refused
++    // here with its reason, instead of being handed over as a 64-lane shader the driver
++    // then refuses (`VICTORY_WAVE64_REFUSE=0`: handed over, as before).
++    match r {
++        Ok((_, Some(64))) if lower::host_max_wave() == 32 && wave64_refuse() => {
++            Err(ShaderError::Unsupported { offset: 0, what: "no wave32 lowering for this wave64 program" })
++        }
++        r => r.map(|(shader, _)| shader),
++    }
++}
++
++/// (D1, T3) `VICTORY_WAVE64_REFUSE` (default 1; =0 as before).
++fn wave64_refuse() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE64_REFUSE").is_none_or(|v| v != "0"))
+ }
+ 
+ /// Whether console wave64 compute programs may take the paired form ([`paired`]):
+@@ -558,17 +574,27 @@
+         };
+         // The program in two other forms: without its early-outs, and
+         // without any branch that only skips code no lane is left for.
+-        let form = |p: Option<ir::Program>| {
+-            p.and_then(|p| {
+-                let st = structure::structure(&p).ok()?;
+-                let io = io::raise(&p, native).ok()?;
+-                let res = resource::track(&p, &native.layout, native.stage, Some(&st)).ok()?;
+-                Some((p, st, io, res))
+-            })
++        // (D1, cool_fox f4b48ad, T5) With `VICTORY_WAVE_WHY`, why a form was not built.
++        let form = |label: &str, p: Option<ir::Program>| {
++            let say = |what: &dyn std::fmt::Display| {
++                if why {
++                    eprintln!("WAVE64-FORM {label}: {what}");
++                }
++            };
++            let Some(p) = p else {
++                say(&"ir returned None");
++                return None;
++            };
++            let st = structure::structure(&p).map_err(|e| say(&format_args!("structure failed: {e}"))).ok()?;
++            let io = io::raise(&p, native).map_err(|e| say(&format_args!("io::raise failed: {e}"))).ok()?;
++            let res = resource::track(&p, &native.layout, native.stage, Some(&st))
++                .map_err(|e| say(&format_args!("resource::track failed: {e}")))
++                .ok()?;
++            Some((p, st, io, res))
+         };
+         let forms = [
+-            ("without early-outs", form(ir::without_early_outs(p))),
+-            ("without skips", form(ir::without_skips(p, false))),
++            ("without early-outs", form("without early-outs", ir::without_early_outs(p))),
++            ("without skips", form("without skips", ir::without_skips(p, false))),
+         ];
+         for (name, f) in &forms {
+             if let Some((p, st, io, res)) = f {
+@@ -619,7 +645,7 @@
+                 // lane runs, where the two host waves can exchange.
+                 // (`VICTORY_WAVE_DEEP_SKIPS=0` and `VICTORY_WAVE_WIDE=0` turn the two off.)
+                 let deep_on = std::env::var_os("VICTORY_WAVE_DEEP_SKIPS").is_none_or(|v| v != "0");
+-                let deep = if deep_on { form(ir::without_skips(p, true)) } else { None };
++                let deep = if deep_on { form("without skips, scalars followed", ir::without_skips(p, true)) } else { None };
+                 if let Some((p, st, io, res)) = &deep {
+                     let again = emit_program(c, native, p, st, io, res);
+                     report("without skips, scalars followed", &again);
+@@ -854,7 +880,23 @@
+             || matches!(&r, Ok((_, Some(64)))) && !needs.is_empty();
+         if !stuck {
+             if why {
+-                eprintln!("WAVE64-WIDE {} branches taken wave-wide", wide.len());
++                // (D1, T5) Which branches, with their last instruction; BACK: a loop's.
++                let order = ir::reverse_postorder(&p.blocks);
++                let mut rpo = vec![0usize; p.blocks.len()];
++                for (i, &b) in order.iter().enumerate() {
++                    rpo[b] = i;
++                }
++                let mut sorted: Vec<usize> = wide.iter().copied().collect();
++                sorted.sort_unstable();
++                let desc: Vec<String> = sorted
++                    .iter()
++                    .map(|&b| {
++                        let back = matches!(p.blocks[b].exit, ir::Exit::Branch { taken, not_taken } if rpo[taken] <= rpo[b] || rpo[not_taken] <= rpo[b]);
++                        let name = p.blocks[b].insts.last().map_or("?", |i| i.name());
++                        format!("B{b}({name}{})", if back { ",BACK" } else { "" })
++                    })
++                    .collect();
++                eprintln!("WAVE64-WIDE {} branches taken wave-wide: [{}]", wide.len(), desc.join(", "));
+             }
+             return r;
+         }
+diff -ruN '--exclude=target' '--exclude=bin-counters' '--exclude=bin-fixes' '--exclude=*.log' D1base/crates/victory-shader/src/emit/shader.rs D1/crates/victory-shader/src/emit/shader.rs
+--- D1base/crates/victory-shader/src/emit/shader.rs	2026-11-25 22:14:18.846810800 +0200
++++ D1/crates/victory-shader/src/emit/shader.rs	2026-11-26 09:46:42.266013100 +0200
+@@ -26,6 +26,18 @@
+ pub const SLOT_STRIDES: u8 = 255;
+ /// Dwords of the [`SLOT_STRIDES`] buffer: heap indices are clamped to it.
+ pub const SLOT_STRIDES_COUNT: u32 = 1 << 21;
++/// (D1, cool_fox f4b48ad, T2) The same table as [`SLOT_STRIDES`], bound for shaders that
++/// only look up the kinds of views that came through their tables (`RootType::Table`):
++/// its presence does not ask the host for the whole-heap buffer pass. (cool_fox uses 252,
++/// which is [`SLOT_HEAP_MARKS`] here.)
++pub const SLOT_TABLE_STRIDES: u8 = 251;
++/// (D1, cool_fox f4b48ad) The bits of a [`SLOT_STRIDES`] dword that hold the stride.
++pub const VIEW_STRIDE_BITS: u32 = (1 << 30) - 1;
++/// In a [`SLOT_STRIDES`] dword: a typed buffer view of an integer format
++/// (`VICTORY_D16_VIEW_KINDS`).
++pub const VIEW_INTEGER: u32 = 1 << 31;
++/// With [`VIEW_INTEGER`]: a signed (`SINT`) format.
++pub const VIEW_SIGNED: u32 = 1 << 30;
+ 
+ /// The root UAV `u<SLOT_HEAP_MARKS>` in [`ROOT_CBV_SPACE`] of a shader that
+ /// stores (or does an atomic operation) through a buffer view it picks from
+diff -ruN '--exclude=target' '--exclude=bin-counters' '--exclude=bin-fixes' '--exclude=*.log' D1base/crates/victory-shader/src/emit/valu_tests.rs D1/crates/victory-shader/src/emit/valu_tests.rs
+--- D1base/crates/victory-shader/src/emit/valu_tests.rs	2026-11-26 09:14:59.545186100 +0200
++++ D1/crates/victory-shader/src/emit/valu_tests.rs	2026-11-26 09:39:23.473289300 +0200
+@@ -1725,3 +1725,143 @@
+         }
+     }
+ }
++
++/// MUBUF `op vdata, vaddr, s[srsrc:srsrc+3], 0` with `idxen` or `offen` and an immediate
++/// byte offset (soffset: the constant 0).
++const fn mubuf(op: u8, vdata: u8, vaddr: u8, srsrc: u8, idxen: bool, offen: bool, offset: u32) -> [u32; 2] {
++    [
++        0x38 << 26 | (op as u32) << 18 | (idxen as u32) << 13 | (offen as u32) << 12 | (offset & 0xFFF),
++        0x80 << 24 | ((srsrc as u32 >> 2) & 0x1F) << 16 | (vdata as u32) << 8 | vaddr as u32,
++    ]
++}
++
++/// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], byte_offset` (soffset: null).
++const fn s_load_dwordx4_at(dst: u8, base: u8, byte_offset: u32) -> [u32; 2] {
++    [
++        0x3D << 26 | 0x02 << 18 | (dst as u32) << 6 | (base as u32 >> 1),
++        (125 << 25) | (byte_offset & 0x1F_FFFF),
++    ]
++}
++
++/// (D1, `VICTORY_D16_BITS`) A d16 format load through a table view of an integer format,
++/// in a place the halves rule leaves out (the program also reads it with a whole-dword
++/// format load): the 16 bits as they are, as the console's load gives them. Before, each
++/// channel was converted as a float, and an unsigned 16-bit value through the float-typed
++/// handle is a denormal there: every channel read 0. Float views keep their halves.
++#[test]
++fn d16_loads_through_integer_views_keep_their_bits() {
++    use super::host::Stride;
++    use windows::Win32::Graphics::Dxgi::Common::{
++        DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_R16G16B16A16_SINT, DXGI_FORMAT_R16G16B16A16_UINT,
++    };
++    let mut words = vec![s_mov_b32(5, 0x80)]; // s5 = 0: s[4:5] the table
++    words.extend_from_slice(&s_load_dwordx4_at(8, 4, 0)); // table[0]: the typed view
++    words.extend_from_slice(&s_load_dwordx4_at(12, 4, 32)); // table[1]: raw out
++    // buffer_load_format_d16_xyzw v[2:3], v0, s[8:11] idxen
++    words.extend_from_slice(&mubuf(0x83, 2, 0, 8, true, false, 0));
++    // buffer_load_format_x v6, v0, s[8:11] idxen: the same place read otherwise too
++    words.extend_from_slice(&mubuf(0x00, 6, 0, 8, true, false, 0));
++    words.push(0x3408_0083); // v_lshlrev_b32 v4, 3, v0
++    // buffer_store_dwordx2 v[2:3], v4, s[12:15] offen
++    words.extend_from_slice(&mubuf(0x1D, 2, 4, 12, false, true, 0));
++    // buffer_store_dword v6, v4, s[12:15] offen offset:64
++    words.extend_from_slice(&mubuf(0x1C, 6, 4, 12, false, true, 64));
++    words.push(S_ENDPGM);
++    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
++    let table = |kind, k: u32| UsedResource {
++        kind,
++        root: RootType::Table,
++        table_offset_dwords: k * 8,
++        lower_bound: k,
++        stride: 4,
++        dwords: 4,
++        user_data: 4,
++        slot: 0,
++    };
++    let native = NativeProgram {
++        stage: HwStage::Cs,
++        wave64: false,
++        vgprs: 8,
++        layout: vec![RootParam {
++            root: RootType::Table,
++            table_offset_dwords: 0,
++            sgprs: 1,
++            base_register: 0,
++            user_data: 4,
++            slot: 0,
++        }],
++        used: vec![table(ResourceType::Srv, 0), table(ResourceType::Uav, 1)],
++        io: StageIo::Cs(ComputeIo { rsrc2: 5 << 1, threads: [4, 1, 1] }),
++        code,
++    };
++    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
++    let st = structure::structure(&p).expect("structure");
++    let res = resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
++    let io = io::raise(&p, &native).expect("io::raise");
++    let lowered = lower::lower(&lower::Parts {
++        native: &native,
++        p: &p,
++        st: &st,
++        io: &io,
++        res: &res,
++        inputs: Vec::new(),
++        outputs: Vec::new(),
++        prims: Vec::new(),
++        mesh_stride: 0,
++    })
++    .expect("lower");
++    assert!(lowered.half_views.is_empty(), "the place is read otherwise too: no halves view");
++    let shader = HostShader {
++        stage: HwStage::Cs,
++        dxil: lowered.dxil,
++        user_data: lowered.user_data,
++        samplers: lowered.samplers,
++        static_samplers: Vec::new(),
++        root_cbvs: lowered.root_cbvs,
++        root_srvs: lowered.root_srvs,
++        root_uavs: lowered.root_uavs,
++        root_indexed_views: res.root_indexed_views,
++        half_views: Vec::new(),
++    };
++    if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
++        let mut copy = shader.dxil.clone();
++        v.validate(&mut copy).expect("DXIL validation failed");
++    }
++    // Four elements of four 16-bit channels.
++    let uint_bits: [u32; 8] =
++        [0x3C00_0001, 0x7E00_BC00, 0xFFFF_8000, 0xABCD_1234, 0x0002_0000, 0x7BFF_FBFF, 0xDEAD_BEEF, 0xCAFE_BABE];
++    let sint_bits: [u32; 8] =
++        [0xFFFF_8000, 0x7FFF_0001, 0xC000_0000, 0x8001_7FFE, 0xFFFF_FFFF, 0x0000_0000, 0xFEDC_BA98, 0x7654_3210];
++    // Normal halves, which go through a float and back unchanged.
++    let float_bits: [u32; 8] =
++        [0x4000_3C00, 0x3800_BC00, 0xC200_3400, 0x4500_0000, 0x3E00_BE00, 0x4400_C400, 0x3C00_0000, 0x4200_C000];
++    let cases = [
++        ("R16G16B16A16_UINT", DXGI_FORMAT_R16G16B16A16_UINT, &uint_bits),
++        ("R16G16B16A16_SINT", DXGI_FORMAT_R16G16B16A16_SINT, &sint_bits),
++        ("R16G16B16A16_FLOAT", DXGI_FORMAT_R16G16B16A16_FLOAT, &float_bits),
++    ];
++    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
++    let mut ran = 0;
++    for (backend, warp) in [("hardware", false), ("warp", true)] {
++        let Ok(host) = Host::new(warp) else {
++            eprintln!("no SM 6.6 {backend} device; skipped");
++            continue;
++        };
++        let (root, pso) =
++            host.compute_pipeline(&shader).unwrap_or_else(|e| panic!("{backend}: compute_pipeline failed: {e}"));
++        for &(label, format, input) in &cases {
++            let views = [View::Buffer { data: input, stride: Stride::Format(format, 8) }, View::RawUav(24)];
++            let ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
++            let out = host
++                .dispatch(
++                    &root,
++                    &pso,
++                    &Dispatch { roots: vec![(0, Root::Constants(ud))], views: &views, samplers: &[], groups: [1, 1, 1] },
++                )
++                .unwrap_or_else(|e| panic!("{backend} {label}: dispatch failed: {e}"));
++            assert_eq!(out[0][..8], input[..], "{backend} {label}: buffer_load_format_d16_xyzw");
++        }
++        ran += 1;
++    }
++    assert!(ran > 0, "no SM 6.6 device available");
++}
+diff -ruN '--exclude=target' '--exclude=bin-counters' '--exclude=bin-fixes' '--exclude=*.log' D1base/crates/victory-shader/src/resource.rs D1/crates/victory-shader/src/resource.rs
+--- D1base/crates/victory-shader/src/resource.rs	2026-11-25 19:11:21.365973000 +0200
++++ D1/crates/victory-shader/src/resource.rs	2026-11-26 09:45:31.576415300 +0200
+@@ -224,9 +224,9 @@
+     let mut offset_at =
+         std::collections::BTreeMap::<usize, (Vec<usize>, Vec<Value>, Vec<Site>)>::new();
+     for (b, block) in p.blocks.iter().enumerate() {
+-        t.at.set(Some(b));
+         for (i, inst) in block.insts.iter().enumerate() {
+             let site = (b, i);
++            t.at.set(Some(site));
+             let fail = |what| ShaderError::Unsupported {
+                 offset: inst.machine.offset,
+                 what,
+@@ -234,7 +234,7 @@
+             let mut first_lane = Vec::new();
+             let mut offset = Vec::new();
+             let mut descriptor = |op: &Operand, role| -> Result<(), ShaderError> {
+-                let source = t.descriptor(inst, op, b).map_err(fail)?;
++                let source = t.descriptor(inst, op, site).map_err(fail)?;
+                 // A descriptor the code keeps per lane ([`Tracer::lane_copies`])
+                 // is the same in every lane: its loop is lowered as it stands
+                 // and needs no proof.
+@@ -411,8 +411,8 @@
+     meets: std::cell::RefCell<Meets>,
+     /// Reverse-postorder index per block.
+     rpo: Vec<usize>,
+-    /// The block of the access being traced ([`Self::live`]).
+-    at: std::cell::Cell<Option<usize>>,
++    /// The instruction site of the access being traced ([`Self::live`]).
++    at: std::cell::Cell<Option<Site>>,
+ }
+ 
+ /// What lanes are known to satisfy: each [`Bool`] where its flag is set,
+@@ -1113,8 +1113,8 @@
+         self.address(lo, hi, extra)
+     }
+ 
+-    /// The source of the descriptor operand `op` of `inst`, in block `at`.
+-    fn descriptor(&self, inst: &Inst, op: &Operand, at: usize) -> Result<Source, &'static str> {
++    /// The source of the descriptor operand `op` of `inst`, at site `at`.
++    fn descriptor(&self, inst: &Inst, op: &Operand, at: Site) -> Result<Source, &'static str> {
+         let Operand::Scalar { code, dwords } = *op else {
+             return Err("a descriptor not in SGPRs");
+         };
+@@ -1122,8 +1122,18 @@
+             .map(|k| inst.read(Reg::S(code + k)).map(|v| self.origin(v)))
+             .collect::<Option<Vec<_>>>()
+             .ok_or("a descriptor not in SGPRs")?;
+-        // Only the lanes that reach the access read the descriptor.
+-        let mut known = Vec::from_iter(self.lanes.map(|l| (l.reach[at], true)));
++        // Only the lanes that reach the access read the descriptor; with
++        // `VICTORY_TRACE_GUARDS` (cool_fox f4b48ad) only those that also run it (its EXEC
++        // guard): an edge into a join that only lanes outside the guard take is dead for it.
++        let mut known = Vec::new();
++        if let Some(l) = self.lanes {
++            known.push((l.reach[at.0], true));
++            if trace_guards()
++                && let Some(guard) = l.guards[at.0][at.1]
++            {
++                known.push((guard, true));
++            }
++        }
+         self.classify(&words, &mut Vec::new(), &mut known)
+     }
+ 
+@@ -1275,7 +1285,13 @@
+         let (Some(at), Some(lanes)) = (self.at.get(), self.lanes) else {
+             return t;
+         };
+-        let mut known = vec![(lanes.reach[at], true)];
++        let mut known = vec![(lanes.reach[at.0], true)];
++        // (`VICTORY_TRACE_GUARDS`) The lanes that run the access, too.
++        if trace_guards()
++            && let Some(guard) = lanes.guards[at.0][at.1]
++        {
++            known.push((guard, true));
++        }
+         for _ in 0..MAX_JOINS {
+             let Term::Value(v) = t else { break };
+             let Some((block, i)) = self.phis[v.0 as usize] else {
+@@ -2245,6 +2261,29 @@
+     }
+ }
+ 
++/// (D1, ported from cool_fox f4b48ad) `VICTORY_TRACE_GUARDS` (default 0 = as before; =1 on):
++/// a descriptor or value traced for an access is taken as the lanes that RUN it hold it
++/// (the block's reach and the access's own EXEC guard), not all that reach its block. Before,
++/// an edge into a join taken only by lanes the guard leaves out kept a second source alive,
++/// and the program was dropped (`alphaResolve:CS_AlphTransmissionPrefilterMip`: black
++/// squares, transmissive eyes). Off by default here: ours already translates that program
++/// (runs 92-97: `2da4beb386509b77` translated and bound), and the fix can let an earlier
++/// wave64 form be chosen for other programs, which changes their translation.
++fn trace_guards() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    #[cfg(test)]
++    if TRACE_GUARDS_TEST.get() {
++        return true;
++    }
++    *ON.get_or_init(|| std::env::var_os("VICTORY_TRACE_GUARDS").is_some_and(|v| v == "1"))
++}
++
++#[cfg(test)]
++thread_local! {
++    /// Tests of [`trace_guards`] turn it on for their thread.
++    static TRACE_GUARDS_TEST: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
+ #[derive(Clone, Copy, PartialEq, Eq)]
+ enum Moved {
+     Const(u32),
+@@ -2261,10 +2300,19 @@
+         if inst.name() != "v_readlane_b32" {
+             return None;
+         }
++        // (D1, cool_fox 8cc31ab, T4d; `VICTORY_SPILL_STRICT=0`: as before) Only a plain
++        // read of a lane inside the wave.
++        if spill_strict() && !plain_lane(v) {
++            return None;
++        }
+         let [Operand::Vector { reg, .. }, lane] = v.src[..] else {
+             return None;
+         };
+-        self.spilled(inst.read(Reg::V(reg))?, lane_of(lane)?, &mut Vec::new())
++        let lane = lane_of(lane)?;
++        if spill_strict() && lane >= if self.p.wave64 { 64 } else { 32 } {
++            return None;
++        }
++        self.spilled(inst.read(Reg::V(reg))?, lane, &mut Vec::new())
+             .ok()
+             .flatten()
+     }
+@@ -2298,6 +2346,10 @@
+         if inst.name() != "v_writelane_b32" {
+             return Err(());
+         }
++        // (D1, T4d) A write with operand modifiers is no plain spill.
++        if spill_strict() && !plain_lane(w) {
++            return Err(());
++        }
+         if lane_of(*at).ok_or(())? != lane {
+             return self.spilled(inst.read(Reg::V(reg)).ok_or(())?, lane, seen);
+         }
+@@ -2314,6 +2366,19 @@
+     }
+ }
+ 
++/// (D1, cool_fox 8cc31ab, T4d) `VICTORY_SPILL_STRICT` (default 1; =0 as before): an SGPR
++/// spill to a VGPR lane is followed only through plain `v_writelane_b32` / `v_readlane_b32`
++/// (no operand modifiers, SDWA or DPP) of a lane inside the wave.
++fn spill_strict() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_SPILL_STRICT").is_none_or(|v| v != "0"))
++}
++
++/// Whether a lane move has no operand modifiers, SDWA or DPP.
++fn plain_lane(v: &crate::gfx10::Valu) -> bool {
++    v.abs == 0 && v.neg == 0 && v.opsel == 0 && !v.clamp && v.omod == 0 && v.sdwa.is_none() && v.dpp.is_none()
++}
++
+ /// A lane select given as a constant.
+ fn lane_of(op: Operand) -> Option<u32> {
+     match op {
+@@ -3859,4 +3924,45 @@
+         assert_eq!(r.waterfall.compares.len(), 2);
+         assert_eq!(r.waterfall.reads.len(), 4);
+     }
++
++    /// (D1, cool_fox f4b48ad, `VICTORY_TRACE_GUARDS`) Lanes failing the compare leave EXEC
++    /// and branch to the join without building the immediate sampler `s[8:11]`; the join's
++    /// `image_sample_lz` runs under EXEC, so only the arm that built it reaches the access.
++    #[test]
++    fn a_guarded_access_excludes_dead_lane_edges_at_a_join() {
++        let code: Vec<u8> = [
++            0xBE84_0300u32, // s_mov_b32 s4, s0
++            0xBE85_0380,    // s_mov_b32 s5, 0
++            0xF40C_0302,
++            0xFA00_0000, // s_load_dwordx8 s[12:19], s[4:5], 0x0
++            0x7E04_0D00, // v_cvt_f32_u32 v2, v0
++            0x7E06_0302, // v_mov_b32 v3, v2
++            0x7D88_0090, // v_cmp_gt_u32 vcc_lo, 16, v0
++            0xBF8C_C07F, // s_waitcnt lgkmcnt(0)
++            0x877E_6A7E, // s_and_b32 exec_lo, exec_lo, vcc_lo
++            0xBF88_0004, // s_cbranch_execz -> join
++            0xBE88_0380, // s_mov_b32 s8, 0
++            0xBE89_0380, // s_mov_b32 s9, 0
++            0xBE8A_0380, // s_mov_b32 s10, 0
++            0xBE8B_0380, // s_mov_b32 s11, 0
++            0xF09C_0F08,
++            0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11]
++            S_ENDPGM,
++        ]
++        .iter()
++        .flat_map(|w| w.to_le_bytes())
++        .collect();
++        TRACE_GUARDS_TEST.set(true);
++        let p = crate::ir::build(&code, false, 256).unwrap();
++        let structured = lanes(&p).expect("structured form");
++        assert!(structured.guards[2][0].is_some(), "the join's access carries an EXEC guard");
++        let r = track(&p, &[param(Table, 0, 1)], HwStage::Cs, Some(&structured)).unwrap();
++        assert!(
++            r.descriptors
++                .iter()
++                .any(|d| d.role == Role::Sampler && d.source == Source::Constant(vec![0; 4])),
++            "the guarded join resolves the immediate sampler from the live arm: {:?}",
++            r.descriptors
++        );
++    }
+ }

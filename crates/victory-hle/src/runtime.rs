@@ -11,6 +11,7 @@ static MAIN_IMAGE_BASE: AtomicUsize = AtomicUsize::new(0);
 pub fn set_main_image(base: usize) {
     MAIN_IMAGE_BASE.store(base, Ordering::Release);
     crate::image_watch::start(base);
+    victory_gpu::loadmeter::title_image(base);
 }
 
 pub fn main_image() -> Option<usize> {

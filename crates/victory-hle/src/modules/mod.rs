@@ -9,6 +9,8 @@
 //! `xaudio2`, `xstore` stubs.
 
 #[cfg(windows)]
+pub mod affinity;
+#[cfg(windows)]
 pub mod apu;
 pub mod audio;
 pub mod d3d12x;
@@ -39,6 +41,9 @@ pub mod xgamesave;
 pub mod xgameui;
 #[cfg(windows)]
 pub mod xmem;
+#[cfg(windows)]
+pub(crate) mod mapdefer;
+pub(crate) mod pagekinds; // (coder G) VICTORY_PAGE_KINDS (F24/F25)
 pub mod xnetworking;
 pub mod xpackage;
 pub mod xstore;
@@ -57,6 +62,8 @@ pub(crate) fn all() -> Vec<HleModule> {
         dsp::module(),
         xg::module(),
     ];
+    #[cfg(windows)]
+    all.push(affinity::module());
     #[cfg(windows)]
     all.push(apu::module());
     #[cfg(windows)]

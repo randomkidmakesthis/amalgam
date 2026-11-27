@@ -114,6 +114,11 @@ pub fn run(paths: Vec<PathBuf>, verbose: bool, disasm: bool) -> Result<()> {
                             *t.native_stages.entry(n.stage).or_default() += 1;
                             list.push(format!("{:?} {} B", n.stage, n.code.len()));
                             if disasm {
+                                listing.push(format!(
+                                    "    {:?} tag {:016x} (VICTORY_NAN_ORIGIN)",
+                                    n.stage,
+                                    victory_shader::emit::code_tag(&n.code)
+                                ));
                                 listing.push(format!("    {:?} stage I/O: {:?}", n.stage, n.io));
                                 listing.extend(n.layout.iter().map(|p| format!("    {p:?}")));
                                 listing.extend(n.used.iter().map(|u| format!("    {u:?}")));

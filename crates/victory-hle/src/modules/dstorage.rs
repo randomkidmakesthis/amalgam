@@ -526,6 +526,77 @@ impl Drop for Queue {
 
 type QueueRef = *const Instance<Queue>;
 
+/// (F10) `VICTORY_DSTORAGE_OLDEST_FIRST` (fox port: default 0 = the fox
+/// base's order until an A/B run; 1 our tree's default; 2: over priority
+/// classes too): workers take the reads of the oldest
+/// batch first. The title retires its batches strictly oldest first and
+/// blocks its frame thread when 16 are outstanding, so the oldest one
+/// decides when it goes on.
+fn oldest_first() -> u8 {
+    static MODE: OnceLock<u8> = OnceLock::new();
+    *MODE.get_or_init(|| std::env::var("VICTORY_DSTORAGE_OLDEST_FIRST").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(0u8).min(2))
+}
+
+/// How many storage workers run at once (soldsawn 0bba762,
+/// `VICTORY_DSTORAGE_WORKERS=<n>` sets it outright, 1..=64;
+/// `VICTORY_DSTORAGE_WORKERS=physical`: the PC's PHYSICAL cores, not its
+/// logical processors, our tree's default; unset: the fox base's every
+/// logical processor). The pool reads, inflates and
+/// unpacks in parallel; SMT twins add little and crowd the submitting
+/// thread and the copies. The author on an 8c/16t PC: copying back
+/// 2.4-3.5 ms/MB with 8 against 5.7 ms/MB with 16.
+fn worker_count() -> usize {
+    static COUNT: OnceLock<usize> = OnceLock::new();
+    *COUNT.get_or_init(|| {
+        let logical = std::thread::available_parallelism().map_or(4, |n| n.get());
+        // (Fox port) Unset: the fox base's count (every logical processor)
+        // until an A/B run; `physical` (our tree's default): the physical
+        // cores; a number 1..=64: that many.
+        match std::env::var("VICTORY_DSTORAGE_WORKERS").ok().as_deref().map(str::trim) {
+            Some("physical") => physical_cores().unwrap_or_else(|| (logical / 2).max(2)).clamp(1, 32),
+            Some(v) => v.parse::<usize>().ok().filter(|n| (1..=64).contains(n)).unwrap_or(logical),
+            None => logical,
+        }
+    })
+}
+
+/// The PC's physical cores, if the system says (one `RelationProcessorCore`
+/// record per core, whatever its SMT twins).
+fn physical_cores() -> Option<usize> {
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        unsafe extern "system" {
+            fn GetLogicalProcessorInformationEx(relationship: i32, buffer: *mut u8, length: *mut u32) -> i32;
+        }
+        const RELATION_PROCESSOR_CORE: i32 = 0;
+        let mut len: u32 = 0;
+        // SAFETY: a null buffer asks for the size (the call fails, `len` filled).
+        unsafe { GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, std::ptr::null_mut(), &mut len) };
+        if len == 0 {
+            return None;
+        }
+        let mut buf = vec![0u8; len as usize];
+        // SAFETY: the buffer is `len` bytes; the call writes at most that.
+        if unsafe { GetLogicalProcessorInformationEx(RELATION_PROCESSOR_CORE, buf.as_mut_ptr(), &mut len) } == 0 {
+            return None;
+        }
+        // Records of { Relationship: u32, Size: u32, ... }.
+        let (mut at, mut cores) = (0usize, 0usize);
+        while at + 8 <= (len as usize).min(buf.len()) {
+            let size = u32::from_le_bytes(buf[at + 4..at + 8].try_into().ok()?) as usize;
+            if size < 8 || at + size > buf.len() {
+                break;
+            }
+            cores += 1;
+            at += size;
+        }
+        (cores > 0).then_some(cores)
+    }
+    #[cfg(not(windows))]
+    None
+}
+
 /// Every queue's requests, run by a pool of workers.
 struct Scheduler {
     lanes: Mutex<Lanes>,
@@ -629,7 +700,7 @@ fn scheduler() -> Option<&'static Scheduler> {
         })
         .as_ref()?;
     STARTED.call_once(|| {
-        let workers = std::thread::available_parallelism().map_or(4, |n| n.get());
+        let workers = worker_count();
         let started = (0..workers)
             .filter(|i| {
                 std::thread::Builder::new()
@@ -638,7 +709,12 @@ fn scheduler() -> Option<&'static Scheduler> {
                     .is_ok()
             })
             .count();
-        tracing::info!(workers = started, "dstorage: workers");
+        tracing::info!(
+            workers = started,
+            logical = std::thread::available_parallelism().map_or(0, |n| n.get()),
+            oldest_first = oldest_first(),
+            "dstorage: workers (VICTORY_DSTORAGE_WORKERS; physical cores unless set; VICTORY_DSTORAGE_OLDEST_FIRST)"
+        );
     });
     Some(scheduler)
 }
@@ -839,11 +915,28 @@ impl Lanes {
     /// its lane that has started the fewest bytes, if the staging buffer
     /// has room for it (or nothing else holds any).
     fn start(&mut self) -> Option<Job> {
+        self.start_as(oldest_first())
+    }
+
+    /// [`Lanes::start`] with `VICTORY_DSTORAGE_OLDEST_FIRST` = `mode`: 0 the
+    /// lane of the class that has started the fewest bytes (the fox base);
+    /// 1 (default) the class as before, then the lane whose next read was
+    /// submitted first (submission numbers are over all queues, a lane's
+    /// reads in order, so that read belongs to the oldest batch not yet all
+    /// started); 2 the oldest read of any class (priorities ignored).
+    fn start_as(&mut self, mode: u8) -> Option<Job> {
         let busy = || self.lanes.iter().filter(|(_, l)| !l.reads.is_empty());
-        let (_, class) = busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?;
+        let class = if mode >= 2 {
+            busy().filter_map(|(_, l)| Some((l.reads.front()?.0, l.class))).min()?.1
+        } else {
+            busy().map(|(_, l)| (self.clock[l.class], l.class)).min()?.1
+        };
         let (_, _, id) = busy()
             .filter(|(_, l)| l.class == class)
-            .filter_map(|(&id, l)| Some((l.clock, l.reads.front()?.0, id)))
+            .filter_map(|(&id, l)| {
+                let seq = l.reads.front()?.0;
+                Some(if mode >= 1 { (seq, l.clock, id) } else { (l.clock, seq, id) })
+            })
             .min()?;
         let lane = self.lanes.get_mut(&id)?;
         let &(seq, Read { request, note }) = lane.reads.front()?;
@@ -1375,6 +1468,39 @@ extern "system" fn close(this: QueueRef) {
 
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request) -> Result<(), HRESULT> {
+    let result = execute_inner(request);
+    // (coder G, VICTORY_LOAD_READ_METER) The load is done: its pages are guarded for the meter.
+    if result.is_ok() && victory_gpu::loadmeter::on() {
+        load_read_meter(request);
+    }
+    // (coder G, VICTORY_PAGE_KINDS) Into GPU-only pages or CPU-visible ones.
+    if result.is_ok() && super::pagekinds::on() {
+        let size = if request.options & (ZLIB | BCPACK) == 0 { request.source_size } else { request.destination_size } as usize;
+        if request.options & PAGE_DESTINATION != 0 {
+            let offset = (request.page_offset & 0xffff) as usize;
+            let pages = read_list(request.destination.cast(), offset, size);
+            super::pagekinds::written(&super::xmem::page_keys(&pages, offset, size), &super::xmem::shown_at(&pages, offset, size));
+        } else {
+            super::pagekinds::written(&[], &[(request.destination as usize, size)]);
+        }
+    }
+    result
+}
+
+/// Where the title sees a completed request's bytes now (all views), for the load-read meter.
+fn load_read_meter(request: &Request) {
+    let size = if request.options & (ZLIB | BCPACK) == 0 { request.source_size } else { request.destination_size } as usize;
+    let shown = if request.options & PAGE_DESTINATION != 0 {
+        let offset = (request.page_offset & 0xffff) as usize;
+        let pages = read_list(request.destination.cast(), offset, size);
+        super::xmem::shown_at(&pages, offset, size)
+    } else {
+        vec![(request.destination as usize, size)]
+    };
+    victory_gpu::loadmeter::loaded(&shown, request.options, size);
+}
+
+fn execute_inner(request: &Request) -> Result<(), HRESULT> {
     let options = request.options;
     let fail = |hr: HRESULT, why: &str| {
         tracing::warn!(
@@ -1890,6 +2016,68 @@ mod tests {
         (0..n).map(|i| (i * 7 + i / 251) as u8).collect()
     }
 
+    /// (F10, `VICTORY_DSTORAGE_OLDEST_FIRST`) The reads of the oldest batch
+    /// go first, whichever lane holds it and however many bytes each lane
+    /// has started; within a batch in its order; classes still share by
+    /// bytes (mode 1), or not (mode 2).
+    #[test]
+    fn the_oldest_batch_is_read_first() {
+        let mut l = lanes(STAGING);
+        l.lanes.insert(0, Lane::new(0, 4096));
+        l.lanes.insert(1, Lane::new(0, 4096));
+        // Batch 1 on lane 1 (big reads), batch 2 on lane 0, batch 3 on lane 1.
+        for _ in 0..3 {
+            read(&mut l, 1, 0, 1 << 20);
+        }
+        l.submit(1, false);
+        for _ in 0..3 {
+            read(&mut l, 0, 0, 4096);
+        }
+        l.submit(0, false);
+        for _ in 0..3 {
+            read(&mut l, 1, 0, 4096);
+        }
+        l.submit(1, false);
+        let mut order = Vec::new();
+        while let Some(job) = l.start_as(1) {
+            order.push((job.lane, job.seq));
+            l.finish(&job, Ok(()));
+        }
+        let mut seqs: Vec<u64> = order.iter().map(|o| o.1).collect();
+        let sorted = { let mut s = seqs.clone(); s.sort_unstable(); s };
+        assert_eq!(seqs, sorted, "{order:?}");
+        assert_eq!(order.iter().map(|o| o.0).collect::<Vec<_>>(), [1, 1, 1, 0, 0, 0, 1, 1, 1]);
+        // Before: lane 0 had started fewer bytes and went ahead of batch 1.
+        let mut l2 = lanes(STAGING);
+        l2.lanes.insert(0, Lane::new(0, 4096));
+        l2.lanes.insert(1, Lane::new(0, 4096));
+        read(&mut l2, 1, 0, 1 << 20);
+        read(&mut l2, 1, 0, 1 << 20);
+        l2.submit(1, false);
+        read(&mut l2, 0, 0, 4096);
+        l2.submit(0, false);
+        let first = l2.start_as(0).unwrap();
+        l2.finish(&first, Ok(()));
+        assert_eq!(l2.start_as(0).unwrap().lane, 0, "round robin by bytes");
+        // Mode 2: over classes too.
+        let mut l3 = lanes(STAGING);
+        l3.lanes.insert(0, Lane::new(-1, 4096));
+        l3.lanes.insert(1, Lane::new(1, 4096));
+        read(&mut l3, 0, 0, 4096);
+        l3.submit(0, false);
+        read(&mut l3, 1, 0, 4096);
+        l3.submit(1, false);
+        assert_eq!(l3.start_as(2).unwrap().lane, 0, "the low-priority batch is older");
+    }
+
+    #[test]
+    fn physical_cores_are_counted() {
+        let n = physical_cores().expect("the system says");
+        let logical = std::thread::available_parallelism().unwrap().get();
+        assert!(n >= 1 && n <= logical, "{n} of {logical}");
+        assert!((1..=128).contains(&worker_count()));
+    }
+
     #[test]
     fn request_layout_is_the_titles() {
         assert_eq!(size_of::<Request>(), 0x48);
@@ -2243,8 +2431,10 @@ mod tests {
         }
         (0..3).for_each(|id| l.submit(id, false));
         let mut started = [0u32; 3];
+        // (As before `VICTORY_DSTORAGE_OLDEST_FIRST`: round robin by bytes
+        // among the lanes of a class.)
         for _ in 0..330 {
-            let job = l.start().unwrap();
+            let job = l.start_as(0).unwrap();
             started[job.lane as usize] += 1;
             l.finish(&job, Ok(()));
         }

@@ -1,0 +1,941 @@
+diff -ruN '--exclude=target' V1host/crates/victory-gpu/src/descriptor/host.rs V1/crates/victory-gpu/src/descriptor/host.rs
+--- V1host/crates/victory-gpu/src/descriptor/host.rs	2026-11-26 08:28:13.000000000 +0200
++++ V1/crates/victory-gpu/src/descriptor/host.rs	2026-11-26 08:44:17.498028600 +0200
+@@ -3712,6 +3712,65 @@
+ /// the pass over textures picked by index last caught up (`draw.rs` `catch_up_budget`).
+ pub(crate) static FRESH_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ 
++/// (fxceless #927 via trustno1 77e13a9) The unsigned integer format with the layout of a
++/// 16-bit float or signed integer format (one, two or four channels), if `format` is one.
++pub(crate) fn half_format(format: u32) -> Option<u32> {
++    match format {
++        // R16G16B16A16_FLOAT and _SINT: R16G16B16A16_UINT.
++        10 | 14 => Some(12),
++        // R16G16_FLOAT and _SINT: R16G16_UINT.
++        34 | 38 => Some(36),
++        // R16_FLOAT and _SINT: R16_UINT.
++        54 | 59 => Some(57),
++        _ => None,
++    }
++}
++
++/// (fxceless #927) `view` as a shader is shown it where it moves a buffer's 16-bit channels
++/// as unsigned integers (`victory_shader::emit::HostShader::half_views`): a buffer view in a
++/// 16-bit float or signed format, in the unsigned format of the same layout, through which
++/// every 16-bit pattern is read and stored as it is. `None` for every other view: the
++/// title's own serves.
++pub(crate) fn half_view(view: &View) -> Option<View> {
++    // Buffer views: dimension 1 in the title's description of either kind.
++    const BUFFER: u32 = 1;
++    match view {
++        View::Shader(resource, Some(desc)) if desc[1] == BUFFER => {
++            let mut desc = *desc;
++            desc[0] = half_format(desc[0])?;
++            Some(View::Shader(*resource, Some(desc)))
++        }
++        View::Unordered(resource, counter, Some(desc)) if desc[1] == BUFFER => {
++            let mut desc = *desc;
++            desc[0] = half_format(desc[0])?;
++            Some(View::Unordered(*resource, *counter, Some(desc)))
++        }
++        View::Placed(unordered, resource, desc) if resource[0] == BUFFER && desc[1] == BUFFER => {
++            let mut desc = *desc;
++            desc[0] = half_format(desc[0])?;
++            Some(View::Placed(*unordered, *resource, desc))
++        }
++        _ => None,
++    }
++}
++
++/// (fxceless #927) The format of `view`, a buffer view through which a shader moves 16-bit
++/// channels as unsigned integers, if those integers are not what the console gives (wider,
++/// normalised or signed 8-bit channels, which the console converts). `None` for the formats
++/// the integers serve exactly, and for anything not a buffer view.
++pub(crate) fn half_inexact(view: &View) -> Option<u32> {
++    const BUFFER: u32 = 1;
++    // R16G16B16A16, R16G16 and R16 (float, unsigned, signed), then R10G10B10A2, R8G8B8A8,
++    // R8G8 and R8 unsigned.
++    const EXACT: [u32; 13] = [10, 12, 14, 34, 36, 38, 54, 57, 59, 25, 30, 50, 62];
++    let format = match view {
++        View::Shader(_, Some(desc)) | View::Unordered(_, _, Some(desc)) if desc[1] == BUFFER => desc[0],
++        View::Placed(_, resource, desc) if resource[0] == BUFFER && desc[1] == BUFFER => desc[0],
++        _ => return None,
++    };
++    (!EXACT.contains(&format)).then_some(format)
++}
++
+ /// The log line of [`STALE_KEPT`] (from the 5-second meter in `host.rs`).
+ pub(crate) fn stale_kept_line() {
+     let [kept, nulled, again] = STALE_KEPT.each_ref().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed));
+@@ -4244,6 +4303,30 @@
+         }
+     }
+ 
++    /// (fxceless #927) The unsigned twin of a 16-bit float or signed format has its layout,
++    /// and only buffer views in such a format are shown as another view.
++    #[test]
++    fn only_16_bit_float_and_signed_buffer_views_get_an_unsigned_twin() {
++        for (format, unsigned) in [(10, 12), (14, 12), (34, 36), (38, 36), (54, 57), (59, 57)] {
++            assert_eq!(half_format(format), Some(unsigned));
++        }
++        for other in [0, 12, 36, 57, 11, 13, 35, 37, 56, 58, 42, 17, 30, 61] {
++            assert_eq!(half_format(other), None, "format {other}");
++        }
++        const BUFFER: u32 = 1;
++        let words = |format: u32, dimension: u32| [format, dimension, 5768, 0, 0, 0, 64, 0, 0, 0];
++        assert_eq!(
++            half_view(&View::Unordered(7, 0, Some(words(10, BUFFER)))),
++            Some(View::Unordered(7, 0, Some(words(12, BUFFER))))
++        );
++        assert_eq!(half_view(&View::Shader(7, Some(words(54, BUFFER)))), Some(View::Shader(7, Some(words(57, BUFFER)))));
++        assert_eq!(half_view(&View::Unordered(7, 0, Some(words(12, BUFFER)))), None);
++        assert_eq!(half_view(&View::Unordered(7, 0, Some(words(10, 4)))), None);
++        assert_eq!(half_view(&View::Shader(7, None)), None);
++        assert_eq!(half_inexact(&View::Shader(7, Some(words(41, BUFFER)))), Some(41));
++        assert_eq!(half_inexact(&View::Shader(7, Some(words(12, BUFFER)))), None);
++    }
++
+     /// A null texture UAV keeps the title's dimension (3D for the world's
+     /// wind field), and is 2D when the title names none.
+     #[test]
+diff -ruN '--exclude=target' V1host/crates/victory-gpu/src/draw.rs V1/crates/victory-gpu/src/draw.rs
+--- V1host/crates/victory-gpu/src/draw.rs	2026-11-26 08:37:28.000000000 +0200
++++ V1/crates/victory-gpu/src/draw.rs	2026-11-26 08:44:17.546879200 +0200
+@@ -1737,6 +1737,14 @@
+             if crate::shadow::any_flagged() {
+                 STAGE_HASH.set(u64::from_str_radix(&stage.shader.hash, 16).unwrap_or(0));
+             }
++            // (fxceless #927) The table places this stage moves 16-bit halves through.
++            HALF_PLACES.with_borrow_mut(|h| {
++                h.clear();
++                h.extend_from_slice(&t.host.half_views);
++            });
++            if !t.host.half_views.is_empty() {
++                note_half_views(&p.name, &stage.shader.hash, &t.host.half_views);
++            }
+             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+             STORES.set(true);
+             if made.iter().any(|m| m.1 == u32::MAX) {
+@@ -3624,6 +3632,27 @@
+                 fresh.push(u.slot);
+             }
+         }
++        // (fxceless #927) A table with a 16-bit float or signed buffer view at a place the
++        // shader moves halves through is made afresh too, with that view in the unsigned
++        // format of the same layout (`descriptor::host::half_view`); the title's own slot
++        // keeps the title's format for the shaders that read it as floats.
++        let half: Vec<(u8, u32)> = HALF_PLACES.with_borrow(|h| h.clone());
++        for &(slot, at) in &half {
++            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
++                continue;
++            };
++            let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
++                continue;
++            };
++            if crate::descriptor::host::half_view(&view).is_some() {
++                fresh.push(slot);
++            } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
++                once!(
++                    format,
++                    "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
++                );
++            }
++        }
+         fresh.sort_unstable();
+         fresh.dedup();
+         for u in used.iter().filter(tables) {
+@@ -3664,6 +3693,9 @@
+                     index.byte_offset.wrapping_add(constant << index.shift) / 32
+                 })
+                 .collect();
++            // (fxceless #927) The places the shader moves halves through are made too, and
++            // the table reaches them (they may lie past the range starts the entries give).
++            selected.extend(half.iter().filter(|&&(s, _)| s == slot).map(|&(_, at)| at / 8));
+             selected.sort_unstable();
+             selected.dedup();
+             let n = entries
+@@ -3699,6 +3731,11 @@
+                     let at = table + u64::from(k) * 32;
+                     // SAFETY: a descriptor slot in title memory.
+                     unsafe { (at as *const [u32; 3]).read_unaligned() }.hash(&mut h);
++                    // (Another table than the same slots made for a shader that reads them
++                    // in the title's formats.)
++                    if half.contains(&(slot, k * 8)) {
++                        [u32::MAX, u32::from(slot), k].hash(&mut h);
++                    }
+                 }
+                 // (Neptune) By contents alone (`tables_by_content`): the title writes every
+                 // draw's table at a place of its own, and two thirds of a frame's tables
+@@ -3868,7 +3905,19 @@
+                         host.constant_at(index, gpu, size);
+                     }
+                     Some(view) => {
+-                        host.make_at(index, &view);
++                        // (fxceless #927) The unsigned twin where the shader moves halves.
++                        let twin = if half.contains(&(slot, k * 8)) {
++                            crate::descriptor::host::half_view(&view)
++                        } else {
++                            None
++                        };
++                        match twin {
++                            Some(twin) => {
++                                HALF_VIEWS_SHOWN.fetch_add(1, Ordering::Relaxed);
++                                host.make_at(index, &twin);
++                            }
++                            None => host.make_at(index, &view),
++                        }
+                         let kind = used.map(|u| u.kind).or_else(|| {
+                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
+                         });
+@@ -4851,6 +4900,35 @@
+     spans
+ }
+ 
++thread_local! {
++    /// (fxceless #927) While a stage's tables are made: the table places it moves 16-bit
++    /// halves through (`HostShader::half_views`).
++    static HALF_PLACES: std::cell::RefCell<Vec<(u8, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
++}
++
++/// (fxceless #927) Since the start: host slots of tables made with the unsigned twin of a
++/// 16-bit float or signed buffer view (`descriptor::host::half_view`).
++pub(crate) static HALF_VIEWS_SHOWN: AtomicU64 = AtomicU64::new(0);
++
++/// (fxceless #927) Logs, once per shader (at most 256), that a stage moves 16-bit halves as
++/// unsigned integers through table places: the face programs (`compute_graph_ops`,
++/// `ped_standard_head_cs`, `ped_skinning_cs`) should show here.
++fn note_half_views(pipeline: &str, shader: &str, places: &[(u8, u32)]) {
++    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
++    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
++    let seen = seen.get_or_insert_with(Default::default);
++    if seen.len() >= 256 || !seen.insert(shader.to_owned()) {
++        return;
++    }
++    tracing::info!(
++        pipeline,
++        shader,
++        places = ?places,
++        "a shader moves 16-bit halves as unsigned integers through these table places (root parameter, dword): \
++         16-bit float views there are shown as their unsigned twin (VICTORY_HALF_VIEWS=0: off, needs a re-warmed shader cache)"
++    );
++}
++
+ /// (Neptune) Whether a table made afresh is remembered as ready within its host list
+ /// (`VICTORY_READY_TABLES=0`: its views are made ready again for every draw, as before).
+ fn ready_tables_on() -> bool {
+diff -ruN '--exclude=target' V1host/crates/victory-gpu/src/host.rs V1/crates/victory-gpu/src/host.rs
+--- V1host/crates/victory-gpu/src/host.rs	2026-11-26 08:34:33.000000000 +0200
++++ V1/crates/victory-gpu/src/host.rs	2026-11-26 08:44:17.619550600 +0200
+@@ -10391,6 +10391,11 @@
+                 crate::pipeline::variants_made()
+             );
+             tracing::info!(
++                "since the start: {} table slots made with the unsigned twin of a 16-bit float buffer view, for shaders that move halves \
++                 as integers (the face programs; VICTORY_HALF_VIEWS=0: off)",
++                crate::draw::HALF_VIEWS_SHOWN.load(Ordering::Relaxed)
++            );
++            tracing::info!(
+                 "copies left out since the start because both sides were one host texture: {}",
+                 crate::list::SELF_COPIES.load(Ordering::Relaxed)
+             );
+diff -ruN '--exclude=target' V1host/crates/victory-gpu/src/shader_cache.rs V1/crates/victory-gpu/src/shader_cache.rs
+--- V1host/crates/victory-gpu/src/shader_cache.rs	2026-11-25 19:11:21.000000000 +0200
++++ V1/crates/victory-gpu/src/shader_cache.rs	2026-11-26 08:44:17.447579100 +0200
+@@ -246,6 +246,12 @@
+             word(&mut out, value);
+         }
+     }
++    // (fxceless #927) The table places the shader moves halves through.
++    word(&mut out, s.half_views.len() as u32);
++    for &(slot, dword) in &s.half_views {
++        word(&mut out, u32::from(slot));
++        word(&mut out, dword);
++    }
+     out
+ }
+ 
+@@ -314,6 +320,11 @@
+             shift: u8::try_from(r.word()?).ok().filter(|&s| s < 32)?,
+         });
+     }
++    let n = r.word()? as usize;
++    let mut half_views = Vec::with_capacity(n.min(256));
++    for _ in 0..n {
++        half_views.push((u8::try_from(r.word()?).ok()?, r.word()?));
++    }
+     r.0.is_empty().then_some(HostShader {
+         stage,
+         dxil,
+@@ -324,6 +335,7 @@
+         root_srvs,
+         root_uavs,
+         root_indexed_views,
++        half_views,
+     })
+ }
+ 
+@@ -358,6 +370,7 @@
+                 byte_offset: 32,
+                 shift: 5,
+             }],
++            half_views: vec![(0, 8), (4, 0)],
+         }
+     }
+ 
+diff -ruN '--exclude=target' V1host/crates/victory-shader/src/emit/descriptor_data.rs V1/crates/victory-shader/src/emit/descriptor_data.rs
+--- V1host/crates/victory-shader/src/emit/descriptor_data.rs	2026-11-25 19:11:21.000000000 +0200
++++ V1/crates/victory-shader/src/emit/descriptor_data.rs	2026-11-26 08:42:16.232600800 +0200
+@@ -106,7 +106,12 @@
+                     let props = if un.starts_with("buffer_load_format")
+                         || un.starts_with("buffer_store_format")
+                     {
+-                        (10 | u, 0x409)
++                        // (fxceless #927) Unsigned integers where the access moves halves.
++                        let halves = self.table_place(&Source::Loaded { load: site, first }).is_some_and(|p| {
++                            self.halves_only.contains(&p)
++                                && (un.contains("_format_d16_") || self.format_load_read_as_halves(ui))
++                        });
++                        (10 | u, if halves { 0x405 } else { 0x409 })
+                     } else if *idxen && format.is_none() && stride >= 4 && stride.is_multiple_of(4)
+                     {
+                         (12 | u, stride)
+diff -ruN '--exclude=target' V1host/crates/victory-shader/src/emit/halves.rs V1/crates/victory-shader/src/emit/halves.rs
+--- V1host/crates/victory-shader/src/emit/halves.rs	1970-01-01 02:00:00.000000000 +0200
++++ V1/crates/victory-shader/src/emit/halves.rs	2026-11-26 08:40:49.461924400 +0200
+@@ -0,0 +1,148 @@
++//! Typed buffer loads that move 16-bit halves without the d16 form: a
++//! format load of whole dwords whose result the program reads only one
++//! half of, as a half float, moves 16-bit integers, like a d16 access
++//! ([`super::super::HostShader::half_views`]).
++
++use std::collections::HashSet;
++
++use super::{Fields, Inst, Lower, Operand, Reg, Role, RootType, Source, Value};
++
++impl<'a> Lower<'a> {
++    /// Whether every use of `value`, a typed buffer load's result, reads
++    /// one 16-bit half of it as a half float: a `v_fma_mix*` source with
++    /// its `op_sel_hi` bit set, or `v_cvt_f32_f16`. A program that takes a
++    /// format load apart like that reads a 16-bit integer view on the
++    /// console (the load gives the zero-extended integer, whose bits are a
++    /// half; a float view's value it would not take apart). A use is a
++    /// read as an operand ([`crate::ir::operand_reads`]): a later write of
++    /// the register reads the value only to keep it in the lanes EXEC
++    /// leaves alone, and a phi carries it on, its own uses counting. False
++    /// without a use.
++    pub(super) fn read_only_as_halves(&self, value: Value) -> bool {
++        let p = self.x.p;
++        let mut used = false;
++        let mut seen = HashSet::from([value]);
++        let mut todo = vec![value];
++        while let Some(value) = todo.pop() {
++            for b in &p.blocks {
++                for phi in b.phis.iter().filter(|phi| phi.args.contains(&value)) {
++                    if seen.insert(phi.value) {
++                        todo.push(phi.value);
++                    }
++                }
++                for i in &b.insts {
++                    if !i.reads.iter().any(|r| r.1 == value) {
++                        continue;
++                    }
++                    let operands = crate::ir::operand_reads(p, i);
++                    let regs: Vec<Reg> = i
++                        .reads
++                        .iter()
++                        .filter(|r| r.1 == value && operands.contains(&r.0))
++                        .map(|r| r.0)
++                        .collect();
++                    if regs.is_empty() {
++                        continue;
++                    }
++                    used = true;
++                    let Fields::Valu(v) = &i.fields else {
++                        return false;
++                    };
++                    match i.name() {
++                        "v_cvt_f32_f16" => {}
++                        "v_fma_mix_f32" | "v_fma_mixlo_f16" | "v_fma_mixhi_f16" => {
++                            let whole = v.src.iter().enumerate().any(|(k, op)| {
++                                matches!(*op, Operand::Vector { reg, .. } if regs.contains(&Reg::V(reg)))
++                                    && v.opsel_hi >> k & 1 == 0
++                            });
++                            if whole {
++                                return false;
++                            }
++                        }
++                        _ => return false,
++                    }
++                }
++            }
++        }
++        used
++    }
++
++    /// Whether `inst` is a format load of whole dwords (not d16) whose
++    /// every channel is read only as halves ([`Self::read_only_as_halves`]).
++    pub(super) fn format_load_read_as_halves(&self, inst: &Inst) -> bool {
++        let Fields::Buffer {
++            data: Some(Operand::Vector { reg, .. }),
++            ..
++        } = inst.fields
++        else {
++            return false;
++        };
++        let name = inst.name();
++        let count = match name
++            .strip_prefix("buffer_load_format_")
++            .or(name.strip_prefix("tbuffer_load_format_"))
++        {
++            Some("x") => 1,
++            Some("xy") => 2,
++            Some("xyz") => 3,
++            Some("xyzw") => 4,
++            _ => return false,
++        };
++        (0..count).all(|k| {
++            inst.write(Reg::V(reg + k))
++                .is_some_and(|v| self.read_only_as_halves(v))
++        })
++    }
++
++    /// The table places ([`Self::table_place`]) every access through which
++    /// moves halves: a d16 access, or a format load read only as halves
++    /// ([`Self::format_load_read_as_halves`]). A place the program reaches
++    /// otherwise too is left out (a format load of numbers beside one of
++    /// halves, a raw or scalar load, a descriptor chosen by control flow),
++    /// and so is every place of a table the program also picks from at run
++    /// time: what the program makes of such a view is not halves alone.
++    pub(super) fn places_read_as_halves(&self) -> std::collections::BTreeSet<(u8, u32)> {
++        let mut halves = std::collections::BTreeSet::new();
++        let mut other = std::collections::BTreeSet::new();
++        let mut picked = HashSet::new();
++        for d in &self.x.res.descriptors {
++            if d.role == Role::Sampler {
++                continue;
++            }
++            let inst = self
++                .x
++                .p
++                .blocks
++                .get(d.site.0)
++                .and_then(|b| b.insts.get(d.site.1));
++            let half = matches!(d.source, Source::Loaded { .. })
++                && inst.is_some_and(|i| {
++                    (i.name().starts_with("buffer_") && i.name().contains("_format_d16_"))
++                        || self.format_load_read_as_halves(i)
++                });
++            for leaf in d.source.leaves() {
++                let Source::Loaded { load, .. } = leaf else {
++                    continue;
++                };
++                let Some(a) = self.scalar.get(load) else {
++                    continue;
++                };
++                if a.dynamic.is_some() {
++                    if let Some(rp) = self.x.native.layout.get(a.param)
++                        && rp.root == RootType::Table
++                    {
++                        picked.insert(rp.slot);
++                    }
++                } else if let Some(place) = self.table_place(leaf) {
++                    if half {
++                        halves.insert(place);
++                    } else {
++                        other.insert(place);
++                    }
++                }
++            }
++        }
++        halves.retain(|p| !other.contains(p) && !picked.contains(&p.0));
++        halves
++    }
++}
+diff -ruN '--exclude=target' V1host/crates/victory-shader/src/emit/host.rs V1/crates/victory-shader/src/emit/host.rs
+--- V1host/crates/victory-shader/src/emit/host.rs	2026-11-25 21:38:26.000000000 +0200
++++ V1/crates/victory-shader/src/emit/host.rs	2026-11-26 08:41:08.176114500 +0200
+@@ -600,6 +600,7 @@
+         root_srvs: Vec::new(),
+         root_uavs: Vec::new(),
+         root_indexed_views: Vec::new(),
++        half_views: Vec::new(),
+     }
+ }
+ 
+diff -ruN '--exclude=target' V1host/crates/victory-shader/src/emit/intersect_tests.rs V1/crates/victory-shader/src/emit/intersect_tests.rs
+--- V1host/crates/victory-shader/src/emit/intersect_tests.rs	2026-11-25 19:11:21.000000000 +0200
++++ V1/crates/victory-shader/src/emit/intersect_tests.rs	2026-11-26 08:41:08.178624900 +0200
+@@ -188,6 +188,7 @@
+         root_srvs: lowered.root_srvs,
+         root_uavs: lowered.root_uavs,
+         root_indexed_views: res.root_indexed_views.clone(),
++        half_views: Vec::new(),
+     };
+     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+         let mut copy = shader.dxil.clone();
+diff -ruN '--exclude=target' V1host/crates/victory-shader/src/emit/lower.rs V1/crates/victory-shader/src/emit/lower.rs
+--- V1host/crates/victory-shader/src/emit/lower.rs	2026-11-25 22:14:18.000000000 +0200
++++ V1/crates/victory-shader/src/emit/lower.rs	2026-11-26 08:46:31.091735300 +0200
+@@ -30,6 +30,19 @@
+ #[path = "descriptor_data.rs"]
+ mod descriptor_data;
+ 
++/// (fxceless #927 via trustno1 77e13a9) Format loads that move 16-bit halves without the
++/// d16 form, a child module so it shares the emitter's state.
++#[path = "halves.rs"]
++mod halves;
++
++/// Whether table places that move 16-bit halves are lowered as unsigned integers and named
++/// to the host ([`super::HostShader::half_views`]; `VICTORY_HALF_VIEWS=0`: as before, the
++/// halves go through float views, which read zeros on NVIDIA: frozen faces).
++fn half_views_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_HALF_VIEWS").is_none_or(|v| v != "0"))
++}
++
+ /// 64-bit floats (the water volumetrics' wave sums of doubles, taken back as floats), a child
+ /// module so it shares the emitter's state.
+ #[path = "float64.rs"]
+@@ -65,6 +78,8 @@
+     pub root_cbvs: Vec<u8>,
+     pub root_srvs: Vec<u8>,
+     pub root_uavs: Vec<u8>,
++    /// See [`super::HostShader::half_views`].
++    pub half_views: Vec<(u8, u32)>,
+     pub user_data: Vec<UserData>,
+     pub samplers: Vec<[u32; 4]>,
+     /// The wave size the shader requires of the host, if any.
+@@ -215,6 +230,11 @@
+     params: HashMap<Value, (usize, u32)>,
+     user_data: Option<V>,
+     user_reads: BTreeMap<u32, UserData>,
++    /// Table descriptors read or written sixteen bits a channel
++    /// ([`super::HostShader::half_views`]): root parameter, dword offset.
++    half_views: std::collections::BTreeSet<(u8, u32)>,
++    /// [`Self::places_read_as_halves`], found before the code is lowered.
++    halves_only: std::collections::BTreeSet<(u8, u32)>,
+     samplers: Vec<[u32; 4]>,
+     descriptors: HashMap<(Site, bool), &'a Source>,
+     scalar: HashMap<Site, Address>,
+@@ -1394,6 +1414,8 @@
+             params: x.res.params.iter().map(|&(v, p, d)| (v, (p, d))).collect(),
+             user_data: None,
+             user_reads: BTreeMap::new(),
++            half_views: Default::default(),
++            halves_only: Default::default(),
+             samplers: Vec::new(),
+             descriptors: x
+                 .res
+@@ -2193,6 +2215,9 @@
+ 
+     fn run(mut self) -> Result<Lowered, Stop> {
+         let p = self.x.p;
++        if half_views_on() {
++            self.halves_only = self.places_read_as_halves();
++        }
+         let order = crate::ir::reverse_postorder(&p.blocks);
+         for (n, &b) in order.iter().enumerate() {
+             self.rpo[b] = n;
+@@ -2326,6 +2351,7 @@
+         let root_cbvs = self.s.root_cbvs.iter().map(|r| r.0).collect();
+         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
+         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
++        let half_views = std::mem::take(&mut self.half_views).into_iter().collect();
+         let cmp_samplers = self.s.cmp_samplers;
+         let wave_size = self.s.wave_size;
+         Ok(Lowered {
+@@ -2334,6 +2360,7 @@
+             root_cbvs,
+             root_srvs,
+             root_uavs,
++            half_views,
+             #[cfg(test)]
+             nonuniform_handles: self.s.nonuniform_handles,
+             #[cfg(test)]
+@@ -3665,6 +3692,40 @@
+         self.s.m.cast(c, Cast::Trunc, hi, self.s.t.i32)
+     }
+ 
++    /// (Neptune 25fbf69, upstream) `VICTORY_NAN_GUARD` (on unless `0`): a float a pixel
++    /// program exports to a colour target, or a store writes to a typed image or buffer, with
++    /// NaN made 0 and an infinity ±65504, so one bad pixel does not stay in a history the
++    /// title blends into each frame (glowing eyes, white shots). `strict` (float targets):
++    /// every NaN. Otherwise only the NaNs the GPU makes (0x7FC00000, either sign) and
++    /// infinities: a typed store may carry an integer's bits.
++    // shortcut: raw buffer stores are left as they are (no type to go by).
++    fn nan_guard(&mut self, f: V, strict: bool) -> V {
++        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        if !*ON.get_or_init(|| std::env::var_os("VICTORY_NAN_GUARD").is_none_or(|v| v != "0")) {
++            return f;
++        }
++        let c = self.cur;
++        let bits = self.as_int(f);
++        let mag = self.s.m.i32(0x7FFF_FFFF);
++        let abs = self.s.m.bin(c, Bin::And, bits, mag);
++        let inf_bits = self.s.m.i32(0x7F80_0000);
++        let nan = if strict {
++            self.s.m.cmp(c, pred::IUGT, abs, inf_bits)
++        } else {
++            let quiet = self.s.m.i32(0x7FC0_0000);
++            self.s.m.cmp(c, pred::EQ, abs, quiet)
++        };
++        let inf = self.s.m.cmp(c, pred::EQ, abs, inf_bits);
++        let sign_bit = self.s.m.i32(0x8000_0000);
++        let sign = self.s.m.bin(c, Bin::And, bits, sign_bit);
++        let big = self.s.m.i32(65504f32.to_bits());
++        let big = self.s.m.bin(c, Bin::Or, sign, big);
++        let zero = self.s.m.i32(0);
++        let r = self.s.m.select(c, inf, big, bits);
++        let r = self.s.m.select(c, nan, zero, r);
++        self.as_float(r)
++    }
++
+     /// `0 × anything = 0`, as in D3D9.
+     fn legacy_mul(&mut self, a: V, b: V) -> V {
+         let c = self.cur;
+@@ -4515,6 +4576,35 @@
+         (self.s.m.select(c, any, at, first), any)
+     }
+ 
++    /// (Neptune 25fbf69 `helpers_read`; avatarmanz 1c8dd31 / myokex 95e9571
++    /// `VICTORY_PS_QUAD_READS`, on unless `0`) Whether a read of another lane of this lane's
++    /// quad must reach helper lanes: in a pixel shader, always. At a triangle's edge the
++    /// quad's other pixels are helpers, which only quad reads see: wave reads give 0 from
++    /// them on AMD, so a derivative taken by hand (`quad_perm`) was the whole value there, the
++    /// texture read that used it took its smallest level (lines on paint, glass and skin;
++    /// holes in lamp shadows). NVIDIA unproven.
++    fn helpers_read(&self, quad: bool) -> bool {
++        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        quad && self.s.pixel && *ON.get_or_init(|| std::env::var_os("VICTORY_PS_QUAD_READS").is_none_or(|v| v != "0"))
++    }
++
++    /// (Neptune 25fbf69 `helper_reads_own`, upstream 0601955) `v_readfirstlane_b32`'s result
++    /// `first` of `own` in a pixel shader: a helper lane takes its own value instead. On the
++    /// console whole-quad mode puts helper lanes in EXEC, so a waterfall loop serves them; on
++    /// the host wave operations leave them out, and once only helper lanes are left in such
++    /// a loop no lane matches and the loop runs to its limit. With its own value a helper
++    /// lane matches in the first pass and leaves (what it computes only feeds derivatives).
++    /// `VICTORY_HELPER_OWN=0`: as before.
++    fn helper_reads_own(&mut self, own: V, first: V) -> V {
++        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        if !self.s.pixel || !*ON.get_or_init(|| std::env::var_os("VICTORY_HELPER_OWN").is_none_or(|v| v != "0")) {
++            return first;
++        }
++        let c = self.cur;
++        let helper = self.s.op(c, "isHelperLane.i1", Attr::ReadOnly, self.s.t.i1, 221, &[]);
++        self.s.m.select(c, helper, own, first)
++    }
++
+     fn read_lane(&mut self, x: V, lane: V) -> V {
+         self.s.op(
+             self.cur,
+@@ -4605,7 +4695,7 @@
+                 let t = self.s.m.bin(c, Bin::Or, t, or);
+                 self.s.m.bin(c, Bin::Xor, t, xor)
+             };
+-            let r = if mesh_quad {
++            let r = if mesh_quad || self.helpers_read(quad) {
+                 self.quad_pick(x, src)
+             } else {
+                 self.read_lane(x, src)
+@@ -6237,6 +6327,19 @@
+         biased.then(|| self.host_word(RootType::Other(USER_VIEW_BIAS), rp.slot, 0))
+     }
+ 
++    /// (fxceless #927) The table descriptor `src` is, as (root parameter, dword in the
++    /// table), when the code loads it from a fixed place in a table: the load's own place,
++    /// not the start of the range its used-resource entry describes. `None` for a
++    /// descriptor picked at run time, built in the code or chosen by control flow.
++    fn table_place(&self, src: &Source) -> Option<(u8, u32)> {
++        let Source::Loaded { load, first } = src else {
++            return None;
++        };
++        let a = self.scalar.get(load)?;
++        let rp = self.x.native.layout.get(a.param)?;
++        (rp.root == RootType::Table && a.dynamic.is_none()).then(|| (rp.slot, a.offset / 4 + u32::from(*first)))
++    }
++
+     /// The used-resource entry a descriptor loaded from a table falls in.
+     fn used_kind(&self, src: &Source) -> Option<&'a UsedResource> {
+         if let Source::Phi { args, .. } | Source::Select { args, .. } | Source::Lanes { args, .. } =
+@@ -6839,7 +6942,7 @@
+                 (src, inside, masks, bound_ctrl)
+             }
+         };
+-        let mut r = if mesh_quad {
++        let mut r = if mesh_quad || self.helpers_read(quad) {
+             self.quad_pick(x, src)
+         } else {
+             self.read_lane(x, src)
+@@ -7748,6 +7851,7 @@
+                 } else {
+                     mine
+                 };
++                let r = self.helper_reads_own(a, r);
+                 int(self, r)
+             }
+             _ => {
+@@ -9485,6 +9589,7 @@
+                     self.float_of(v)?
+                 });
+             }
++            let vals: Vec<V> = vals.into_iter().map(|v| self.nan_guard(v, false)).collect();
+             let h = self.handle(site, src, false, props)?;
+             let at = self.begin_guarded(guard);
+             let mut args = vec![h];
+@@ -10163,6 +10268,21 @@
+             .copied()
+             .ok_or("an untracked buffer")?;
+         let used = self.used_kind(src);
++        // (fxceless #927) Sixteen bits a channel through a view of a table: the bits go as
++        // they are, as unsigned integers, and the host is told, which shows the shader a
++        // 16-bit float view there as its unsigned twin ([`super::HostShader::half_views`]).
++        // A d16 access, or a format load of whole dwords whose every use reads one half of
++        // a result as a half float (the head program's reads of the face network's
++        // output), where every access through its place does
++        // ([`Self::places_read_as_halves`]).
++        let place = (typed && format.is_none())
++            .then(|| self.table_place(src))
++            .flatten()
++            .filter(|p| self.halves_only.contains(p) && (d16 || self.format_load_read_as_halves(inst)));
++        let halves = place.is_some();
++        if let Some(place) = place {
++            self.half_views.insert(place);
++        }
+         let (base, extra) = self.built_offset(src)?;
+         if base != 0 {
+             let b = self.s.m.i32(base);
+@@ -10382,6 +10502,8 @@
+             if d16 {
+                 // shortcut: d16 data is taken as f16 (integer formats would
+                 // keep 16 bits), widened for the 32-bit float store.
++                // (fxceless #927) Through a view of a table that moves halves each half is
++                // stored as it is.
+                 let mut wide = Vec::new();
+                 for k in 0..count {
+                     let mut x = vals[(k / 2) as usize];
+@@ -10389,6 +10511,11 @@
+                         let k16 = self.s.m.i32(16);
+                         x = self.s.m.bin(c, Bin::LShr, x, k16);
+                     }
++                    if halves {
++                        let low = self.s.m.i32(0xffff);
++                        wide.push(self.s.m.bin(c, Bin::And, x, low));
++                        continue;
++                    }
+                     let f32t = self.s.t.f32;
+                     let f = self
+                         .s
+@@ -10404,12 +10531,19 @@
+                 if count != 4 || *offen || *offset != 0 {
+                     return Err("a typed buffer store of some channels or at an offset");
+                 }
+-                args.push(self.handle(site, src, false, (10 | u, 0x409))?);
++                // (fxceless #927) Four unsigned integers for halves, four floats otherwise.
++                let component = if halves { 0x405 } else { 0x409 };
++                args.push(self.handle(site, src, false, (10 | u, component))?);
+                 args.extend([index.unwrap_or(self.s.m.i32(0)), iu]);
+                 for x in vals {
+-                    args.push(self.as_float(x));
++                    if halves {
++                        args.push(x);
++                    } else {
++                        let f = self.as_float(x);
++                        args.push(self.nan_guard(f, false));
++                    }
+                 }
+-                (69, "bufferStore.f32")
++                (69, if halves { "bufferStore.i32" } else { "bufferStore.f32" })
+             } else {
+                 match index {
+                     // A raw buffer (stride 1) written by index: the index is the byte.
+@@ -10465,16 +10599,24 @@
+             if uav {
+                 self.s.flags |= flags::TYPED_UAV_LOADS;
+             }
+-            let h = self.handle(site, src, false, (10 | u, 0x409))?;
+             let index = index.unwrap_or(self.s.m.i32(0));
+-            self.s.op(
+-                c,
+-                "bufferLoad.f32",
+-                Attr::ReadOnly,
+-                self.s.t.res_ret,
+-                68,
+-                &[h, index, iu],
+-            )
++            if halves {
++                // (fxceless #927) The halves as unsigned integers.
++                let h = self.handle(site, src, false, (10 | u, 0x405))?;
++                let i32t = self.s.t.i32;
++                let ret = self.s.m.named_struct("dx.types.ResRet.i32", vec![i32t; 5]);
++                self.s.op(c, "bufferLoad.i32", Attr::ReadOnly, ret, 68, &[h, index, iu])
++            } else {
++                let h = self.handle(site, src, false, (10 | u, 0x409))?;
++                self.s.op(
++                    c,
++                    "bufferLoad.f32",
++                    Attr::ReadOnly,
++                    self.s.t.res_ret,
++                    68,
++                    &[h, index, iu],
++                )
++            }
+         } else {
+             let mask = self.s.m.i8((1u8 << count) - 1);
+             let align = self.s.m.i32(4);
+@@ -10531,9 +10673,14 @@
+                 let mut x = None;
+                 for ch in (2 * k..(2 * k + 2).min(count)).rev() {
+                     let f = self.s.m.extract(c, r, ch);
+-                    let h = self
+-                        .s
+-                        .op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f]);
++                    // (fxceless #927) Through a view of a table that moves halves, the 16
++                    // bits of each as they are.
++                    let h = if halves {
++                        let low = self.s.m.i32(0xffff);
++                        self.s.m.bin(c, Bin::And, f, low)
++                    } else {
++                        self.s.op(c, "legacyF32ToF16", Attr::ReadNone, i32t, 130, &[f])
++                    };
+                     x = Some(match x {
+                         Some(hi) => {
+                             let hi = self.s.m.bin(c, Bin::Shl, hi, k16);
+@@ -10548,7 +10695,8 @@
+         }
+         for k in 0..count {
+             let x = self.s.m.extract(c, r, k);
+-            let x = self.as_int(x);
++            // (Integers already where the load moved halves.)
++            let x = if halves { x } else { self.as_int(x) };
+             self.write(inst, Reg::V(reg + k as u8), x, guard);
+         }
+         Ok(())
+@@ -10758,9 +10906,13 @@
+                     .op(c, "legacyF16ToF32", Attr::ReadNone, f32t, 131, &[x]);
+                 x = self.as_int(f);
+             }
++            let pixel = self.s.pixel;
+             let el = &mut elements(self, primitive)[id];
+             el.usage |= 1 << col;
+-            let (suffix, x) = match el.comp {
++            // (Neptune) A pixel program's float colour target (`VICTORY_NAN_GUARD`).
++            let (kind, comp) = (el.kind, el.comp);
++            let target = !mesh && pixel && kind == 16 && comp == 9;
++            let (suffix, x) = match comp {
+                 9 if half.is_some() => (".f32", self.as_float(x)),
+                 9 => {
+                     let f = match self.floats.get(&value) {
+@@ -10771,6 +10923,7 @@
+                 }
+                 _ => (".i32", x),
+             };
++            let x = if target { self.nan_guard(x, true) } else { x };
+             let sig = if primitive { id as u32 } else { self.sig_id(false, id) };
+             let mut args = vec![
+                 self.s.m.i32(sig),
+diff -ruN '--exclude=target' V1host/crates/victory-shader/src/emit/mod.rs V1/crates/victory-shader/src/emit/mod.rs
+--- V1host/crates/victory-shader/src/emit/mod.rs	2026-11-25 22:14:18.000000000 +0200
++++ V1/crates/victory-shader/src/emit/mod.rs	2026-11-26 08:42:06.692811100 +0200
+@@ -276,6 +276,17 @@
+     pub root_uavs: Vec<u8>,
+     /// Heap descriptors that can be selected from root state at bind time.
+     pub root_indexed_views: Vec<crate::resource::RootIndexedView>,
++    /// (fxceless #927 via trustno1 77e13a9) Table descriptors (root parameter, dword
++    /// offset in the table) through which the shader moves sixteen bits a channel as
++    /// they are: a d16 typed access, or a format load of whole dwords whose every use
++    /// reads one half as a half float (the head program's reads of the face network's
++    /// output), where every access through that place does. On the console the 16 bits
++    /// move as they are through a 16-bit float view and an integer one alike; the DXIL
++    /// moves them as unsigned integers, and the host shows the shader a 16-bit float or
++    /// signed buffer view at these places as the unsigned format of the same layout
++    /// (`descriptor::host::half_view`). Read as floats on NVIDIA they came back as zeros:
++    /// frozen faces. `VICTORY_HALF_VIEWS=0`: none, as before.
++    pub half_views: Vec<(u8, u32)>,
+ }
+ 
+ impl HostShader {
+@@ -1012,6 +1023,7 @@
+         root_srvs: l.root_srvs,
+         root_uavs: l.root_uavs,
+         root_indexed_views: res.root_indexed_views.clone(),
++        half_views: l.half_views,
+     };
+     Ok((shader, wave_size))
+ }
+@@ -1460,6 +1472,7 @@
+             root_srvs: Vec::new(),
+             root_uavs: Vec::new(),
+             root_indexed_views: Vec::new(),
++            half_views: Vec::new(),
+         };
+         let file = |var: &str, stage| {
+             std::env::var(var).ok().map(|p| super::HostShader {
+@@ -1472,6 +1485,7 @@
+                 root_srvs: Vec::new(),
+                 root_uavs: Vec::new(),
+                 root_indexed_views: Vec::new(),
++                half_views: Vec::new(),
+             })
+         };
+         let ps = file("VICTORY_REF_PS", crate::HwStage::Ps).unwrap_or(ps);
+@@ -1761,6 +1775,7 @@
+                 root_srvs: l.root_srvs,
+                 root_uavs: l.root_uavs,
+                 root_indexed_views: Vec::new(),
++                half_views: Vec::new(),
+             };
+             let (root, pso) = host.compute_pipeline(&cs).unwrap();
+             let inputs: Vec<u32> = [
+diff -ruN '--exclude=target' V1host/crates/victory-shader/src/emit/rect.rs V1/crates/victory-shader/src/emit/rect.rs
+--- V1host/crates/victory-shader/src/emit/rect.rs	2026-11-25 19:11:21.000000000 +0200
++++ V1/crates/victory-shader/src/emit/rect.rs	2026-11-26 08:41:08.182632400 +0200
+@@ -416,6 +416,7 @@
+             root_srvs: Vec::new(),
+             root_uavs: Vec::new(),
+             root_indexed_views: Vec::new(),
++            half_views: Vec::new(),
+         };
+         (
+             host(crate::native::HwStage::Vs, vs),
+diff -ruN '--exclude=target' V1host/crates/victory-shader/src/emit/valu_tests.rs V1/crates/victory-shader/src/emit/valu_tests.rs
+--- V1host/crates/victory-shader/src/emit/valu_tests.rs	2026-11-25 19:52:39.000000000 +0200
++++ V1/crates/victory-shader/src/emit/valu_tests.rs	2026-11-26 08:41:08.184638700 +0200
+@@ -224,6 +224,7 @@
+         root_srvs: lowered.root_srvs,
+         root_uavs: lowered.root_uavs,
+         root_indexed_views: res.root_indexed_views,
++        half_views: Vec::new(),
+     };
+ 
+     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+@@ -1668,6 +1669,7 @@
+         root_srvs: lowered.root_srvs,
+         root_uavs: lowered.root_uavs,
+         root_indexed_views: Vec::new(),
++        half_views: Vec::new(),
+     };
+     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+         let mut copy = shader.dxil.clone();
+diff -ruN '--exclude=target' V1host/crates/victory-shader/src/emit/waterfall_tests.rs V1/crates/victory-shader/src/emit/waterfall_tests.rs
+--- V1host/crates/victory-shader/src/emit/waterfall_tests.rs	2026-11-25 19:11:21.000000000 +0200
++++ V1/crates/victory-shader/src/emit/waterfall_tests.rs	2026-11-26 08:41:08.184638700 +0200
+@@ -84,6 +84,7 @@
+         root_srvs: lowered.root_srvs,
+         root_uavs: lowered.root_uavs,
+         root_indexed_views: Vec::new(),
++        half_views: Vec::new(),
+     };
+     if let Ok(mut v) = validator::Validator::load(validator::Validator::default_path().as_deref()) {
+         v.validate(&mut shader.dxil.clone())
+diff -ruN '--exclude=target' V1host/crates/victory-shader/src/emit/wave64_tests.rs V1/crates/victory-shader/src/emit/wave64_tests.rs
+--- V1host/crates/victory-shader/src/emit/wave64_tests.rs	2026-11-25 21:39:27.000000000 +0200
++++ V1/crates/victory-shader/src/emit/wave64_tests.rs	2026-11-26 08:41:08.187150500 +0200
+@@ -140,6 +140,7 @@
+         root_srvs: lowered.root_srvs,
+         root_uavs: lowered.root_uavs,
+         root_indexed_views: res.root_indexed_views,
++        half_views: Vec::new(),
+     })
+ }
+ 

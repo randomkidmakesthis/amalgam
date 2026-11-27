@@ -1,0 +1,36 @@
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -8944,8 +8944,11 @@
+             self.caption = Some(buffer);
+         }
+         let Some(caption) = &self.caption else { return };
+-        let text = format!(" | VIctory {fps:.0} fps {ms:.1} ms/frame {draws:.0} draws/frame");
+-        let mut text: Vec<u16> = caption.iter().copied().chain(text.encode_utf16()).collect();
++        // (Fox port A) Our scripts' caption: "Scarlett | <game> | F FPS | M ms
++        // | D draws" (fields split at '|'; run-auto/input-check/run-compare).
++        let _ = ms;
++        let text = crate::shell::caption_for(caption, fps, draws);
++        let mut text: Vec<u16> = text.encode_utf16().collect();
+         text.push(0);
+         // Setting the text waits for the window's thread (a title thread,
+         // which may not pump for a while), so a thread of ours does it and
+@@ -9256,7 +9259,8 @@
+             #[cfg(feature = "diagnostics")]
+             crate::replay::record::present(texture, state);
+             let mut showing = crate::timeline::span("the host's Present");
+-            let _ = p.swap_chain.Present(0, DXGI_PRESENT(0));
++            // (Fox port A) `VICTORY_PRESENT_SKIP`: 0 as before, 1 never, N every Nth without waiting.
++            let _ = crate::shell::present_maybe(DXGI_PRESENT_DO_NOT_WAIT.0, |flags| p.swap_chain.Present(0, DXGI_PRESENT(flags)));
+             showing.next("the frame meter");
+             #[cfg(feature = "diagnostics")]
+             p.panel.frame(p.meter.line_due());
+@@ -9279,6 +9283,9 @@
+             Some(hwnd) => hwnd,
+             None => window(width, height)?,
+         };
++        // (Fox port A) The game's logos as the window's icons, on a thread of
++        // their own (nothing waits for them; a failure leaves the window's own).
++        crate::shell::set_icons(hwnd);
+         self.log_video_memory("right before the swap chain is made");
+         // SAFETY: plain object creation for our window.
+         unsafe {

@@ -1,0 +1,1700 @@
+diff -ruN '--exclude=target' F1base/apps/victory/src/run.rs F1/apps/victory/src/run.rs
+--- F1base/apps/victory/src/run.rs	2026-11-25 19:11:21.000000000 +0200
++++ F1/apps/victory/src/run.rs	2026-11-26 00:41:50.533544300 +0200
+@@ -127,6 +127,8 @@
+     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
+         late.load(file, show).map_err(|e| format!("{e:#}"))
+     }));
++    // SAFETY: the mapped title image, none of whose code has run yet.
++    unsafe { victory_hle::readback::install(image.base()) };
+     // SAFETY: imports are bound; from here on we run title code.
+     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
+     let code = main
+diff -ruN '--exclude=target' F1base/crates/victory-gpu/src/host.rs F1/crates/victory-gpu/src/host.rs
+--- F1base/crates/victory-gpu/src/host.rs	2026-11-25 23:55:46.000000000 +0200
++++ F1/crates/victory-gpu/src/host.rs	2026-11-26 00:39:36.497158600 +0200
+@@ -8631,6 +8631,8 @@
+         return;
+     }
+     if title_dst {
++        // Copy-back held over the destination goes in first (F1).
++        crate::readback::settle(dst as usize, len);
+         // The kernel writes the destination: it must not be guarded.
+         crate::watch::writing(dst as usize, len);
+     }
+@@ -8642,6 +8644,9 @@
+     #[cfg(feature = "diagnostics")]
+     crate::copystat::add(crate::copystat::C::MoveUs, moved.elapsed().as_micros() as u64);
+     if whole {
++        if !title_dst {
++            crate::readback::overlay(src as usize, dst, len);
++        }
+         return;
+     }
+     // The copy failed: a source page is not there, or the destination is
+@@ -8659,6 +8664,9 @@
+     } else {
+         read_pieces(src, dst, len);
+     }
++    if !title_dst {
++        crate::readback::overlay(src as usize, dst, len);
++    }
+     #[cfg(feature = "diagnostics")]
+     crate::copystat::add(crate::copystat::C::SparseUs, sparse.elapsed().as_micros() as u64);
+ }
+@@ -8720,7 +8728,11 @@
+ pub(crate) fn read_into(src: *const u8, dst: &mut [u8]) -> bool {
+     // In place first, if asked for (`crate::plaincopy`): the destination is
+     // memory of ours, as in `copy_mapped`.
+-    crate::plaincopy::copy(dst.as_mut_ptr(), src, dst.len()) || read(src, dst.as_mut_ptr(), dst.len())
++    let whole = crate::plaincopy::copy(dst.as_mut_ptr(), src, dst.len()) || read(src, dst.as_mut_ptr(), dst.len());
++    if whole {
++        crate::readback::overlay(src as usize, dst.as_mut_ptr(), dst.len());
++    }
++    whole
+ }
+ 
+ /// Copies `len` bytes from `src` to `dst` unless a source page is not
+@@ -9060,6 +9072,7 @@
+             }
+         }
+         crate::shadow::back_line(frames);
++        crate::readback::line();
+         {
+             let [passes, pieces, compares] = [0, 1, 2].map(|i| CARD_PASSES[i].swap(0, Ordering::Relaxed) as f64 / frames);
+             if passes + compares > 0.0 {
+diff -ruN '--exclude=target' F1base/crates/victory-gpu/src/lib.rs F1/crates/victory-gpu/src/lib.rs
+--- F1base/crates/victory-gpu/src/lib.rs	2026-11-25 22:59:40.000000000 +0200
++++ F1/crates/victory-gpu/src/lib.rs	2026-11-26 00:39:36.505609100 +0200
+@@ -53,6 +53,8 @@
+ pub mod query;
+ pub mod queue;
+ #[cfg(windows)]
++pub mod readback;
++#[cfg(windows)]
+ mod ranges;
+ #[cfg(windows)]
+ mod queue2;
+diff -ruN '--exclude=target' F1base/crates/victory-gpu/src/readback/feedback.rs F1/crates/victory-gpu/src/readback/feedback.rs
+--- F1base/crates/victory-gpu/src/readback/feedback.rs	1970-01-01 02:00:00.000000000 +0200
++++ F1/crates/victory-gpu/src/readback/feedback.rs	2026-11-26 01:18:15.050631800 +0200
+@@ -0,0 +1,416 @@
++//! What the title does with read-back memory (finding F1, iteration 2):
++//! its buffer locks (`VICTORY_READBACK_LOCKS=1`) and the feedback health of
++//! each read-back ring.
++//!
++//! The engine's generic lock (0x145121550) takes a multi-frame handle and
++//! a record; it picks the handle's buffer for this frame, sets the record's
++//! byte at +0x3c to 2 whatever the caller wants, and maps nothing for a
++//! buffer without a resource: the record's CPU pointer (+0) and bytes
++//! (u32 at +0x18) name raw title memory. The caller's intent is not an
++//! argument, so the mode is measured: the locked bytes are summed at the
++//! lock and again at the matching unlock (0x144e8abe0, same record): a
++//! lock whose bytes changed in between is one the CPU wrote through.
++//!
++//! What shaders wrote is known exactly as the copy-back puts it into title
++//! memory ([`written`]): byte runs where the GPU's bytes differ from the
++//! snapshot (copies in the PC's memory), first to last differing byte of a
++//! 64 KiB piece (copies in the card's memory and the relay). It is kept by
++//! range with the layer frame it landed in, for the last [`RECENT`] frames.
++
++use std::collections::{BTreeMap, HashMap};
++use std::sync::Mutex;
++use std::sync::atomic::{AtomicU64, Ordering};
++
++use super::{ALIAS, Buffer, SET, locks_on, only_read, read_u64, settle};
++
++/// Frames a landed shader write stays in [`WRITTEN`].
++const RECENT: u64 = 8;
++/// The first locks logged with their raw arguments.
++const SAY_ARGS: u64 = 200;
++/// Locked bytes summed at most (a bigger lock is summed over its first ones).
++const SUM_MOST: u64 = 1 << 20;
++
++/// A checksum that shows a change of content (FNV-1a, 32 bits).
++pub(crate) fn sum(bytes: &[u8]) -> u32 {
++    bytes.iter().fold(0x811c_9dc5u32, |h, &b| (h ^ u32::from(b)).wrapping_mul(0x0100_0193))
++}
++
++fn read(at: u64, n: u64) -> Option<Vec<u8>> {
++    let mut v = vec![0u8; n.min(SUM_MOST) as usize];
++    crate::host::read_into(at as *const u8, &mut v).then_some(v)
++}
++
++/// Ranges shaders wrote as the copy-back landed them: start to (end, layer
++/// frame), disjoint; a later landing replaces what it covers.
++#[derive(Default)]
++pub(crate) struct Written(BTreeMap<u64, (u64, u64)>);
++
++impl Written {
++    pub(crate) fn mark(&mut self, from: u64, to: u64, frame: u64) {
++        if from >= to {
++            return;
++        }
++        let meeting: Vec<u64> = self.0.range(..to).rev().take_while(|(_, v)| v.0 > from).map(|(&a, _)| a).collect();
++        for a in meeting {
++            let (e, f) = self.0.remove(&a).unwrap_or((a, 0));
++            if a < from {
++                self.0.insert(a, (from, f));
++            }
++            if e > to {
++                self.0.insert(to, (e, f));
++            }
++        }
++        self.0.insert(from, (to, frame));
++    }
++
++    /// Bytes of `[from, to)` landed in frame `since` or later.
++    pub(crate) fn recent(&self, from: u64, to: u64, since: u64) -> u64 {
++        let mut n = 0;
++        for (&a, &(e, f)) in self.0.range(..to).rev() {
++            if e <= from {
++                break;
++            }
++            if f >= since {
++                n += e.min(to) - a.max(from);
++            }
++        }
++        n
++    }
++
++    fn forget_before(&mut self, frame: u64) {
++        self.0.retain(|_, v| v.1 >= frame);
++    }
++}
++
++static WRITTEN: Mutex<Written> = Mutex::new(Written(BTreeMap::new()));
++
++/// The copy-back wrote `[at, at + n)` (some of it outside the set).
++pub(super) fn written(at: u64, n: u64) {
++    let mut w = WRITTEN.lock().unwrap_or_else(|e| e.into_inner());
++    w.mark(at, at + n, crate::frame::current());
++    if w.0.len() > 1 << 21 {
++        w.0.clear();
++        tracing::warn!("read-back locks: the record of shader-written ranges grew past 2M ranges and was cleared");
++    }
++}
++
++/// One read-back ring's feedback: since the last line, and since the start.
++#[derive(Default)]
++struct Ring {
++    name: &'static str,
++    site: u64,
++    // Since the last line.
++    landed: u64,
++    last_frame: u64,
++    bytes: u64,
++    nonzero: u64,
++    changed: u64,
++    locks: u64,
++    late: u64,
++    zero: u64,
++    latency: u64,
++    latencies: u64,
++    // Since the start, per buffer: the sum of the last landing, and the
++    // title frame whose GPU write it carried (-1: none yet).
++    sums: [u32; 3],
++    carried: [i64; 3],
++}
++
++static RINGS: Mutex<Option<HashMap<u64, Ring>>> = Mutex::new(None);
++
++pub(super) fn ring(ring: u64, site: u64, name: &'static str) {
++    let mut r = RINGS.lock().unwrap_or_else(|e| e.into_inner());
++    r.get_or_insert_with(HashMap::new).insert(ring, Ring { name, site, carried: [-1; 3], ..Ring::default() });
++}
++
++/// The ring's state: the index the CPU reads (+0x4c) and the packed
++/// write state (+0x50: bit 31 valid, bits 4-30 the title's frame, bits
++/// 0-3 the index the GPU writes this frame). `None` if not valid.
++fn state(ring: u64) -> Option<(u64, u64, i64)> {
++    let v = read_u64(ring + 0x4c)?;
++    let (read, packed) = (v & 0xffff_ffff, v >> 32);
++    (packed >> 31 != 0).then_some((read, packed & 0xf, ((packed >> 4) & 0x7ff_ffff) as i64))
++}
++
++/// Frames since the GPU wrote buffer `index` of a ring of `n` that writes
++/// buffer `writing` now (each frame the next one, in turn).
++pub(crate) fn age(index: u64, writing: u64, n: u64) -> u64 {
++    if n == 0 { 0 } else { (writing + n - index % n) % n }
++}
++
++/// The copy-back is about to land `bytes` at `at`; `over`: the read-back
++/// buffers it meets and the parts of it they hold.
++pub(super) fn landed(at: u64, bytes: &[u8], over: &[(Buffer, u64, u64)]) {
++    let frame = crate::frame::current();
++    let mut r = RINGS.lock().unwrap_or_else(|e| e.into_inner());
++    let Some(rings) = r.as_mut() else { return };
++    for &(b, a, e) in over {
++        let Some(ring) = rings.get_mut(&b.ring) else { continue };
++        let part = &bytes[(a - at) as usize..(e - at) as usize];
++        if ring.last_frame != frame {
++            ring.landed += 1;
++            ring.last_frame = frame;
++        }
++        ring.bytes += part.len() as u64;
++        ring.nonzero += part.iter().filter(|&&x| x != 0).count() as u64;
++        let i = usize::from(b.index.min(2));
++        let s = sum(part) ^ (a - b.cpu.min(a)) as u32;
++        if s != ring.sums[i] {
++            ring.changed += 1;
++            ring.sums[i] = s;
++        }
++        if let Some((_, writing, title_frame)) = state(b.ring) {
++            let late = age(u64::from(b.index), writing, u64::from(b.count));
++            ring.latency += late;
++            ring.latencies += 1;
++            ring.carried[i] = title_frame - late as i64;
++        }
++    }
++}
++
++/// A lock under way: what it returned, and its bytes' sum then.
++struct Open {
++    handle: u64,
++    cpu: u64,
++    bytes: u64,
++    sum: u32,
++}
++
++/// Per lock handle outside the set, since the last line.
++#[derive(Default)]
++struct Handle {
++    caller: u64,
++    stride: u64,
++    count: u64,
++    locks: u64,
++    wrote: u64,
++    kept: u64,
++    overlap: u64,
++    nonzero: u64,
++    bytes: u64,
++    changed: u64,
++    last_sum: u32,
++}
++
++#[derive(Default)]
++struct Locks {
++    open: HashMap<u64, Open>,
++    handles: HashMap<u64, Handle>,
++    /// Since the last line: locks; unlocks seen; of them those whose bytes
++    /// changed between lock and unlock; locks outside the set.
++    n: [u64; 4],
++}
++
++static LOCKS: Mutex<Option<Locks>> = Mutex::new(None);
++static SAID: AtomicU64 = AtomicU64::new(0);
++
++/// The lock hook at the lock's entry: its handle (rcx), record (rdx), r8,
++/// r9, and the caller's return address (as 0x14...). The first
++/// [`SAY_ARGS`] are logged with the record's first 8 words.
++pub fn lock_entered(handle: u64, record: u64, r8: u64, r9: u64, caller: u64) {
++    if SAID.fetch_add(1, Ordering::Relaxed) >= SAY_ARGS {
++        return;
++    }
++    let words: Vec<String> = (0..8).map(|i| read_u64(record + 8 * i).map_or("?".into(), |v| format!("{v:#x}"))).collect();
++    let flags = read_u64(handle + 0x18).map_or(0, |v| v & 0xffff_ffff);
++    tracing::info!(
++        "lock args: caller={caller:#x} handle={handle:#x} handle+0x18={flags:#x} r8={r8:#x} r9={r9:#x} record={record:#x} [{}]",
++        words.join(" ")
++    );
++}
++
++/// The lock returned (`ok`: its `al`): the record holds the CPU address
++/// (+0), bytes (u32 at +0x18) and the buffer object (+0x30).
++pub fn lock_returned(handle: u64, record: u64, caller: u64, ok: bool) {
++    if !ok || record == 0 {
++        return;
++    }
++    let (Some(cpu), Some(bytes)) = (read_u64(record), read_u64(record + 0x18)) else { return };
++    let bytes = bytes & 0xffff_ffff;
++    if cpu == 0 || bytes == 0 || bytes > 1 << 30 || cpu.checked_add(bytes).is_none() {
++        return;
++    }
++    if only_read() {
++        settle(cpu as usize, bytes as usize);
++    }
++    let content = read(cpu, bytes).unwrap_or_default();
++    let s = sum(&content);
++    let nonzero = content.iter().filter(|&&x| x != 0).count() as u64;
++    let (inside, over) = {
++        let set = SET.read().unwrap_or_else(|e| e.into_inner());
++        let alias = *ALIAS.lock().unwrap_or_else(|e| e.into_inner());
++        (set.inside(cpu, bytes) == bytes, set.over(cpu, bytes, alias))
++    };
++    ring_locked(&over, nonzero);
++    let mut l = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
++    let l = l.get_or_insert_with(Locks::default);
++    l.n[0] += 1;
++    l.open.insert(record, Open { handle, cpu, bytes, sum: s });
++    if l.open.len() > 1 << 16 {
++        l.open.clear();
++    }
++    if inside {
++        return;
++    }
++    l.n[3] += 1;
++    let overlap = WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).recent(cpu, cpu + bytes, crate::frame::current().saturating_sub(RECENT));
++    let object = read_u64(record + 0x30).unwrap_or(0);
++    let head = if object != 0 { read_u64(object + 8).unwrap_or(0) } else { 0 };
++    let h = l.handles.entry(handle).or_default();
++    h.caller = caller;
++    (h.count, h.stride) = (head & 0xffff_ffff, (head >> 32) & 0xfff);
++    h.locks += 1;
++    h.overlap += overlap;
++    h.nonzero = nonzero;
++    h.bytes = bytes;
++    if h.locks > 1 && s != h.last_sum {
++        h.changed += 1;
++    }
++    h.last_sum = s;
++}
++
++/// The read-back rings' buffers a lock met: counted for their feedback.
++fn ring_locked(over: &[(Buffer, u64, u64)], nonzero: u64) {
++    if over.is_empty() {
++        return;
++    }
++    let mut r = RINGS.lock().unwrap_or_else(|e| e.into_inner());
++    let Some(rings) = r.as_mut() else { return };
++    for &(b, _, _) in over {
++        let Some(ring) = rings.get_mut(&b.ring) else { continue };
++        ring.locks += 1;
++        if nonzero == 0 {
++            ring.zero += 1;
++        }
++        // The title frame whose GPU write this buffer holds now, by the
++        // ring's state, against the one its last landing carried.
++        if let Some((_, writing, title_frame)) = state(b.ring) {
++            let wrote = title_frame - age(u64::from(b.index), writing, u64::from(b.count)) as i64;
++            if ring.carried[usize::from(b.index.min(2))] < wrote {
++                ring.late += 1;
++            }
++        }
++    }
++}
++
++/// The unlock hook (rcx: the record).
++pub fn unlocked(record: u64) {
++    let open = {
++        let mut l = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
++        let Some(l) = l.as_mut() else { return };
++        let Some(open) = l.open.remove(&record) else { return };
++        open
++    };
++    let now = read(open.cpu, open.bytes).map(|v| sum(&v));
++    let wrote = now.is_some_and(|s| s != open.sum);
++    let mut l = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
++    let Some(l) = l.as_mut() else { return };
++    l.n[1] += 1;
++    l.n[2] += u64::from(wrote);
++    let set_has = SET.read().unwrap_or_else(|e| e.into_inner()).inside(open.cpu, open.bytes) == open.bytes;
++    if set_has {
++        return;
++    }
++    if let Some(h) = l.handles.get_mut(&open.handle) {
++        if wrote {
++            h.wrote += 1;
++        } else {
++            h.kept += 1;
++        }
++    }
++}
++
++pub(super) fn line() {
++    let frame = crate::frame::current();
++    WRITTEN.lock().unwrap_or_else(|e| e.into_inner()).forget_before(frame.saturating_sub(RECENT));
++    if locks_on() {
++        let (n, mut handles) = {
++            let mut l = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
++            let l = l.get_or_insert_with(Locks::default);
++            (std::mem::take(&mut l.n), std::mem::take(&mut l.handles))
++        };
++        // Read-capable: no unlock saw a change.
++        let reading: Vec<(&u64, &Handle)> = handles.iter().filter(|(_, h)| h.wrote == 0).collect();
++        let over: Vec<&(&u64, &Handle)> = reading.iter().filter(|(_, h)| h.overlap > 0).collect();
++        tracing::info!(
++            "read-back locks this period: {} locks, {} unlocks seen ({} wrote between lock and unlock, {} did not); outside the read-back set: {} locks of {} buffers; read-capable buffers outside the set (never wrote): {}, of them {} over bytes the copy-back wrote in the last {RECENT} frames ({} bytes overlapping exactly; {} with non-zero bytes at the last lock; {} whose bytes changed between locks)",
++            n[0],
++            n[1],
++            n[2],
++            n[1] - n[2],
++            n[3],
++            handles.len(),
++            reading.len(),
++            over.len(),
++            over.iter().map(|(_, h)| h.overlap).sum::<u64>(),
++            over.iter().filter(|(_, h)| h.nonzero > 0).count(),
++            over.iter().filter(|(_, h)| h.changed > 0).count(),
++        );
++        let mut top: Vec<(u64, Handle)> = handles.drain().collect();
++        top.sort_unstable_by(|a, b| b.1.locks.cmp(&a.1.locks));
++        for (handle, h) in top.iter().take(16) {
++            tracing::info!(
++                "lock outside the read-back set: handle {handle:#x} (stride {}, count {}), caller {:#x}, locks {}, wrote {}, did not write {}, shader-written bytes overlapped {}, non-zero at the last lock {} of {} bytes, changed between locks {}",
++                h.stride, h.count, h.caller, h.locks, h.wrote, h.kept, h.overlap, h.nonzero, h.bytes, h.changed
++            );
++        }
++    }
++    let mut r = RINGS.lock().unwrap_or_else(|e| e.into_inner());
++    let Some(rings) = r.as_mut() else { return };
++    let mut list: Vec<(&u64, &mut Ring)> = rings.iter_mut().collect();
++    list.sort_unstable_by_key(|(a, _)| **a);
++    for (at, ring) in list {
++        if ring.name.is_empty() && ring.landed + ring.locks == 0 {
++            continue;
++        }
++        let name = if ring.name.is_empty() { format!("site {:#x} ring {at:#x}", ring.site) } else { ring.name.to_string() };
++        tracing::info!(
++            "feedback ring {name}: landed {} times, non-zero {} of {} bytes, changed {} times, game locks {}, lock-before-data {} times (data arrived after the game read), all-zero at lock {} times; landing {:.2} frames after the GPU write on average",
++            ring.landed,
++            ring.nonzero,
++            ring.bytes,
++            ring.changed,
++            ring.locks,
++            ring.late,
++            ring.zero,
++            if ring.latencies == 0 { 0.0 } else { ring.latency as f64 / ring.latencies as f64 }
++        );
++        (ring.landed, ring.bytes, ring.nonzero, ring.changed, ring.locks, ring.late, ring.zero, ring.latency, ring.latencies) = (0, 0, 0, 0, 0, 0, 0, 0, 0);
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn a_later_landing_replaces_what_it_covers() {
++        let mut w = Written::default();
++        w.mark(0x100, 0x200, 1);
++        w.mark(0x180, 0x280, 5);
++        assert_eq!(w.recent(0x100, 0x300, 0), 0x180);
++        assert_eq!(w.recent(0x100, 0x300, 5), 0x100, "only the newer part");
++        assert_eq!(w.recent(0x100, 0x180, 2), 0, "the older part is older");
++        w.mark(0x120, 0x140, 9);
++        assert_eq!(w.recent(0x100, 0x300, 9), 0x20);
++        assert_eq!(w.recent(0x100, 0x300, 0), 0x180, "exact bytes, nothing counted twice");
++        assert_eq!(w.recent(0x0, 0x100, 0), 0, "adjacent is not overlapping");
++        w.forget_before(5);
++        assert_eq!(w.recent(0x0, 0x1000, 0), 0x120);
++    }
++
++    #[test]
++    fn a_buffer_ages_one_frame_per_step_of_the_ring() {
++        assert_eq!(age(2, 2, 3), 0, "being written now");
++        assert_eq!(age(1, 2, 3), 1, "written last frame: what the CPU reads");
++        assert_eq!(age(0, 2, 3), 2);
++        assert_eq!(age(2, 0, 3), 1);
++        assert_eq!(age(0, 0, 1), 0);
++    }
++
++    #[test]
++    fn the_sum_sees_a_change() {
++        assert_ne!(sum(&[0, 0, 0, 1]), sum(&[0, 0, 1, 0]));
++        assert_eq!(sum(&[]), 0x811c_9dc5);
++    }
++}
+diff -ruN '--exclude=target' F1base/crates/victory-gpu/src/readback.rs F1/crates/victory-gpu/src/readback.rs
+--- F1base/crates/victory-gpu/src/readback.rs	1970-01-01 02:00:00.000000000 +0200
++++ F1/crates/victory-gpu/src/readback.rs	2026-11-26 01:18:15.050631800 +0200
+@@ -0,0 +1,603 @@
++//! The title's CPU read-back buffers (finding F1), and what the copy-back
++//! puts into title memory outside them.
++//!
++//! The engine makes every buffer its CPU reads back through one class
++//! ("CpuReadBackShaderResourceBuffer"); a hook in the title's code
++//! (`victory_hle::readback`) hands each ring of them to [`ring_created`]
++//! once its buffers exist. The ranges form the read-back set.
++//!
++//! * `VICTORY_READBACK_SET` (default 1; 0: no hook): record the set, and
++//!   meter what the copy-back writes into title memory ([`back`], at each
++//!   place it writes) inside and outside it; a line every 5 s ([`line`]).
++//! * `VICTORY_READBACK_LOCKS` (default 0): the engine's generic buffer
++//!   lock is hooked too ([`locked`]); a lock whose range holds memory
++//!   shaders wrote outside the set is logged (the completeness test).
++//! * `VICTORY_BACK_ONLY_READ` (default 0): what the copy-back would write
++//!   wholly outside the set is not written. It is kept here instead (the
++//!   card's bytes newer than title memory), and every read of title memory
++//!   by the layer's copies ([`overlay`]: `read_into`, `copy_mapped`) sees
++//!   it as if written, byte by byte where title memory still holds what it
++//!   held when the write was skipped (a byte the title wrote since is the
++//!   title's). It goes into title memory ([`settle`]) before the layer
++//!   writes title memory there, before the runtime remaps it, when the
++//!   title locks it (with the lock hook), and when more than
++//!   `VICTORY_BACK_ONLY_READ_MB` (256) is held.
++//!
++//! shortcut: the set only grows (no hook on the buffers' release).
++//! shortcut: the title's own CPU reads of skipped memory see the old bytes:
++//! that is the bet the switch tests (the lock meter is its evidence).
++
++use std::collections::{BTreeMap, HashMap};
++use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
++use std::sync::{Mutex, OnceLock, RwLock};
++
++mod feedback;
++pub use feedback::{lock_entered, lock_returned, unlocked};
++
++fn switch(name: &str, default: bool) -> bool {
++    match std::env::var(name) {
++        Ok(v) => v.trim() == "1",
++        Err(_) => default,
++    }
++}
++
++/// `VICTORY_READBACK_SET` (on unless `=0`).
++pub fn set_on() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| switch("VICTORY_READBACK_SET", true))
++}
++
++/// `VICTORY_READBACK_LOCKS=1` (off by default).
++pub fn locks_on() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| set_on() && switch("VICTORY_READBACK_LOCKS", false))
++}
++
++/// `VICTORY_BACK_ONLY_READ=1` (off by default).
++fn only_read() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| set_on() && switch("VICTORY_BACK_ONLY_READ", false))
++}
++
++fn held_most() -> u64 {
++    static MOST: OnceLock<u64> = OnceLock::new();
++    *MOST.get_or_init(|| {
++        std::env::var("VICTORY_BACK_ONLY_READ_MB").ok().and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(256) << 20
++    })
++}
++
++/// The GPU's form of CPU address `cpu`: title memory in `[alias[0],
++/// alias[0] + alias[1])` is given to the GPU at `alias[2]` on; other memory
++/// at its own address.
++pub(crate) fn gpu_form(cpu: u64, alias: [u64; 3]) -> u64 {
++    let [from, len, base] = alias;
++    if len != 0 && cpu >= from && cpu - from < len { base.wrapping_add(cpu - from) } else { cpu }
++}
++
++/// A read-back buffer: its ring, CPU address, GPU address, bytes,
++/// creation order.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) struct Buffer {
++    pub(crate) ring: u64,
++    /// Its index in the ring, and the ring's number of buffers.
++    pub(crate) index: u8,
++    pub(crate) count: u8,
++    pub(crate) cpu: u64,
++    pub(crate) gpu: u64,
++    pub(crate) bytes: u64,
++    pub(crate) order: u64,
++}
++
++/// The read-back set: its buffers, and the address ranges they cover in
++/// either form (start to end, disjoint, merged).
++#[derive(Default)]
++pub(crate) struct Set {
++    pub(crate) buffers: Vec<Buffer>,
++    spans: BTreeMap<u64, u64>,
++    pub(crate) bytes: u64,
++    pub(crate) rings: u64,
++}
++
++/// Bytes of `[from, to)` that `spans` (disjoint, merged) cover.
++fn covered(spans: &BTreeMap<u64, u64>, from: u64, to: u64) -> u64 {
++    let mut n = 0;
++    for (&a, &e) in spans.range(..to).rev() {
++        if e <= from {
++            break;
++        }
++        n += e.min(to) - a.max(from);
++    }
++    n
++}
++
++fn add_span(spans: &mut BTreeMap<u64, u64>, mut from: u64, mut to: u64) {
++    if from >= to {
++        return;
++    }
++    let meeting: Vec<(u64, u64)> = spans.range(..=to).rev().take_while(|&(_, &e)| e >= from).map(|(&a, &e)| (a, e)).collect();
++    for (a, e) in meeting {
++        spans.remove(&a);
++        from = from.min(a);
++        to = to.max(e);
++    }
++    spans.insert(from, to);
++}
++
++impl Set {
++    /// Records a buffer: its CPU range, its GPU range as the object gives
++    /// it (0: none), and its CPU range's alias form.
++    pub(crate) fn add(&mut self, ring: (u64, u8, u8), cpu: u64, gpu: u64, bytes: u64, alias: [u64; 3]) -> Buffer {
++        let gpu = if gpu == 0 { gpu_form(cpu, alias) } else { gpu };
++        let order = self.buffers.len() as u64;
++        let (ring, index, count) = ring;
++        let buffer = Buffer { ring, index, count, cpu, gpu, bytes, order };
++        if self.buffers.len() < 1 << 16 {
++            self.buffers.push(buffer);
++        }
++        for at in [cpu, gpu, gpu_form(cpu, alias)] {
++            add_span(&mut self.spans, at, at.saturating_add(bytes));
++        }
++        self.bytes += bytes;
++        buffer
++    }
++
++    /// The buffers that hold bytes of `[at, at + len)`, each with the part
++    /// of the range it holds (`[a, e)`, in the range's addresses; by the
++    /// first of its forms that meets it).
++    pub(crate) fn over(&self, at: u64, len: u64, alias: [u64; 3]) -> Vec<(Buffer, u64, u64)> {
++        let end = at.saturating_add(len);
++        let mut out = Vec::new();
++        for b in &self.buffers {
++            for f in [b.cpu, b.gpu, gpu_form(b.cpu, alias)] {
++                let (a, e) = (at.max(f), end.min(f.saturating_add(b.bytes)));
++                if a < e {
++                    out.push((*b, a, e));
++                    break;
++                }
++            }
++        }
++        out
++    }
++
++    /// The rings whose buffers hold bytes of `[at, at + len)` (in either
++    /// form), with those bytes.
++    #[cfg(test)]
++    pub(crate) fn rings_over(&self, at: u64, len: u64, alias: [u64; 3]) -> Vec<(u64, u64)> {
++        let mut out: Vec<(u64, u64)> = Vec::new();
++        for (b, a, e) in self.over(at, len, alias) {
++            match out.iter_mut().find(|r| r.0 == b.ring) {
++                Some(r) => r.1 += e - a,
++                None => out.push((b.ring, e - a)),
++            }
++        }
++        out
++    }
++
++    /// Bytes of `[at, at + len)` inside the set, in any form.
++    pub(crate) fn inside(&self, at: u64, len: u64) -> u64 {
++        covered(&self.spans, at, at.saturating_add(len))
++    }
++}
++
++static SET: RwLock<Set> = RwLock::new(Set { buffers: Vec::new(), spans: BTreeMap::new(), bytes: 0, rings: 0 });
++static RINGS: AtomicU64 = AtomicU64::new(0);
++/// The alias words as the last ring read them ([`gpu_form`]).
++static ALIAS: Mutex<[u64; 3]> = Mutex::new([0; 3]);
++/// Since the last [`line`]: bytes the copy-back wrote inside the set, by ring.
++static BY_RING: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
++
++/// Since the last [`line`]: bytes the copy-back wrote inside and outside
++/// the set, bytes not written (`VICTORY_BACK_ONLY_READ`), bytes written
++/// later (settled), title buffer locks seen, and of them those over memory
++/// shaders wrote outside the set.
++static PERIOD: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
++const IN: usize = 0;
++const OUT: usize = 1;
++const SKIPPED: usize = 2;
++const SETTLED: usize = 3;
++
++/// Since the last [`line`]: bytes written outside the set by range start
++/// (at most [`TOP_KEYS`] starts; the rest go under 0).
++static OUTSIDE: Mutex<Option<HashMap<u64, u64>>> = Mutex::new(None);
++const TOP_KEYS: usize = 1 << 14;
++
++fn read_u64(at: u64) -> Option<u64> {
++    let mut b = [0u8; 8];
++    crate::host::read_into(at as *const u8, &mut b).then(|| u64::from_le_bytes(b))
++}
++
++/// From the hook after a read-back ring's constructor made its buffers:
++/// `ring` holds up to three buffer objects (one if its flags, at +0x54,
++/// have 8), each with its element count (u32 at +8), stride (u16 at +0xc,
++/// low 12 bits), CPU address (+0x18) and GPU address (+0x38). `alias_at`:
++/// the title's three words of [`gpu_form`] (start, length, GPU base).
++/// `site`: where the title asked for the ring (the return address into the
++/// wrapper's caller, as 0x14...; 0: not known), and its name if known.
++/// Reads go through the kernel: a bad pointer reads as nothing.
++pub fn ring_created(ring: usize, alias_at: u64, site: u64, name: &'static str) {
++    if !set_on() || ring == 0 {
++        return;
++    }
++    let alias = [0, 8, 16].map(|o| read_u64(alias_at + o).unwrap_or(0));
++    *ALIAS.lock().unwrap_or_else(|e| e.into_inner()) = alias;
++    let ring = ring as u64;
++    let flags = read_u64(ring + 0x50).map_or(0, |v| v >> 32);
++    let count = if flags & 8 != 0 { 1 } else { 3 };
++    let mut made = Vec::new();
++    for i in 0..count {
++        let Some(object) = read_u64(ring + 8 * i).filter(|&o| o != 0) else {
++            continue;
++        };
++        let (Some(head), Some(cpu), Some(gpu)) = (read_u64(object + 8), read_u64(object + 0x18), read_u64(object + 0x38)) else {
++            continue;
++        };
++        let elements = head & 0xffff_ffff;
++        let stride = (head >> 32) & 0xfff;
++        let bytes = elements * stride;
++        if cpu == 0 || bytes == 0 || bytes > 1 << 30 {
++            tracing::debug!(object = format_args!("{object:#x}"), cpu, elements, stride, "read-back buffer object not taken");
++            continue;
++        }
++        made.push(SET.write().unwrap_or_else(|e| e.into_inner()).add((ring, i as u8, count as u8), cpu, gpu, bytes, alias));
++    }
++    let n = RINGS.fetch_add(1, Ordering::Relaxed) + 1;
++    SET.write().unwrap_or_else(|e| e.into_inner()).rings = n;
++    feedback::ring(ring, site, name);
++    if n <= 64 || n.is_power_of_two() {
++        let at: Vec<String> = made
++            .iter()
++            .map(|b| if b.gpu == b.cpu { format!("{:#x}", b.cpu) } else { format!("{:#x} (gpu {:#x})", b.cpu, b.gpu) })
++            .collect();
++        tracing::info!(
++            ring = n,
++            flags,
++            "read-back ring: {} buffers of {} bytes at {} (ring {ring:#x}, site {site:#x} {name})",
++            made.len(),
++            made.first().map_or(0, |b| b.bytes),
++            at.join(", ")
++        );
++    }
++}
++
++/// The copy-back is about to put `bytes` (what shaders wrote, merged with
++/// the title's) into title memory at `at`: metered, and with
++/// `VICTORY_BACK_ONLY_READ` kept here instead if none of it is in the set
++/// (true: the caller writes nothing).
++pub(crate) fn back(at: usize, bytes: &[u8]) -> bool {
++    let n = bytes.len() as u64;
++    if !set_on() || n == 0 {
++        return false;
++    }
++    let inside = SET.read().unwrap_or_else(|e| e.into_inner()).inside(at as u64, n);
++    PERIOD[IN].fetch_add(inside, Ordering::Relaxed);
++    if inside > 0 {
++        let alias = *ALIAS.lock().unwrap_or_else(|e| e.into_inner());
++        let over = SET.read().unwrap_or_else(|e| e.into_inner()).over(at as u64, n, alias);
++        {
++            let mut by = BY_RING.lock().unwrap_or_else(|e| e.into_inner());
++            let by = by.get_or_insert_with(HashMap::new);
++            for &(b, a, e) in &over {
++                *by.entry(b.ring).or_insert(0) += e - a;
++            }
++        }
++        feedback::landed(at as u64, bytes, &over);
++    }
++    if inside < n {
++        PERIOD[OUT].fetch_add(n - inside, Ordering::Relaxed);
++        let mut top = OUTSIDE.lock().unwrap_or_else(|e| e.into_inner());
++        let top = top.get_or_insert_with(HashMap::new);
++        let key = if top.len() < TOP_KEYS || top.contains_key(&(at as u64)) { at as u64 } else { 0 };
++        *top.entry(key).or_insert(0) += n - inside;
++        if locks_on() {
++            feedback::written(at as u64, n);
++        }
++    }
++    if inside == 0 && only_read() && RINGS.load(Ordering::Relaxed) > 0 && crate::inplace::level() == 0 && defer(at, bytes) {
++        PERIOD[SKIPPED].fetch_add(n, Ordering::Relaxed);
++        return true;
++    }
++    // Written now: what is held over it goes first (the caller's bytes
++    // were made from title memory as `overlay` shows it).
++    settle(at, bytes.len());
++    false
++}
++
++/// Bytes the copy-back did not write: `new` for title memory at its key,
++/// where it still holds `old` (what it held when the write was skipped).
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(crate) struct Held {
++    pub(crate) old: Vec<u8>,
++    pub(crate) new: Vec<u8>,
++}
++
++/// Held writes by address: disjoint.
++#[derive(Default)]
++pub(crate) struct Ledger {
++    map: BTreeMap<usize, Held>,
++    bytes: u64,
++}
++
++impl Ledger {
++    fn meeting(&self, from: usize, to: usize) -> Vec<usize> {
++        let mut keys = Vec::new();
++        for (&a, h) in self.map.range(..to).rev() {
++            if a + h.new.len() <= from {
++                break;
++            }
++            keys.push(a);
++        }
++        keys
++    }
++
++    /// Takes out what is held over `[from, to)`.
++    pub(crate) fn take(&mut self, from: usize, to: usize) -> Vec<(usize, Held)> {
++        let keys = self.meeting(from, to);
++        keys.into_iter()
++            .filter_map(|a| {
++                let h = self.map.remove(&a)?;
++                self.bytes -= h.new.len() as u64;
++                Some((a, h))
++            })
++            .collect()
++    }
++
++    /// Holds `new` at `at` in place of an earlier write of the same range;
++    /// false if there is none.
++    pub(crate) fn renew(&mut self, at: usize, new: &[u8]) -> bool {
++        match self.map.get_mut(&at) {
++            Some(h) if h.new.len() == new.len() => {
++                h.new.copy_from_slice(new);
++                true
++            }
++            _ => false,
++        }
++    }
++
++    /// Holds a write; false (nothing held) if something else is held over
++    /// it.
++    pub(crate) fn hold(&mut self, at: usize, held: Held) -> bool {
++        if !self.meeting(at, at + held.new.len()).is_empty() {
++            return false;
++        }
++        self.bytes += held.new.len() as u64;
++        self.map.insert(at, held);
++        true
++    }
++
++    /// Title memory `dst` read at `src`, as it would be had the held
++    /// writes been made.
++    pub(crate) fn overlay(&self, src: usize, dst: &mut [u8]) {
++        for a in self.meeting(src, src + dst.len()) {
++            let h = &self.map[&a];
++            let (from, to) = (a.max(src), (a + h.new.len()).min(src + dst.len()));
++            for at in from..to {
++                let (d, j) = (&mut dst[at - src], at - a);
++                if *d == h.old[j] {
++                    *d = h.new[j];
++                }
++            }
++        }
++    }
++
++    pub(crate) fn len(&self) -> usize {
++        self.map.len()
++    }
++}
++
++/// Title memory `ram` with `held` written where it still holds the old bytes.
++pub(crate) fn resolved(ram: &[u8], held: &Held) -> Vec<u8> {
++    ram.iter().zip(&held.old).zip(&held.new).map(|((&r, &o), &n)| if r == o { n } else { r }).collect()
++}
++
++static LEDGER: RwLock<Ledger> = RwLock::new(Ledger { map: BTreeMap::new(), bytes: 0 });
++/// Whether anything is held: [`overlay`] and [`settle`] do nothing
++/// otherwise.
++static ANY: AtomicBool = AtomicBool::new(false);
++
++fn ledger() -> std::sync::RwLockWriteGuard<'static, Ledger> {
++    LEDGER.write().unwrap_or_else(|e| e.into_inner())
++}
++
++fn defer(at: usize, bytes: &[u8]) -> bool {
++    let over = {
++        let mut l = ledger();
++        if l.renew(at, bytes) {
++            drop(l);
++            noted(at, bytes.len());
++            return true;
++        }
++        let over = l.take(at, at + bytes.len());
++        ANY.store(l.len() > 0, Ordering::Relaxed);
++        over
++    };
++    write_back(over);
++    if LEDGER.read().unwrap_or_else(|e| e.into_inner()).bytes + bytes.len() as u64 > held_most() {
++        return false;
++    }
++    // What title memory holds now (nothing else is held over it).
++    let mut old = vec![0u8; bytes.len()];
++    if !crate::host::read_into(at as *const u8, &mut old) {
++        return false;
++    }
++    let held = {
++        let mut l = ledger();
++        let held = l.hold(at, Held { old, new: bytes.to_vec() });
++        ANY.store(l.len() > 0, Ordering::Relaxed);
++        held
++    };
++    if held {
++        noted(at, bytes.len());
++    }
++    held
++}
++
++/// A held write counts as written for every copy of its memory, as the
++/// write would have: they take it again, through [`overlay`].
++fn noted(at: usize, n: usize) {
++    crate::watch::writing(at, n);
++    crate::watch::noted_written(at, n);
++}
++
++/// Writes held bytes into title memory.
++fn write_back(held: Vec<(usize, Held)>) {
++    for (at, h) in held {
++        let n = h.new.len();
++        let mut ram = vec![0u8; n];
++        if !crate::host::read_into(at as *const u8, &mut ram) {
++            continue;
++        }
++        let out = resolved(&ram, &h);
++        if out != ram {
++            crate::watch::writing(at, n);
++            crate::host::write_mapped(at as *mut u8, out.as_ptr(), n);
++        }
++        PERIOD[SETTLED].fetch_add(n as u64, Ordering::Relaxed);
++    }
++}
++
++/// Title memory `[at, at + len)` is about to be written, remapped or read
++/// by the title: what is held over it goes in first.
++pub(crate) fn settle(at: usize, len: usize) {
++    if !ANY.load(Ordering::Relaxed) || len == 0 {
++        return;
++    }
++    let held = {
++        let mut l = ledger();
++        let held = l.take(at, at.saturating_add(len));
++        ANY.store(l.len() > 0, Ordering::Relaxed);
++        held
++    };
++    write_back(held);
++}
++
++/// The layer read title memory `[src, src + len)` into `dst`: shown as if
++/// the held writes had been made.
++pub(crate) fn overlay(src: usize, dst: *mut u8, len: usize) {
++    if !ANY.load(Ordering::Relaxed) || len == 0 {
++        return;
++    }
++    // SAFETY: the caller's destination of `len` bytes, just written.
++    let dst = unsafe { std::slice::from_raw_parts_mut(dst, len) };
++    LEDGER.read().unwrap_or_else(|e| e.into_inner()).overlay(src, dst);
++}
++
++/// The lines, every 5 s (called once a second from the frame-rate line).
++pub(crate) fn line() {
++    static LAST: AtomicU64 = AtomicU64::new(0);
++    if !set_on() {
++        return;
++    }
++    let now = crate::host::now_ms();
++    let last = LAST.load(Ordering::Relaxed);
++    if now < last + 5000 || LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() {
++        return;
++    }
++    let p: Vec<u64> = PERIOD.iter().map(|c| c.swap(0, Ordering::Relaxed)).collect();
++    let mut top: Vec<(u64, u64)> = OUTSIDE.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default().into_iter().collect();
++    top.sort_unstable_by(|a, b| b.1.cmp(&a.1));
++    // Key 0: every range past the first TOP_KEYS starts of the period.
++    let top: Vec<String> =
++        top.iter().take(8).map(|(a, n)| if *a == 0 { format!("(other ranges) {n}") } else { format!("{a:#x} {n}") }).collect();
++    let (rings, bytes) = {
++        let s = SET.read().unwrap_or_else(|e| e.into_inner());
++        (s.rings, s.bytes)
++    };
++    let mb = |v: u64| v as f64 / (1 << 20) as f64;
++    let all = p[IN] + p[OUT];
++    tracing::info!(
++        "read-back set: {rings} rings, {bytes} bytes; copy-back this period: {:.1} MB inside the set, {:.1} MB outside ({:.1} % outside); ranges outside the set that were copied back: top 8 by bytes with address and bytes: [{}]",
++        mb(p[IN]),
++        mb(p[OUT]),
++        if all == 0 { 0.0 } else { p[OUT] as f64 * 100.0 / all as f64 },
++        top.join(", ")
++    );
++    let mut rings: Vec<(u64, u64)> = BY_RING.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default().into_iter().collect();
++    if !rings.is_empty() {
++        rings.sort_unstable_by(|a, b| b.1.cmp(&a.1));
++        let list: Vec<String> = rings.iter().take(8).map(|(r, n)| format!("ring {r:#x} {n}")).collect();
++        tracing::info!("read-back set: copy-back this period inside the set by ring, top 8 of {}: [{}]", rings.len(), list.join(", "));
++    }
++    if only_read() {
++        let (ranges, held) = {
++            let l = LEDGER.read().unwrap_or_else(|e| e.into_inner());
++            (l.len(), l.bytes)
++        };
++        tracing::info!(
++            "copy-back skipped as never read: {:.1} MB (VICTORY_BACK_ONLY_READ=1; {:.1} MB written later, when needed; {ranges} ranges, {:.1} MB held newer than title memory)",
++            mb(p[SKIPPED]),
++            mb(p[SETTLED]),
++            mb(held)
++        );
++    }
++    feedback::line();
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    const ALIAS: [u64; 3] = [0x2_0000_0000, 0x1000_0000, 0x9_0000_0000];
++
++    #[test]
++    fn the_alias_moves_only_memory_in_its_window() {
++        assert_eq!(gpu_form(0x2_0000_1000, ALIAS), 0x9_0000_1000);
++        assert_eq!(gpu_form(0x2_1000_0000, ALIAS), 0x2_1000_0000, "the window's end is outside it");
++        assert_eq!(gpu_form(0x1_ffff_ffff, ALIAS), 0x1_ffff_ffff);
++        assert_eq!(gpu_form(0x2_0000_1000, [0x2_0000_0000, 0, 0x9_0000_0000]), 0x2_0000_1000);
++    }
++
++    #[test]
++    fn ranges_are_inside_by_either_address() {
++        let mut s = Set::default();
++        // GPU address not given: the alias gives it.
++        let b = s.add((0x10, 0, 3), 0x2_0000_1000, 0, 0x100, ALIAS);
++        assert_eq!(b.gpu, 0x9_0000_1000);
++        // Given, and different from both.
++        s.add((0x10, 0, 3), 0x5000_0000, 0x7000_0000, 0x40, ALIAS);
++        assert_eq!(s.inside(0x2_0000_1000, 0x100), 0x100);
++        assert_eq!(s.inside(0x9_0000_1000, 0x100), 0x100, "the GPU's form");
++        assert_eq!(s.inside(0x9_0000_10f0, 0x20), 0x10, "half in");
++        assert_eq!(s.inside(0x2_0000_0f00, 0x100), 0, "just before");
++        assert_eq!(s.inside(0x2_0000_1100, 0x100), 0, "just after");
++        assert_eq!(s.inside(0x7000_0020, 0x40), 0x20);
++        assert_eq!(s.inside(0x5000_0000, 0x40), 0x40);
++        // Overlapping and adjacent buffers merge, and count once.
++        s.add((0x10, 0, 3), 0x2_0000_1080, 0, 0x100, ALIAS);
++        s.add((0x10, 0, 3), 0x2_0000_1180, 0, 0x80, ALIAS);
++        assert_eq!(s.inside(0x2_0000_0000, 0x10000), 0x200);
++        assert_eq!(s.buffers.len(), 4);
++        assert_eq!(s.buffers[3].order, 3);
++        // By ring, in either form: ring 0x10 holds all of these.
++        assert_eq!(s.rings_over(0x9_0000_1000, 0x40, ALIAS), [(0x10, 0x40)]);
++        assert!(s.rings_over(0x3000_0000, 0x40, ALIAS).is_empty());
++        // The part each buffer holds, in the asked addresses.
++        let over = s.over(0x9_0000_10f0, 0x20, ALIAS);
++        assert_eq!(over.len(), 2);
++        assert_eq!((over[0].1, over[0].2), (0x9_0000_10f0, 0x9_0000_1100));
++        assert_eq!((over[1].1, over[1].2), (0x9_0000_10f0, 0x9_0000_1110));
++    }
++
++    #[test]
++    fn a_held_write_shows_where_title_memory_is_unchanged() {
++        let mut l = Ledger::default();
++        assert!(l.hold(0x1000, Held { old: vec![1, 2, 3, 4], new: vec![9, 9, 3, 9] }));
++        assert!(!l.hold(0x1002, Held { old: vec![0; 4], new: vec![0; 4] }), "overlapping");
++        // The title wrote 0x1001 since (2 -> 7): its byte stays.
++        let mut read = vec![0, 1, 7, 3, 4, 5];
++        l.overlay(0x0fff, &mut read);
++        assert_eq!(read, [0, 9, 7, 3, 9, 5]);
++        // A partial read.
++        let mut read = vec![3, 4];
++        l.overlay(0x1002, &mut read);
++        assert_eq!(read, [3, 9]);
++        // A newer write of the same range replaces it, the old bytes stay.
++        assert!(l.renew(0x1000, &[8, 8, 8, 8]));
++        assert!(!l.renew(0x1000, &[8, 8]));
++        let held = l.take(0x1003, 0x1004);
++        assert_eq!(held.len(), 1);
++        assert_eq!(resolved(&[1, 7, 3, 4], &held[0].1), [8, 7, 8, 8]);
++        assert_eq!(l.len(), 0);
++        assert_eq!(l.bytes, 0);
++        assert!(l.take(0, usize::MAX).is_empty());
++    }
++}
+diff -ruN '--exclude=target' F1base/crates/victory-gpu/src/shadow.rs F1/crates/victory-gpu/src/shadow.rs
+--- F1base/crates/victory-gpu/src/shadow.rs	2026-11-25 23:52:30.000000000 +0200
++++ F1/crates/victory-gpu/src/shadow.rs	2026-11-26 00:40:50.305765700 +0200
+@@ -3394,6 +3394,9 @@
+                 // stretch is the title's as read, and a title write landing
+                 // there since stays.
+                 for &(off, len) in &runs {
++                    if crate::readback::back(start + at + off, &title[off..off + len]) {
++                        continue;
++                    }
+                     crate::host::write_mapped((start + at + off) as *mut u8, title[off..].as_ptr(), len);
+                     written += len;
+                     crate::heap_marks::back(start + at + off, len);
+@@ -3497,6 +3500,9 @@
+             return 0;
+         }
+         crate::host::shaders_write(start + at, &title[..]);
++        if crate::readback::back(start + at, &title[..]) {
++            return 0;
++        }
+         self.raw_own_back(n);
+         crate::heap_marks::back(start + at, n);
+         if self.put_back_own(start + at, &title[..]) {
+@@ -4405,7 +4411,9 @@
+                 *t = merged;
+                 *o = merged;
+             }
+-            if differs != 0 {
++            if differs != 0 && crate::readback::back(start + at, &title[..]) {
++                crate::host::shaders_write(start + at, &title[..]);
++            } else if differs != 0 {
+                 crate::host::shaders_write(start + at, &title[..]);
+                 crate::watch::writing(start + at, n);
+                 merge_race(as_read.as_deref(), (self.start, self.len), start + at, &title[..], "card");
+@@ -4495,6 +4503,9 @@
+             return 0;
+         }
+         crate::host::shaders_write(start + at, &title[..]);
++        if crate::readback::back(start + at, &title[..]) {
++            return 0;
++        }
+         crate::heap_marks::back(start + at, n);
+         if self.put_back_own(start + at, &title[..]) {
+             return n;
+diff -ruN '--exclude=target' F1base/crates/victory-gpu/src/watch.rs F1/crates/victory-gpu/src/watch.rs
+--- F1base/crates/victory-gpu/src/watch.rs	2026-11-25 23:46:57.000000000 +0200
++++ F1/crates/victory-gpu/src/watch.rs	2026-11-26 00:40:50.305765700 +0200
+@@ -1466,6 +1466,21 @@
+     }
+ }
+ 
++/// Title memory `[at, at + len)` counts as written now, as a write of the
++/// title's found by an asking would (`crate::readback`: a copy-back held,
++/// not made): every copy that took its pages takes them again.
++pub(crate) fn noted_written(at: usize, len: usize) {
++    if len == 0 {
++        return;
++    }
++    let mut j = journal();
++    j.asked += 1;
++    let now = j.asked;
++    for page in at / PAGE..=(at + len - 1) / PAGE {
++        j.written.insert(page, now);
++    }
++}
++
+ pub fn writing(at: usize, len: usize) {
+     // The length is the title's (`fread`'s size times count, saturated).
+     open(&mut guards(), at, at.saturating_add(len));
+@@ -1721,6 +1736,7 @@
+ /// unmapping and the mapping again, over all the bytes whose mapping it
+ /// changes (with `VICTORY_MAPPING_RANGES=0`, all of title memory).
+ pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
++    crate::readback::settle(at, len);
+     let asked = std::time::Instant::now();
+     let held = if by_range() {
+         let end = at.saturating_add(len);
+diff -ruN '--exclude=target' F1base/crates/victory-hle/src/lib.rs F1/crates/victory-hle/src/lib.rs
+--- F1base/crates/victory-hle/src/lib.rs	2026-11-25 19:11:21.000000000 +0200
++++ F1/crates/victory-hle/src/lib.rs	2026-11-26 00:41:50.528610000 +0200
+@@ -13,6 +13,8 @@
+ 
+ mod host;
+ pub mod modules;
++#[cfg(windows)]
++pub mod readback;
+ mod registry;
+ pub mod runtime;
+ 
+diff -ruN '--exclude=target' F1base/crates/victory-hle/src/readback.rs F1/crates/victory-hle/src/readback.rs
+--- F1base/crates/victory-hle/src/readback.rs	1970-01-01 02:00:00.000000000 +0200
++++ F1/crates/victory-hle/src/readback.rs	2026-11-26 01:01:40.380999100 +0200
+@@ -0,0 +1,157 @@
++//! The hooks of finding F1 in the title's code (build 1.0.2.1; addresses
++//! as RVAs from the preferred base 0x140000000): the ring of read-back
++//! buffers (`victory_gpu::readback`), and with `VICTORY_READBACK_LOCKS=1`
++//! the engine's generic buffer lock. Each site's bytes are checked first;
++//! a site that differs is left alone with a warning.
++
++use std::cell::RefCell;
++use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
++
++use victory_loader::callhook::{self, Regs};
++
++/// The `call` (5 bytes) in the read-back ring's constructor that runs once
++/// its buffers exist, with rcx = rsi = the ring (`mov rcx, rsi` before it).
++const RING_SITE: usize = 0x1adc33b;
++/// What it calls.
++const RING_TARGET: usize = 0x1adc380;
++/// The title's alias of CPU memory for the GPU: start, length, GPU base.
++const ALIAS: u64 = 0x9e1dac0;
++/// The generic buffer lock (rcx = buffer handle, rdx = lock record), and
++/// its first instructions: `push rsi; push rdi; push rbx; sub rsp, 0x20`.
++const LOCK: usize = 0x5121550;
++const LOCK_PROLOGUE: [u8; 7] = [0x56, 0x57, 0x53, 0x48, 0x83, 0xEC, 0x20];
++/// Its unlock (rcx = the same record): `mov r8, rcx; mov rcx, [rcx+0x10]`.
++const UNLOCK: usize = 0x4e8abe0;
++const UNLOCK_PROLOGUE: [u8; 7] = [0x49, 0x89, 0xC8, 0x48, 0x8B, 0x49, 0x10];
++/// The return address of the constructor's one call, in the ring wrapper
++/// (0x141d40f90: eight pushes and 0x68 bytes, then the call).
++const CTOR_RETURN: usize = 0x1d4107d;
++/// From the hook's return slot to the constructor's return address (its
++/// five pushes and 0x50 bytes, the call's own slot), and from there to the
++/// wrapper's return address.
++const TO_CTOR_RETURN: usize = 0x80;
++const TO_WRAPPER_RETURN: usize = 0xb0;
++/// Where the wrapper returns to, for the rings named so far (the 22 call
++/// sites are all in the log by address).
++const NAMED: [(usize, &str); 3] =
++    [(0xcc9067, "imposter"), (0x1dfee58, "visibility_buffer"), (0x3286358, "terrain_virtual_texture")];
++/// The preferred base, for addresses printed as the analyst's.
++const PREFERRED: u64 = 0x1_4000_0000;
++
++static BASE: AtomicU64 = AtomicU64::new(0);
++static AFTER: AtomicUsize = AtomicUsize::new(0);
++
++thread_local! {
++    /// Locks under way on this thread: the real return address, the
++    /// record, the handle.
++    static LOCKS: RefCell<Vec<(u64, u64, u64)>> = const { RefCell::new(Vec::new()) };
++}
++
++unsafe extern "C" fn ring_made(regs: *mut Regs) {
++    // SAFETY: the thunk's saved registers.
++    let ring = unsafe { (*regs).rcx } as usize;
++    let base = BASE.load(Ordering::Relaxed) as usize;
++    // The stack above the call, as the constructor and the wrapper laid it
++    // out (checked by the constructor's return address).
++    // SAFETY: `ret` is the call's slot on this thread's stack; the frames
++    // above it are the constructor's and the wrapper's, still live.
++    let slot = unsafe { std::ptr::addr_of!((*regs).ret) } as usize;
++    let ctor_return = unsafe { ((slot + TO_CTOR_RETURN) as *const usize).read() };
++    let site = if ctor_return == base + CTOR_RETURN {
++        // SAFETY: as above.
++        unsafe { ((slot + TO_CTOR_RETURN + TO_WRAPPER_RETURN) as *const usize).read() }.wrapping_sub(base)
++    } else {
++        0
++    };
++    let name = NAMED.iter().find(|n| n.0 == site).map_or("", |n| n.1);
++    let site = if site == 0 { 0 } else { site as u64 + PREFERRED };
++    let alias = base as u64 + ALIAS;
++    let _ = std::panic::catch_unwind(|| victory_gpu::readback::ring_created(ring, alias, site, name));
++}
++
++unsafe extern "C" fn lock_entered(regs: *mut Regs) {
++    // SAFETY: the thunk's saved registers; `ret` is the return address on
++    // the stack, which the stub takes.
++    let regs = unsafe { &mut *regs };
++    if regs.rdx == 0 {
++        return;
++    }
++    let caller = regs.ret.wrapping_sub(BASE.load(Ordering::Relaxed)).wrapping_add(PREFERRED);
++    let (handle, record, r8, r9) = (regs.rcx, regs.rdx, regs.r8, regs.r9);
++    let _ = std::panic::catch_unwind(|| victory_gpu::readback::lock_entered(handle, record, r8, r9, caller));
++    LOCKS.with(|l| l.borrow_mut().push((regs.ret, record, handle)));
++    regs.ret = AFTER.load(Ordering::Relaxed) as u64;
++}
++
++unsafe extern "C" fn unlock_entered(regs: *mut Regs) {
++    // SAFETY: the thunk's saved registers.
++    let record = unsafe { (*regs).rcx };
++    let _ = std::panic::catch_unwind(|| victory_gpu::readback::unlocked(record));
++}
++
++unsafe extern "C" fn lock_returned(rax: u64, slot: *mut u64) {
++    let Some((ret, record, handle)) = LOCKS.with(|l| l.borrow_mut().pop()) else {
++        // Nowhere to return to: cannot happen (each stub return was pushed).
++        std::process::abort();
++    };
++    // SAFETY: the stub's slot for the return address.
++    unsafe { *slot = ret };
++    let caller = ret.wrapping_sub(BASE.load(Ordering::Relaxed)).wrapping_add(PREFERRED);
++    let _ = std::panic::catch_unwind(|| victory_gpu::readback::lock_returned(handle, record, caller, rax & 0xff != 0));
++}
++
++/// The bytes at `rva` of the image at `base`.
++fn bytes(base: usize, rva: usize, n: usize) -> Vec<u8> {
++    // SAFETY: inside the mapped image (the sites are in its .text).
++    unsafe { std::slice::from_raw_parts((base + rva) as *const u8, n) }.to_vec()
++}
++
++/// Installs the hooks the switches ask for into the image at `base`.
++///
++/// # Safety
++/// `base` is the title's mapped image (build 1.0.2.1 or one whose bytes the
++/// checks refuse), and no title code runs yet.
++pub unsafe fn install(base: usize) {
++    if !victory_gpu::readback::set_on() {
++        return;
++    }
++    BASE.store(base as u64, Ordering::Relaxed);
++    // The call and the `mov rcx, rsi` before it.
++    let found = bytes(base, RING_SITE - 3, 8);
++    if found[..3] != [0x48, 0x89, 0xF1] {
++        tracing::warn!(at = format_args!("{:#x}", base + RING_SITE), found = ?found, "read-back ring hook not installed: the bytes differ (another build?)");
++        return;
++    }
++    // SAFETY: the caller's promise; `redirect_call` checks the call.
++    match unsafe { callhook::redirect_call(base + RING_SITE, base + RING_TARGET, ring_made) } {
++        Ok(()) => tracing::info!(at = format_args!("{:#x}", base + RING_SITE), "read-back ring hook installed (VICTORY_READBACK_SET=1)"),
++        Err(e) => {
++            tracing::warn!(error = %e, "read-back ring hook not installed: the bytes differ (another build?)");
++            return;
++        }
++    }
++    if !victory_gpu::readback::locks_on() {
++        return;
++    }
++    let stub = match callhook::after_stub(lock_returned) {
++        Ok(stub) => stub,
++        Err(e) => {
++            tracing::warn!(error = %e, "buffer lock hook not installed");
++            return;
++        }
++    };
++    AFTER.store(stub, Ordering::Relaxed);
++    // SAFETY: the caller's promise; `hook_entry` checks the prologue.
++    match unsafe { callhook::hook_entry(base + LOCK, &LOCK_PROLOGUE, lock_entered) } {
++        Ok(()) => tracing::info!(at = format_args!("{:#x}", base + LOCK), "buffer lock hook installed (VICTORY_READBACK_LOCKS=1)"),
++        Err(e) => {
++            tracing::warn!(error = %e, "buffer lock hook not installed: the bytes differ (another build?)");
++            return;
++        }
++    }
++    // SAFETY: as above.
++    match unsafe { callhook::hook_entry(base + UNLOCK, &UNLOCK_PROLOGUE, unlock_entered) } {
++        Ok(()) => tracing::info!(at = format_args!("{:#x}", base + UNLOCK), "buffer unlock hook installed (VICTORY_READBACK_LOCKS=1)"),
++        Err(e) => tracing::warn!(error = %e, "buffer unlock hook not installed: the bytes differ (another build?)"),
++    }
++}
+diff -ruN '--exclude=target' F1base/crates/victory-loader/src/callhook.rs F1/crates/victory-loader/src/callhook.rs
+--- F1base/crates/victory-loader/src/callhook.rs	1970-01-01 02:00:00.000000000 +0200
++++ F1/crates/victory-loader/src/callhook.rs	2026-11-26 00:37:12.061882800 +0200
+@@ -0,0 +1,318 @@
++//! Small hooks in the title's code: a `call rel32` redirected to a thunk
++//! (call-site redirect), or a function entry turned into a jump to one
++//! (entry hook). Same mechanism as the static TLS redirect (`crate::tls`):
++//! generated code on a page within `rel32` reach of the image, the title's
++//! bytes rewritten while no title code runs, after checking them.
++//!
++//! The thunk saves every volatile register, the flags and xmm0-5, calls a
++//! routine of ours with a pointer to the saved general registers
++//! ([`Regs`]), restores everything, runs the bytes it replaced (an entry
++//! hook's prologue; nothing for a call site) and jumps on to the original
++//! code: the title sees the same registers, flags and stack as without it.
++//! The routine runs on a 16-byte aligned stack with its shadow space.
++//!
++//! A routine may replace [`Regs::ret`] (the return address of the call
++//! being made) with an [`after_stub`]: the function then returns there,
++//! the stub calls a second routine with the function's `rax` and a slot to
++//! put the real return address in, and returns there with `rax` and xmm0
++//! as the function left them.
++
++use std::sync::atomic::{AtomicUsize, Ordering};
++
++use anyhow::{Result, bail};
++use windows_sys::Win32::System::Diagnostics::Debug::FlushInstructionCache;
++use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE, VirtualProtect};
++use windows_sys::Win32::System::Threading::GetCurrentProcess;
++
++/// The general registers as the thunk saved them, lowest address first;
++/// `ret` is the return address on the stack (writable: see the module).
++#[repr(C)]
++#[derive(Debug, Clone, Copy)]
++pub struct Regs {
++    pub r11: u64,
++    pub r10: u64,
++    pub r9: u64,
++    pub r8: u64,
++    pub rdx: u64,
++    pub rcx: u64,
++    pub rax: u64,
++    pub flags: u64,
++    pub ret: u64,
++}
++
++/// Called before the hooked code, with the saved registers.
++pub type Before = unsafe extern "C" fn(*mut Regs);
++/// Called when a function whose return an [`after_stub`] took returns:
++/// its `rax`, and the slot to write the real return address into.
++pub type After = unsafe extern "C" fn(u64, *mut u64);
++
++/// Whether `code` (5 bytes at address `site`) is `call target`.
++pub fn is_call_to(code: &[u8], site: usize, target: usize) -> bool {
++    code.len() >= 5
++        && code[0] == 0xE8
++        && (site as i64 + 5 + i64::from(i32::from_le_bytes([code[1], code[2], code[3], code[4]]))) as usize == target
++}
++
++/// The thunk: saves, calls `before`, restores, runs `replaced`, jumps to
++/// `resume`. Position independent.
++fn before_thunk(before: usize, replaced: &[u8], resume: usize) -> Vec<u8> {
++    let mut c = vec![0x9C, 0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53];
++    c.extend([0x48, 0x81, 0xEC, 0x88, 0, 0, 0]); // sub rsp, 0x88
++    for x in 0..6u8 {
++        c.extend([0xF3, 0x0F, 0x7F, 0x44 | x << 3, 0x24, 0x20 + 0x10 * x]); // movdqu [rsp+..], xmmN
++    }
++    c.extend([0x48, 0x8D, 0x8C, 0x24, 0x88, 0, 0, 0]); // lea rcx, [rsp+0x88]: the saved registers
++    c.extend([0x48, 0xB8]);
++    c.extend((before as u64).to_le_bytes()); // mov rax, before
++    c.extend([0xFF, 0xD0]); // call rax
++    for x in 0..6u8 {
++        c.extend([0xF3, 0x0F, 0x6F, 0x44 | x << 3, 0x24, 0x20 + 0x10 * x]); // movdqu xmmN, [rsp+..]
++    }
++    c.extend([0x48, 0x81, 0xC4, 0x88, 0, 0, 0]); // add rsp, 0x88
++    c.extend([0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59, 0x58, 0x9D]);
++    c.extend(replaced);
++    c.extend([0xFF, 0x25, 0, 0, 0, 0]); // jmp [rip]
++    c.extend((resume as u64).to_le_bytes());
++    c
++}
++
++/// The stub a function returns to when a [`Before`] routine took its
++/// return ([`after_stub`]).
++fn after_code(after: usize) -> Vec<u8> {
++    let mut c = vec![0x48, 0x83, 0xEC, 0x08, 0x50, 0x48, 0x83, 0xEC, 0x30]; // sub rsp,8; push rax; sub rsp,0x30
++    c.extend([0xF3, 0x0F, 0x7F, 0x44, 0x24, 0x20]); // movdqu [rsp+0x20], xmm0
++    c.extend([0x48, 0x89, 0xC1, 0x48, 0x8D, 0x54, 0x24, 0x38]); // mov rcx, rax; lea rdx, [rsp+0x38]
++    c.extend([0x48, 0xB8]);
++    c.extend((after as u64).to_le_bytes());
++    c.extend([0xFF, 0xD0]); // call rax
++    c.extend([0xF3, 0x0F, 0x6F, 0x44, 0x24, 0x20]); // movdqu xmm0, [rsp+0x20]
++    c.extend([0x48, 0x83, 0xC4, 0x30, 0x58, 0xC3]); // add rsp,0x30; pop rax; ret
++    c
++}
++
++/// Our code on a fresh page near `near_to`, made executable.
++fn place(near_to: usize, code: &[u8]) -> Result<usize> {
++    if code.len() > 4096 {
++        bail!("hook thunk too large");
++    }
++    let page = crate::tls::near(near_to, 0)?;
++    // SAFETY: a fresh writable page of ours, 4096 bytes.
++    unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), page, code.len()) };
++    let mut old = 0;
++    // SAFETY: our page.
++    if unsafe { VirtualProtect(page as _, 4096, PAGE_EXECUTE_READ, &mut old) } == 0 {
++        bail!("VirtualProtect(hook thunk) failed: {}", std::io::Error::last_os_error());
++    }
++    Ok(page as usize)
++}
++
++/// Writes `bytes` over the code at `at`.
++///
++/// # Safety
++/// `at..at + bytes.len()` is mapped code no thread is running.
++unsafe fn write_code(at: usize, bytes: &[u8]) -> Result<()> {
++    let mut old = 0;
++    // SAFETY: the caller's range.
++    if unsafe { VirtualProtect(at as _, bytes.len(), PAGE_EXECUTE_READWRITE, &mut old) } == 0 {
++        bail!("VirtualProtect(code) failed: {}", std::io::Error::last_os_error());
++    }
++    // SAFETY: writable now; see the caller's promise.
++    unsafe {
++        std::ptr::copy_nonoverlapping(bytes.as_ptr(), at as *mut u8, bytes.len());
++        VirtualProtect(at as _, bytes.len(), old, &mut old);
++        FlushInstructionCache(GetCurrentProcess(), at as _, bytes.len());
++    }
++    Ok(())
++}
++
++fn rel32(from_end: usize, to: usize) -> Result<[u8; 4]> {
++    let rel = to as i64 - from_end as i64;
++    match i32::try_from(rel) {
++        Ok(r) => Ok(r.to_le_bytes()),
++        Err(_) => bail!("hook thunk out of rel32 reach"),
++    }
++}
++
++/// Redirects the `call target` at `site` to a thunk that runs `before`,
++/// then `target`. Refuses (and changes nothing) unless the 5 bytes there
++/// are that call.
++///
++/// # Safety
++/// `site` is mapped title code that no thread runs yet.
++pub unsafe fn redirect_call(site: usize, target: usize, before: Before) -> Result<()> {
++    // SAFETY: the caller's mapped code.
++    let found = unsafe { std::slice::from_raw_parts(site as *const u8, 5) };
++    if !is_call_to(found, site, target) {
++        bail!("bytes at {site:#x} are {found:02x?}, not a call to {target:#x}");
++    }
++    let thunk = place(site, &before_thunk(before as usize, &[], target))?;
++    let mut call = vec![0xE8];
++    call.extend(rel32(site + 5, thunk)?);
++    // SAFETY: the caller's promise.
++    unsafe { write_code(site, &call) }
++}
++
++/// Turns the function entry at `entry`, whose first bytes must be
++/// `prologue` (whole instructions, position independent, at least 5
++/// bytes), into a jump to a thunk that runs `before`, then the prologue,
++/// then the function from `entry + prologue.len()`. Refuses (and changes
++/// nothing) if the bytes differ.
++///
++/// # Safety
++/// `entry` is mapped title code that no thread runs yet, and no code jumps
++/// into the middle of the prologue.
++pub unsafe fn hook_entry(entry: usize, prologue: &[u8], before: Before) -> Result<()> {
++    if prologue.len() < 5 {
++        bail!("a prologue of {} bytes has no room for a jump", prologue.len());
++    }
++    // SAFETY: the caller's mapped code.
++    let found = unsafe { std::slice::from_raw_parts(entry as *const u8, prologue.len()) };
++    if found != prologue {
++        bail!("bytes at {entry:#x} are {found:02x?}, expected {prologue:02x?}");
++    }
++    let thunk = place(entry, &before_thunk(before as usize, prologue, entry + prologue.len()))?;
++    let mut jump = vec![0xE9];
++    jump.extend(rel32(entry + 5, thunk)?);
++    jump.resize(prologue.len(), 0x90);
++    // SAFETY: the caller's promise.
++    unsafe { write_code(entry, &jump) }
++}
++
++/// The address of a stub that calls `after` (see the module); one per
++/// routine, made once.
++pub fn after_stub(after: After) -> Result<usize> {
++    static MADE: std::sync::Mutex<Vec<(usize, usize)>> = std::sync::Mutex::new(Vec::new());
++    static NEAR: AtomicUsize = AtomicUsize::new(0);
++    let mut made = MADE.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some(&(_, stub)) = made.iter().find(|m| m.0 == after as usize) {
++        return Ok(stub);
++    }
++    // Anywhere does: the stub is reached by a return, not a rel32.
++    let near_to = match NEAR.load(Ordering::Relaxed) {
++        0 => after as usize,
++        n => n,
++    };
++    let stub = place(near_to, &after_code(after as usize))?;
++    NEAR.store(stub, Ordering::Relaxed);
++    made.push((after as usize, stub));
++    Ok(stub)
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::sync::Mutex;
++
++    static SEEN: Mutex<Vec<Regs>> = Mutex::new(Vec::new());
++    static RETURNED: Mutex<Vec<(u64, u64)>> = Mutex::new(Vec::new());
++    static STUB: AtomicUsize = AtomicUsize::new(0);
++
++    extern "C" fn target(a: u64, b: u64, c: u64, d: u64) -> u64 {
++        a * 1000 + b * 100 + c * 10 + d
++    }
++
++    unsafe extern "C" fn record(regs: *mut Regs) {
++        // SAFETY: the thunk's saved registers.
++        let r = unsafe { *regs };
++        SEEN.lock().unwrap().push(r);
++    }
++
++    thread_local! {
++        static RETURNS: std::cell::RefCell<Vec<u64>> = const { std::cell::RefCell::new(Vec::new()) };
++    }
++
++    unsafe extern "C" fn take_return(regs: *mut Regs) {
++        // SAFETY: the thunk's saved registers.
++        let r = unsafe { &mut *regs };
++        SEEN.lock().unwrap().push(*r);
++        RETURNS.with(|s| s.borrow_mut().push(r.ret));
++        r.ret = STUB.load(Ordering::Relaxed) as u64;
++    }
++
++    unsafe extern "C" fn returned(rax: u64, slot: *mut u64) {
++        let ret = RETURNS.with(|s| s.borrow_mut().pop()).expect("a taken return");
++        RETURNED.lock().unwrap().push((rax, ret));
++        // SAFETY: the stub's slot.
++        unsafe { *slot = ret };
++    }
++
++    /// Writable code of ours near `to`: `bytes` at its start.
++    fn code_page(to: usize, bytes: &[u8]) -> usize {
++        let page = crate::tls::near(to, 0).unwrap();
++        // SAFETY: our fresh page.
++        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), page, bytes.len()) };
++        let mut old = 0;
++        // SAFETY: our page.
++        unsafe { VirtualProtect(page as _, 4096, PAGE_EXECUTE_READ, &mut old) };
++        page as usize
++    }
++
++    #[test]
++    fn a_call_is_recognised_by_its_bytes() {
++        let site = 0x1_4000_1000usize;
++        let target = 0x1_4000_1040usize;
++        let mut code = vec![0xE8];
++        code.extend(((target - site - 5) as i32).to_le_bytes());
++        assert!(is_call_to(&code, site, target));
++        assert!(!is_call_to(&code, site, target + 1));
++        code[0] = 0xE9;
++        assert!(!is_call_to(&code, site, target));
++        assert!(!is_call_to(&code[..4], site, target));
++    }
++
++    #[test]
++    fn a_redirected_call_runs_the_routine_then_the_target_with_the_same_registers() {
++        let t = target as *const () as usize;
++        // sub rsp,0x28; call target; add rsp,0x28; ret
++        let mut code = vec![0x48, 0x83, 0xEC, 0x28, 0xE8, 0, 0, 0, 0, 0x48, 0x83, 0xC4, 0x28, 0xC3];
++        let probe = crate::tls::near(t, 0).unwrap() as usize;
++        code[5..9].copy_from_slice(&rel32(probe + 9, t).unwrap());
++        // SAFETY: our fresh page.
++        unsafe { std::ptr::copy_nonoverlapping(code.as_ptr(), probe as *mut u8, code.len()) };
++        let mut old = 0;
++        // SAFETY: our page.
++        unsafe { VirtualProtect(probe as _, 4096, PAGE_EXECUTE_READ, &mut old) };
++        let site = probe + 4;
++        let f: extern "C" fn(u64, u64, u64, u64) -> u64 = unsafe { std::mem::transmute(probe) };
++        // Wrong target: refused, nothing changed.
++        // SAFETY: our page, not running.
++        assert!(unsafe { redirect_call(site, t + 1, record) }.is_err());
++        // SAFETY: our page, not running.
++        unsafe { redirect_call(site, t, record) }.unwrap();
++        SEEN.lock().unwrap().clear();
++        assert_eq!(f(1, 2, 3, 4), 1234);
++        assert_eq!(f(5, 6, 7, 8), 5678);
++        let seen = SEEN.lock().unwrap().clone();
++        assert_eq!(seen.len(), 2);
++        assert_eq!((seen[0].rcx, seen[0].rdx, seen[0].r8, seen[0].r9), (1, 2, 3, 4));
++        assert_eq!(seen[0].ret as usize, site + 5);
++        assert_eq!((seen[1].rcx, seen[1].r9), (5, 8));
++    }
++
++    #[test]
++    fn an_entry_hook_sees_the_arguments_and_the_return() {
++        // push rsi; push rdi; push rbx; sub rsp,0x20 | lea rax,[rcx+rdx] |
++        // add rsp,0x20; pop rbx; pop rdi; pop rsi; ret
++        let prologue = [0x56, 0x57, 0x53, 0x48, 0x83, 0xEC, 0x20];
++        let mut code = prologue.to_vec();
++        code.extend([0x48, 0x8D, 0x04, 0x11, 0x48, 0x83, 0xC4, 0x20, 0x5B, 0x5F, 0x5E, 0xC3]);
++        let entry = code_page(record as *const () as usize, &code);
++        STUB.store(after_stub(returned).unwrap(), Ordering::Relaxed);
++        // SAFETY: our page, not running.
++        assert!(unsafe { hook_entry(entry, &[0x55, 0x57, 0x53, 0x48, 0x83, 0xEC, 0x20], take_return) }.is_err());
++        // SAFETY: as above: refused, so the bytes are as they were.
++        assert_eq!(unsafe { std::slice::from_raw_parts(entry as *const u8, 7) }, &prologue);
++        // SAFETY: our page, not running.
++        unsafe { hook_entry(entry, &prologue, take_return) }.unwrap();
++        let f: extern "C" fn(u64, u64) -> u64 = unsafe { std::mem::transmute(entry) };
++        SEEN.lock().unwrap().clear();
++        RETURNED.lock().unwrap().clear();
++        assert_eq!(f(40, 2), 42);
++        assert_eq!(f(7, 8), 15);
++        let seen = SEEN.lock().unwrap().clone();
++        assert_eq!((seen[0].rcx, seen[0].rdx), (40, 2));
++        let back = RETURNED.lock().unwrap().clone();
++        assert_eq!(back.iter().map(|b| b.0).collect::<Vec<_>>(), [42, 15]);
++        assert_eq!(back[0].1, seen[0].ret);
++    }
++}
+diff -ruN '--exclude=target' F1base/crates/victory-loader/src/lib.rs F1/crates/victory-loader/src/lib.rs
+--- F1base/crates/victory-loader/src/lib.rs	2026-11-25 19:11:21.000000000 +0200
++++ F1/crates/victory-loader/src/lib.rs	2026-11-26 00:37:12.286110300 +0200
+@@ -22,6 +22,8 @@
+ //!    on, pass every thread start and end on to the attached images.
+ 
+ #[cfg(windows)]
++pub mod callhook;
++#[cfg(windows)]
+ mod console_insn;
+ mod crash;
+ pub mod prepare;
+diff -ruN '--exclude=target' F1base/crates/victory-loader/src/tls.rs F1/crates/victory-loader/src/tls.rs
+--- F1base/crates/victory-loader/src/tls.rs	2026-11-25 19:11:21.000000000 +0200
++++ F1/crates/victory-loader/src/tls.rs	2026-11-26 00:37:12.168550000 +0200
+@@ -140,7 +140,7 @@
+ 
+ /// One writable page within `rel32` reach of `[base, base + size)`. Leaked:
+ /// title code calls into it for the life of the process.
+-fn near(base: usize, size: usize) -> Result<*mut u8> {
++pub(crate) fn near(base: usize, size: usize) -> Result<*mut u8> {
+     const GRANULE: usize = 0x1_0000;
+     // The search spans 1 GiB each side, so every call site stays in reach.
+     if size >= 1 << 30 {

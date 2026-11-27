@@ -1,0 +1,2357 @@
+diff -ruN '--exclude=target' S/crates/victory-formats/src/texture.rs Y/crates/victory-formats/src/texture.rs
+--- S/crates/victory-formats/src/texture.rs	2026-11-25 19:11:21.000000000 +0200
++++ Y/crates/victory-formats/src/texture.rs	2026-11-25 22:00:11.122188500 +0200
+@@ -581,8 +581,35 @@
+         self.mips.get(mip as usize).map_or(0, |m| m.depth)
+     }
+ 
++    /// The bytes from the texture's start that mip `first` and the smaller
++    /// ones take: the smaller a mip, the nearer the start it lies, so a
++    /// title that streams textures has memory for the smaller mips only and
++    /// another texture right behind them. All of the layout where slices
++    /// follow each other (each holds its whole chain). (myokex c3723f3.)
++    pub fn bytes_from(&self, first: u32) -> u64 {
++        let whole = first == 0
++            || self.slices != 1
++            || self.thick
++            || self.desc.dimension == Dimension::Tex3d
++            || self.desc.samples != 1
++            || first >= self.desc.mips;
++        if whole {
++            return self.size;
++        }
++        self.mips[first as usize..]
++            .iter()
++            .map(|m| match m.tail {
++                Some(_) => self.alignment,
++                None => m.offset + u64::from(m.pitch) * u64::from(m.rows) * u64::from(self.desc.element_bytes),
++            })
++            .max()
++            .unwrap_or(self.size)
++            .min(self.size)
++    }
++
+     /// Copies one subresource out of tiled memory (the whole texture,
+-    /// [`Layout::size`] bytes) into linear rows: mip `mip` of array slice
++    /// [`Layout::size`] bytes, or the [`Layout::bytes_from`] of the mip)
++    /// into linear rows: mip `mip` of array slice
+     /// `slice` (3D: every depth slice of the mip, `slice` 0). Rows are
+     /// `row_pitch` bytes apart, depth slices `depth_pitch`.
+     pub fn detile(
+@@ -594,7 +621,24 @@
+         row_pitch: usize,
+         depth_pitch: usize,
+     ) -> Result<(), Error> {
+-        self.walk::<true>(tiled, linear, mip, slice, row_pitch, depth_pitch)
++        self.walk::<true>(tiled, linear, mip, slice, row_pitch, depth_pitch, None)
++    }
++
++    /// [`Layout::detile`] of rows `rows` only, of a subresource one slice
++    /// deep (a 2D mip of one array slice): `linear` starts at row
++    /// `rows.start`. The bands of a subresource can so be detiled apart,
++    /// on several threads, into disjoint parts of its rows, byte for byte
++    /// as the whole detile writes them.
++    pub fn detile_rows(
++        &self,
++        tiled: &[u8],
++        mip: u32,
++        slice: u32,
++        linear: &mut [u8],
++        row_pitch: usize,
++        rows: std::ops::Range<u32>,
++    ) -> Result<(), Error> {
++        self.walk::<true>(tiled, linear, mip, slice, row_pitch, 0, Some(rows))
+     }
+ 
+     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
+@@ -607,10 +651,12 @@
+         row_pitch: usize,
+         depth_pitch: usize,
+     ) -> Result<(), Error> {
+-        self.walk::<false>(linear, tiled, mip, slice, row_pitch, depth_pitch)
++        self.walk::<false>(linear, tiled, mip, slice, row_pitch, depth_pitch, None)
+     }
+ 
+-    /// Copies contiguous runs in one direction between the two layouts.
++    /// Copies contiguous runs in one direction between the two layouts;
++    /// with `band`, only those rows of a subresource one slice deep, linear
++    /// offsets counted from the band's first row.
+     #[allow(clippy::too_many_arguments)]
+     fn walk<const DETILE: bool>(
+         &self,
+@@ -620,9 +666,14 @@
+         slice: u32,
+         row_pitch: usize,
+         depth_pitch: usize,
++        band: Option<std::ops::Range<u32>>,
+     ) -> Result<(), Error> {
+         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
+         let depth = m.depth;
++        let rows = band.clone().unwrap_or(0..m.height);
++        if band.is_some() && (depth != 1 || rows.start >= rows.end || rows.end > m.height) {
++            return Err(Error::Invalid);
++        }
+         let first = if self.desc.dimension == Dimension::Tex3d {
+             if slice != 0 {
+                 return Err(Error::Invalid);
+@@ -641,7 +692,7 @@
+         let bytes = m.width as usize * n;
+         let need = (depth as usize - 1)
+             .checked_mul(depth_pitch)
+-            .zip((m.height as usize - 1).checked_mul(row_pitch))
++            .zip((rows.len().max(1) - 1).checked_mul(row_pitch))
+             .and_then(|(depth_offset, row_offset)| depth_offset.checked_add(row_offset))
+             .and_then(|offset| offset.checked_add(bytes))
+             .ok_or(Error::TooSmall)?;
+@@ -650,7 +701,7 @@
+         } else {
+             (dst.len(), src.len())
+         };
+-        if tiled_len < self.size as usize || linear_len < need || row_pitch < bytes {
++        if tiled_len < self.bytes_from(mip) as usize || linear_len < need || row_pitch < bytes {
+             return Err(Error::TooSmall);
+         }
+         let linear = self.desc.swizzle == Swizzle::LINEAR;
+@@ -681,8 +732,8 @@
+         for z in 0..depth {
+             let (s, inner) = self.split(first + z);
+             let base = u64::from(s) * self.slice_size + m.offset;
+-            for y in 0..m.height {
+-                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
++            for y in rows.clone() {
++                let linear_row = z as usize * depth_pitch + (y - rows.start) as usize * row_pitch;
+                 if linear {
+                     let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
+                     copy_run::<DETILE>(src, dst, tiled_row as usize, linear_row, bytes);
+@@ -1176,4 +1227,104 @@
+         );
+         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+     }
++
++    /// Detiling a subresource band by band gives the rows the whole
++    /// detile gives, whatever the bands: in every mode the layout can
++    /// address, every mip and slice, with block compression, 16-byte
++    /// elements and odd sizes (Trexies 58c7bb0, over all modes here).
++    #[test]
++    fn bands_detile_as_the_whole() {
++        let modes: Vec<Swizzle> = (0..32).map(Swizzle).filter(|s| s.block_log2().is_some()).collect();
++        let (mut addressed, mut seen) = (0, std::collections::BTreeSet::new());
++        for swizzle in modes {
++            let mut bc = desc(200, 136, 6, 16, swizzle);
++            bc.block = 4;
++            let mut array = desc(96, 70, 3, 8, swizzle);
++            array.depth = 3;
++            let cases = [
++                desc(300, 190, 5, 4, swizzle),
++                desc(64, 64, 7, 16, swizzle),
++                desc(130, 3, 2, 2, swizzle),
++                desc(77, 41, 4, 1, swizzle),
++                bc,
++                array,
++            ];
++            for d in cases {
++                let Ok(l) = Layout::new(&d) else {
++                    continue;
++                };
++                if !l.addressable() {
++                    continue;
++                }
++                addressed += 1;
++                seen.insert(swizzle.0);
++                let tiled: Vec<u8> = (0..l.size as usize).map(|i| (i * 131 + i / 7) as u8).collect();
++                for slice in 0..d.depth {
++                    for mip in 0..d.mips {
++                        let m = &l.mips[mip as usize];
++                        let pitch = (m.width * d.element_bytes) as usize + 12;
++                        let size = pitch * m.height as usize;
++                        let mut whole = vec![0x5Au8; size];
++                        l.detile(&tiled, mip, slice, &mut whole, pitch, size).unwrap();
++                        for band in [1u32, 2, 5, m.height] {
++                            let mut banded = vec![0x5Au8; size];
++                            let mut y = 0;
++                            while y < m.height {
++                                let end = (y + band).min(m.height);
++                                let part = &mut banded[y as usize * pitch..end as usize * pitch];
++                                l.detile_rows(&tiled, mip, slice, part, pitch, y..end).unwrap();
++                                y = end;
++                            }
++                            assert_eq!(banded, whole, "{d:?} slice {slice} mip {mip} bands of {band}");
++                        }
++                    }
++                }
++            }
++        }
++        println!("{addressed} layouts addressed: {seen:?}");
++        assert!(addressed >= 40, "only {addressed} layouts addressable");
++        // Rows outside the mip, an empty band, too short a buffer, a 3D
++        // subresource: refused.
++        let l = Layout::new(&desc(64, 64, 2, 4, Swizzle::SW_64KB_S)).unwrap();
++        let tiled = vec![0u8; l.size as usize];
++        let mut row = vec![0u8; 256];
++        assert_eq!(l.detile_rows(&tiled, 0, 0, &mut row, 256, 63..65), Err(Error::Invalid));
++        assert_eq!(l.detile_rows(&tiled, 0, 0, &mut row, 256, 3..3), Err(Error::Invalid));
++        assert_eq!(l.detile_rows(&tiled, 0, 0, &mut row[..255], 256, 0..1), Err(Error::TooSmall));
++        let mut thick = desc(32, 32, 1, 4, Swizzle::SW_64KB_S);
++        thick.dimension = Dimension::Tex3d;
++        thick.depth = 4;
++        let l = Layout::new(&thick).unwrap();
++        let tiled = vec![0u8; l.size as usize];
++        let mut rows = vec![0u8; 32 * 4 * 32];
++        assert_eq!(l.detile_rows(&tiled, 0, 0, &mut rows, 128, 0..32), Err(Error::Invalid));
++    }
++
++    /// The smaller mips lie first: they are read from the memory that holds
++    /// them alone, as from the whole texture's (myokex c3723f3).
++    #[test]
++    fn smaller_mips_need_only_the_start_of_the_texture() {
++        // 1024x1024 BC1 (8-byte elements) in 4 KiB blocks: the tail (from
++        // 64x64 on), then 128x128 in two blocks, 256x256 in eight.
++        let l = Layout::new(&Desc { block: 4, ..desc(1024, 1024, 9, 8, Swizzle::SW_4KB_S) }).unwrap();
++        assert_eq!(l.bytes_from(0), l.size);
++        let needs: Vec<u64> = (0..9).map(|mip| l.bytes_from(mip)).collect();
++        assert!(needs.windows(2).all(|w| w[0] >= w[1]), "{needs:?}");
++        assert_eq!((l.bytes_from(4), l.bytes_from(8)), (4096, 4096));
++        let tiled: Vec<u8> = (0..l.size).map(|i| (i * 7 >> 3) as u8).collect();
++        for mip in 1..9 {
++            let m = l.mips[mip as usize];
++            let pitch = m.width as usize * 8;
++            let read = |tiled: &[u8]| {
++                let mut linear = vec![0; pitch * m.height as usize];
++                l.detile(tiled, mip, 0, &mut linear, pitch, pitch * m.height as usize).map(|()| linear)
++            };
++            let len = l.bytes_from(mip) as usize;
++            assert_eq!(read(&tiled[..len]), read(&tiled));
++            assert_eq!(read(&tiled[..len - 1]), Err(Error::TooSmall));
++        }
++        // Slices each hold their chain: the whole texture.
++        let l = Layout::new(&Desc { depth: 2, block: 4, ..desc(1024, 1024, 9, 8, Swizzle::SW_4KB_S) }).unwrap();
++        assert_eq!(l.bytes_from(4), l.size);
++    }
+ }
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/descriptor/host.rs Y/crates/victory-gpu/src/descriptor/host.rs
+--- S/crates/victory-gpu/src/descriptor/host.rs	2026-11-25 19:54:13.000000000 +0200
++++ Y/crates/victory-gpu/src/descriptor/host.rs	2026-11-25 21:43:36.319794000 +0200
+@@ -76,7 +76,7 @@
+     /// placed texture, a texture object), with the frame from which they
+     /// are due: such a texture is uploaded when a draw reads it through a
+     /// table; one a shader picks by a computed index is brought up to date
+-    /// from here ([`HostHeap::texture_slots_due`]).
++    /// from here ([`HostHeap::texture_slots_due_aged`]).
+     textures: Mutex<TextureQueue>,
+     /// Per title slot, the frame (plus one; 0: never) in which a draw last
+     /// read it through a table, or made a table it lies in (with
+@@ -564,6 +564,13 @@
+     /// the fingerprint it had at the upload, how many looks found it
+     /// unchanged, and the frame of the upload. A fingerprint of 0: none.
+     checked: (u64, u64, u64, u8, u64),
++    /// When it was written (`crate::host::now_ms`), for the frame line.
++    written_ms: u64,
++    /// From when it has been due and not served (`crate::host::now_ms`, as
++    /// the pass first found it due: [`TextureQueue::stamp`]); 0: not due
++    /// yet. A write while it waits keeps it, so that a slot the title
++    /// writes again and again still ages (`VICTORY_TEXTURE_MAX_AGE_MS`).
++    due_ms: u64,
+ }
+ 
+ /// The queue of title slots whose texture view waits to be brought up to
+@@ -590,7 +597,12 @@
+         }
+         self.writes += 1;
+         let write = self.writes;
+-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
++        let due_ms = self.slots.get(&index).map_or(0, |w| w.due_ms);
++        let written_ms = crate::host::now_ms();
++        self.slots.insert(
++            index,
++            Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), written_ms, due_ms },
++        );
+     }
+ 
+     fn remove(&mut self, index: u32) {
+@@ -607,10 +619,37 @@
+     ///   25,000-40,000 while the textures of the shot on screen waited
+     ///   (run 52: 98% of the drawn pixels had no colour texture in the
+     ///   first 3D frames).
++    #[cfg_attr(not(test), allow(dead_code))]
+     fn due(&self, frame: u64, max: usize) -> Vec<(u32, u64)> {
++        self.due_aged(frame, max, 0, 0).0
++    }
++
++    /// The slots due at `frame` and not served yet get the time `now` as
++    /// the moment they were first found due (see [`Waiting::due_ms`]).
++    fn stamp(&mut self, frame: u64, now: u64) {
++        for w in self.slots.values_mut() {
++            if w.due <= frame && w.due_ms == 0 {
++                w.due_ms = now.max(1);
++            }
++        }
++    }
++
++    /// [`TextureQueue::due`], with the slots due for `max_age` ms or more
++    /// at `now` (as [`TextureQueue::stamp`] found them) ahead of all the
++    /// others, the longest due first; and how many of those there are at
++    /// the head of the order. `max_age` 0: none is ahead for its age.
++    /// (`VICTORY_TEXTURE_MAX_AGE_MS`: the queue's other order serves what
++    /// was looked at before and the newest writes first, and with more due
++    /// than a pass takes the rest waited thousands of frames.)
++    fn due_aged(&self, frame: u64, max: usize, now: u64, max_age: u64) -> (Vec<(u32, u64)>, usize) {
++        let mut aged: Vec<(u64, u32, u64)> = Vec::new();
+         let mut again: Vec<(u64, u32, u64)> = Vec::new();
+         let mut fresh: Vec<(u64, u32, u64)> = Vec::new();
+         for (&index, w) in self.slots.iter().filter(|(_, w)| w.due <= frame) {
++            if max_age > 0 && w.due_ms != 0 && now.saturating_sub(w.due_ms) >= max_age {
++                aged.push((w.due_ms, index, w.write));
++                continue;
++            }
+             let class = if w.looks > 0 || w.mapped > 0 { &mut again } else { &mut fresh };
+             class.push((w.written, index, w.write));
+         }
+@@ -618,7 +657,12 @@
+         let newest_first = |a: &(u64, u32, u64), b: &(u64, u32, u64)| b.2.cmp(&a.2);
+         again.sort_unstable_by(newest_first);
+         fresh.sort_unstable_by(newest_first);
+-        let mut order: Vec<(u32, u64)> = again.iter().map(|&(_, index, write)| (index, write)).collect();
++        // The longest due first (then by slot, for a stable order).
++        aged.sort_unstable();
++        aged.truncate(max);
++        let ahead = aged.len();
++        let mut order: Vec<(u32, u64)> = aged.iter().map(|&(_, index, write)| (index, write)).collect();
++        order.extend(again.iter().map(|&(_, index, write)| (index, write)));
+         let (mut new, mut old) = (0, fresh.len());
+         while new < old && order.len() < max {
+             order.push((fresh[new].1, fresh[new].2));
+@@ -629,7 +673,7 @@
+             }
+         }
+         order.truncate(max);
+-        order
++        (order, ahead)
+     }
+ 
+     /// The entry of `index` if it is still the write the pass was handed.
+@@ -650,6 +694,7 @@
+         if let Some(w) = self.same(index, write) {
+             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
+             w.looks = w.looks.saturating_add(1);
++            w.due_ms = 0;
+         }
+     }
+ 
+@@ -666,6 +711,7 @@
+     fn hold(&mut self, index: u32, write: u64, due: u64) {
+         if let Some(w) = self.same(index, write) {
+             w.due = w.due.max(due);
++            w.due_ms = 0;
+             self.held.insert(index, write);
+         }
+     }
+@@ -689,6 +735,7 @@
+     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
+         if let Some(w) = self.same(index, write) {
+             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
++            w.due_ms = 0;
+         }
+     }
+ 
+@@ -701,6 +748,7 @@
+         if let Some(w) = self.same(index, write) {
+             (w.due, w.looks, w.mapped) = (due, 1, 0);
+             w.checked = (at.0, at.1, print, looks, uploaded);
++            w.due_ms = 0;
+         }
+     }
+ 
+@@ -718,7 +766,12 @@
+         self.writes += 1;
+         let write = self.writes;
+         let due = self.slots.get(&index).map_or(due, |w| w.due.min(due));
+-        self.slots.insert(index, Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0) });
++        let due_ms = self.slots.get(&index).map_or(0, |w| w.due_ms);
++        let written_ms = crate::host::now_ms();
++        self.slots.insert(
++            index,
++            Waiting { due, written: frame, write, looks: 0, mapped: 0, checked: (0, 0, 0, 0, 0), written_ms, due_ms },
++        );
+     }
+ 
+     /// Bytes of slot `index`'s memory that were mapped at its last upload
+@@ -745,6 +798,20 @@
+         }
+         c
+     }
++
++    /// For the frame line, at `now` (`crate::host::now_ms`): the
++    /// milliseconds since the write of the oldest written slot due at
++    /// `frame`, and the longest any due slot has been due unserved.
++    fn census_ms(&self, frame: u64, now: u64) -> [u64; 2] {
++        let mut c = [0, 0];
++        for w in self.slots.values().filter(|w| w.due <= frame) {
++            c[0] = c[0].max(now.saturating_sub(w.written_ms));
++            if w.due_ms != 0 {
++                c[1] = c[1].max(now.saturating_sub(w.due_ms));
++            }
++        }
++        c
++    }
+ }
+ 
+ /// Whether `view` is of a texture the title may fill itself: a texture it
+@@ -1173,11 +1240,30 @@
+     /// with its write number, in the order to serve them
+     /// ([`TextureQueue::due`]), and the queue's counts
+     /// ([`TextureQueue::census`]).
++    #[cfg(test)]
+     pub(crate) fn texture_slots_due(&self, frame: u64, max: usize) -> (Vec<(u32, u64)>, [u64; 5]) {
+         let textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+         (if max == 0 { Vec::new() } else { textures.due(frame, max) }, textures.census(frame))
+     }
+ 
++    /// Up to `max` title slots whose texture view is due at `frame`, each
++    /// with its write number, in the order to serve them, the slots due for
++    /// `max_age` ms or more at `now` ahead ([`TextureQueue::due_aged`]; how
++    /// many is the third); the queue's counts ([`TextureQueue::census`])
++    /// and its ages in milliseconds ([`TextureQueue::census_ms`]).
++    pub(crate) fn texture_slots_due_aged(
++        &self,
++        frame: u64,
++        max: usize,
++        now: u64,
++        max_age: u64,
++    ) -> (Vec<(u32, u64)>, [u64; 5], usize, [u64; 2]) {
++        let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
++        textures.stamp(frame, now);
++        let (due, ahead) = if max == 0 { (Vec::new(), 0) } else { textures.due_aged(frame, max, now, max_age) };
++        (due, textures.census(frame), ahead, textures.census_ms(frame, now))
++    }
++
+     /// Every title slot of the queue that is due at `frame`, and whether
+     /// it was uploaded before (in part, or whole and waiting for another
+     /// look): for the card accounting line
+@@ -3564,6 +3650,49 @@
+         assert!(q.due(16, 100).iter().any(|d| d.0 == 98));
+     }
+ 
++    /// A slot due for `VICTORY_TEXTURE_MAX_AGE_MS` or more is handed out
++    /// ahead of all others, the longest due first, however often the
++    /// title writes it meanwhile; a look that finds nothing to upload
++    /// starts its wait again.
++    #[test]
++    fn slots_due_too_long_go_first() {
++        let mut q = TextureQueue::default();
++        // 200 slots looked at before (memory not there) fill the head of
++        // the plain order.
++        for i in 0..200u32 {
++            q.written(1000 + i, 1, 0, false);
++        }
++        for (index, write) in q.due(1, 1000) {
++            q.later(index, write, 1, 1);
++        }
++        q.written(7, 1, 0, false);
++        q.written(8, 1, 0, false);
++        q.stamp(1, 100);
++        q.written(9, 2, 0, false);
++        q.stamp(2, 1000);
++        // Not yet aged: 7 and 8 are not ahead of the slots looked at before.
++        let (order, ahead) = q.due_aged(2, 50, 2000, 2000);
++        assert_eq!(ahead, 0);
++        assert!(!order.iter().any(|d| d.0 == 7 || d.0 == 8));
++        // The title writes slot 8 again: it keeps its wait.
++        q.written(8, 3, 0, false);
++        // At 2,100 ms 7 and 8 are due for 2 s, 9 for 1.1 s.
++        let (order, ahead) = q.due_aged(3, 50, 2100, 2000);
++        assert_eq!(ahead, 2);
++        assert_eq!(order[..2].iter().map(|d| d.0).collect::<Vec<_>>(), [7, 8]);
++        assert!(!order.iter().any(|d| d.0 == 9));
++        assert_eq!(q.census_ms(3, 2100)[1], 2000);
++        // Off: the plain order.
++        assert_eq!(q.due_aged(3, 50, 2100, 0), (q.due(3, 50), 0));
++        // A look that finds nothing to upload: due again later, and its
++        // wait starts anew when it is.
++        let w7 = order[0].1;
++        q.later(7, w7, 3, 1);
++        q.stamp(4, 2200);
++        let (order, ahead) = q.due_aged(4, 50, 2200, 2000);
++        assert_eq!((ahead, order[0].0), (1, 8));
++    }
++
+     /// Slots held back for lack of room on the card are not handed out
+     /// until their frame, keep their place, are not counted as waiting
+     /// for their memory, and all come back at once when the card has room;
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/draw.rs Y/crates/victory-gpu/src/draw.rs
+--- S/crates/victory-gpu/src/draw.rs	2026-11-25 19:54:13.000000000 +0200
++++ Y/crates/victory-gpu/src/draw.rs	2026-11-25 22:00:11.123189600 +0200
+@@ -447,6 +447,49 @@
+ /// (`TextureQueue::census`): slots in it, due, waiting for their memory,
+ /// uploaded in part, and the frames the oldest due one has waited.
+ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
++/// The same queue's ages in milliseconds at the last pass: since the write
++/// of the oldest written due slot, and the longest a due slot has waited
++/// unserved; and, since the last frame line, the slots handed out ahead of
++/// the others because they had been due for `VICTORY_TEXTURE_MAX_AGE_MS`
++/// ([`texture_max_age_ms`]).
++pub(crate) static HEAP_TEXTURES_AGE: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
++
++/// Milliseconds of the pass's work over textures picked by index per
++/// second of real time (`VICTORY_TEXTURE_BUDGET_MS_PER_S`, 500; 0: the
++/// budget per frame alone, as before).
++///
++/// The pass had its bytes and its time per frame (192 MB, 250 ms), so at
++/// the 9 frames a second of a world streaming in textures that had
++/// arrived waited thousands of frames, minutes of real time, while the
++/// title streams by its frame rate. Taken over a second at 30 frames
++/// those numbers are 5.8 GB and 7.5 s, more than a second holds: they
++/// were never the pass's share of the time, only a ceiling on one frame.
++/// They stay that ceiling, for all the passes of a frame together; under
++/// it the pass gets what the clock gives it at this rate (half the time
++/// of the thread recording frames: at 30 frames a second 17 ms a frame,
++/// at 9 a second 55 ms), however slow the frames, and never a slow
++/// frame's credit on top of the ceiling (`VICTORY_TEXTURE_CATCHUP`'s three
++/// times the bytes made the world 0.2 frames a second for minutes in
++/// allforks: with this budget on the catch-up is not used). Slots due for
++/// longer than [`texture_max_age_ms`] are served past this rate, up to
++/// the ceiling.
++pub(crate) fn texture_budget_ms_per_s() -> u64 {
++    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    *MS.get_or_init(|| {
++        std::env::var("VICTORY_TEXTURE_BUDGET_MS_PER_S").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(500).min(1000)
++    })
++}
++
++/// The longest a slot due in the queue of textures picked by index waits
++/// before it is served ahead of all others and past
++/// [`texture_budget_ms_per_s`] (`VICTORY_TEXTURE_MAX_AGE_MS`, 2000; 0:
++/// never ahead for its age). Still within the ceiling per frame, so with
++/// more of them than a frame's ceiling takes, the longest due go first and
++/// the rest a frame later.
++pub(crate) fn texture_max_age_ms() -> u64 {
++    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    *MS.get_or_init(|| std::env::var("VICTORY_TEXTURE_MAX_AGE_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2000))
++}
+ /// Since the start: looks at a slot uploaded in part that found no more of
+ /// its memory mapped; uploads of textures not all mapped; and of those,
+ /// the ones whose first page was not there (asked by the first page alone,
+@@ -1776,11 +1819,15 @@
+         if room {
+             host.texture_slots_waiting(frame);
+         }
+-        let (due, census) = host.texture_slots_due(frame, 4096);
++        let (due, census, aged, ages) =
++            host.texture_slots_due_aged(frame, 4096, crate::host::now_ms(), texture_max_age_ms());
+         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
+         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
+             count.store(now, Ordering::Relaxed);
+         }
++        for (count, now) in HEAP_TEXTURES_AGE.iter().zip(ages) {
++            count.store(now, Ordering::Relaxed);
++        }
+         // Where the card's memory is, and what the due slots would need
+         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
+         // room, and every five seconds after it).
+@@ -1819,7 +1866,36 @@
+         // drains; `VICTORY_TEXTURE_CATCHUP=0` keeps the plain budget.
+         static CATCHUP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+         let catchup = *CATCHUP.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_CATCHUP").is_none_or(|v| v != "0"));
+-        let (per_frame, span) = if catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
++        let rate = texture_budget_ms_per_s();
++        let (per_frame, span) =
++            if rate == 0 && catchup && due.len() >= 1024 { (per_frame * 3, span * 3) } else { (per_frame, span) };
++        // With `VICTORY_TEXTURE_BUDGET_MS_PER_S` (`texture_budget_ms_per_s`):
++        // the time the passes of this frame have taken so far, and the
++        // credit the clock gave since the last pass (microseconds; at most
++        // the frame's ceiling).
++        static FRAME_US: AtomicU64 = AtomicU64::new(0);
++        static CREDIT_US: AtomicU64 = AtomicU64::new(0);
++        static CREDITED_US: AtomicU64 = AtomicU64::new(u64::MAX);
++        static FRAME_OF_US: AtomicU64 = AtomicU64::new(u64::MAX);
++        if FRAME_OF_US.swap(frame, Ordering::Relaxed) != frame {
++            FRAME_US.store(0, Ordering::Relaxed);
++        }
++        let span_us = span.as_micros() as u64;
++        // The ceiling left to this frame, and the clock's credit within it.
++        let (ceiling, credit) = if rate > 0 && PASS_BUDGET.get().is_none() {
++            let clock = crate::host::now_us();
++            let last = CREDITED_US.swap(clock, Ordering::Relaxed);
++            let gained = if last == u64::MAX { span_us } else { clock.saturating_sub(last).saturating_mul(rate) / 1000 };
++            let credit = CREDIT_US.load(Ordering::Relaxed).saturating_add(gained).min(span_us);
++            CREDIT_US.store(credit, Ordering::Relaxed);
++            let left = span_us.saturating_sub(FRAME_US.load(Ordering::Relaxed));
++            (
++                std::time::Duration::from_micros(left),
++                std::time::Duration::from_micros(credit.min(left)),
++            )
++        } else {
++            (span, span)
++        };
+         // A run made early (`State::early_textures`) has a budget of its
+         // own: its bytes on top of what the frame has spent so far.
+         // (Not `most`: that is the longest wait between looks, used below.)
+@@ -1827,13 +1903,32 @@
+             Some((ms, bytes)) => {
+                 (std::time::Duration::from_millis(ms), SPENT.load(Ordering::Relaxed).saturating_add(bytes))
+             }
+-            None => (span, per_frame),
++            None => (credit, per_frame),
+         };
+         let began = std::time::Instant::now();
+-        for (index, write) in due {
++        // What the pass took, from the credit and the frame's ceiling.
++        struct Took(std::time::Instant, bool);
++        impl Drop for Took {
++            fn drop(&mut self) {
++                if self.1 {
++                    let us = self.0.elapsed().as_micros() as u64;
++                    FRAME_US.fetch_add(us, Ordering::Relaxed);
++                    let _ = CREDIT_US
++                        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |c| Some(c.saturating_sub(us)));
++                }
++            }
++        }
++        let _took = Took(began, rate > 0 && PASS_BUDGET.get().is_none());
++        for (k, (index, write)) in due.into_iter().enumerate() {
++            // Slots due too long (`texture_max_age_ms`, at the head of
++            // `due`) go past the clock's credit, up to the frame's ceiling.
++            let span = if k < aged && PASS_BUDGET.get().is_none() { ceiling.max(span) } else { span };
+             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
+                 break;
+             }
++            if k < aged {
++                HEAP_TEXTURES_AGE[2].fetch_add(1, Ordering::Relaxed);
++            }
+             // A placed texture whose memory is not mapped (not streamed in
+             // yet, or streamed out again: the heap keeps tens of thousands
+             // of such views) gets no host texture; looked at again soon (a
+@@ -1880,7 +1975,9 @@
+             let mut partly = None;
+             if let Some(View::Placed(false, resource, desc)) = heap.handle(index).and_then(crate::descriptor::view) {
+                 let address = u64::from(desc[10]) | u64::from(desc[11]) << 32;
+-                let len = crate::resource::placed_bytes(&resource).unwrap_or(1);
++                // Of the mips the view shows: what lies behind them is
++                // another texture's (`VICTORY_TEXTURE_FIRST_MIP`).
++                let len = crate::resource::placed_bytes_from(&resource, crate::resource::first_mip(&desc)).unwrap_or(1);
+                 let mapped = crate::texture::mapped_bytes(address as *const u8, len as usize);
+                 if mapped == 0 {
+                     HEAP_TEXTURES_AWAY.fetch_add(1, Ordering::Relaxed);
+@@ -2871,7 +2968,7 @@
+                 // The vertices are read in place, at submission: no change
+                 // of mapping under the read (see
+                 // `crate::watch::title_memory_reading`).
+-                let _mapped = crate::watch::title_memory_reading();
++                let _mapped = crate::watch::title_memory_reading(from, n * 3 * stride);
+                 // SAFETY: the vertices lie in a title buffer (checked when
+                 // recorded) and the scratch memory is the list's.
+                 let (src, dst) = unsafe {
+@@ -3319,7 +3416,13 @@
+                 && let Some(t) = crate::resource::host_resource(*resource as This)
+                 && crate::texture::title_written(t)
+             {
+-                crate::texture::upload(list, *resource as This, t);
++                // Of a texture the title placed, the mips the view shows
++                // (`VICTORY_TEXTURE_FIRST_MIP`).
++                let first = match (&placed, view) {
++                    (Some(_), View::Shader(_, Some(desc))) => crate::resource::first_mip(desc),
++                    _ => 0,
++                };
++                crate::texture::upload_from(list, *resource as This, t, first);
+             }
+             // A depth texture shaders also write: what they wrote, first.
+             list.twin_use(*resource as This, false, false);
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/host.rs Y/crates/victory-gpu/src/host.rs
+--- S/crates/victory-gpu/src/host.rs	2026-11-25 20:53:33.000000000 +0200
++++ Y/crates/victory-gpu/src/host.rs	2026-11-25 22:00:26.376245000 +0200
+@@ -4085,6 +4085,20 @@
+     *ON.get_or_init(|| std::env::var_os("VICTORY_JOIN_COPIES").is_some_and(|v| v == "1"))
+ }
+ 
++/// Whether a buffer-to-texture copy whose source this list's shaders write
++/// takes those bytes from the memory's host copy, on the card, in the
++/// list's order ([`HostList::staged_written_source`];
++/// `VICTORY_COPY_WRITTEN_SOURCE=0`: from title memory at submission, as
++/// before). On by default (allforks a9b474f, PalmVIDev 4d1ce258).
++pub(crate) fn copy_written_source() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_COPY_WRITTEN_SOURCE").is_none_or(|v| v != "0"))
++}
++
++/// Buffer-to-texture copies whose source this list's shaders write, staged
++/// on the card ([`HostList::staged_written_source`]), since the start.
++pub(crate) static STAGED_WRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
+ /// Since the last frame-rate line: title buffer copies recorded, and those
+ /// that continue the one before ([`join_copies`]).
+ static COPIES_JOINED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+@@ -7287,6 +7301,99 @@
+         Some((buffer, data))
+     }
+ 
++    /// Whether shaders of this list, as recorded so far, may write title
++    /// memory in `[address, address + len)` (a range declared with
++    /// [`HostList::defer_gpu_write`] touches it).
++    pub(crate) fn gpu_wrote(&self, address: usize, len: usize) -> bool {
++        let end = address.saturating_add(len);
++        self.deferred().copies.iter().any(|step| {
++            matches!(step, Step::GpuWrite(_, at, n) if *at < end && address < at.saturating_add(*n))
++        })
++    }
++
++    /// For a copy out of title buffer memory that this list's shaders
++    /// write (a dispatch fills a buffer, the list then copies the buffer
++    /// into a texture): a host buffer holding `[address, address + len)`
++    /// as it is at this point of the list, in the copy source state. The
++    /// bytes are copied on the card from the memory's host copy, after the
++    /// dispatches recorded before; the title's memory only gets them once
++    /// the list has run, so a copy filled from it at submission took what
++    /// was there before the list (zeros the first time). `None` if no
++    /// shader of the list writes the range, it has no host copy, or
++    /// [`copy_written_source`] is off: the caller then copies from title
++    /// memory as before. (allforks a9b474f, PalmVIDev 4d1ce258.)
++    pub(crate) fn staged_written_source(&self, host: &Host, address: u64, len: u64) -> Option<ID3D12Resource> {
++        if len == 0 || !copy_written_source() || !self.gpu_wrote(address as usize, usize::try_from(len).ok()?) {
++            return None;
++        }
++        let shadow = crate::shadow::find(address, len)?;
++        let offset = shadow.offset_in(address)?;
++        if shadow.left(address) < len {
++            return None;
++        }
++        let heap = D3D12_HEAP_PROPERTIES {
++            Type: D3D12_HEAP_TYPE_DEFAULT,
++            ..Default::default()
++        };
++        let desc = D3D12_RESOURCE_DESC {
++            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
++            Width: len,
++            Height: 1,
++            DepthOrArraySize: 1,
++            MipLevels: 1,
++            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
++            ..Default::default()
++        };
++        let mut staged: Option<ID3D12Resource> = None;
++        // SAFETY: plain creation of a buffer.
++        let made = unsafe {
++            host.device.CreateCommittedResource(
++                &heap,
++                D3D12_HEAP_FLAG_NONE,
++                &desc,
++                D3D12_RESOURCE_STATE_COPY_DEST,
++                None,
++                &mut staged,
++            )
++        };
++        if let Err(e) = made {
++            tracing::warn!(error = %e, len, "no buffer to stage a shader-written copy source");
++            return None;
++        }
++        let staged = staged?;
++        name(&staged, || format!("shader-written copy source {address:#x}+{len:#x}"));
++        // What the title wrote there itself reaches the host copy at
++        // submission, as for a shader that reads the range.
++        shadow.refresh(self, address, len);
++        // SAFETY: an open list; the range lies in the host copy (checked
++        // above) and the staged buffer holds `len` bytes.
++        unsafe {
++            // What shaders of this list wrote to the copy before, first.
++            self.list.ResourceBarrier(&[D3D12_RESOURCE_BARRIER {
++                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
++                ..Default::default()
++            }]);
++            self.list.CopyBufferRegion(&staged, 0, &shadow.buffer, offset, len);
++            self.list.ResourceBarrier(&[transition(
++                &staged,
++                D3D12_RESOURCE_STATE_COPY_DEST,
++                D3D12_RESOURCE_STATE_COPY_SOURCE,
++            )]);
++        }
++        self.keep(&staged);
++        STAGED_WRITTEN.fetch_add(1, Ordering::Relaxed);
++        let n = STAGED_WRITTEN.load(Ordering::Relaxed);
++        if n == 1 || n.is_multiple_of(1000) {
++            tracing::info!(
++                so_far = n,
++                bytes = len,
++                "a buffer-to-texture copy takes what the list's own shaders wrote (VICTORY_COPY_WRITTEN_SOURCE=0: from title memory)"
++            );
++        }
++        Some(staged)
++    }
++
+     /// `len` bytes of upload memory (256-byte aligned) until the list is
+     /// reset: the host GPU address and the CPU pointer.
+     pub(crate) fn scratch(&self, len: u64) -> Option<(u64, *mut u8)> {
+@@ -8392,11 +8499,18 @@
+                      hold still (the runtime remapping it); the rest is reading, hashing and detiling"
+                 );
+             }
+-            let [through, left] = [0, 1].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
++            let [through, left, around] = [0, 1, 2].map(|i| crate::texture::UNLOCKED[i].swap(0, Ordering::Relaxed) as f64 / frames);
+             if through + left > 0.0 {
+                 tracing::info!(
+                     "texture refreshes that did not wait for title memory to hold still, per frame (VICTORY_TEXTURE_NO_WAIT=1): \
+-                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there)"
++                     {through:.1} read through the kernel, {left:.1} left for the next refresh (a page was not there), \
++                     {around:.1} of those read around the missing pages instead (nothing uploaded yet, VICTORY_TEXTURE_READ_AROUND); \
++                     a refresh steps around {}",
++                    if crate::watch::by_range() {
++                        "changes of its own bytes only (VICTORY_MAPPING_RANGES)"
++                    } else {
++                        "any change of title memory's mapping (VICTORY_MAPPING_RANGES=0)"
++                    }
+                 );
+             }
+         }
+@@ -8445,16 +8559,22 @@
+             {
+                 let [queued, due, away, partly, oldest] =
+                     [0, 1, 2, 3, 4].map(|i| crate::draw::HEAP_TEXTURES_QUEUE[i].load(Ordering::Relaxed));
++                let [oldest_ms, longest_ms] = [0, 1].map(|i| crate::draw::HEAP_TEXTURES_AGE[i].load(Ordering::Relaxed));
++                let promoted = crate::draw::HEAP_TEXTURES_AGE[2].swap(0, Ordering::Relaxed);
+                 let [same, parts, tails] =
+                     [0, 1, 2].map(|i| crate::draw::HEAP_TEXTURES_PARTLY[i].load(Ordering::Relaxed));
+                 tracing::info!(
+-                    "textures picked by index, the queue: {queued} slots, {due} of them due (the oldest written {oldest} frames ago), \
++                    "textures picked by index, the queue: {queued} slots, {due} of them due (the oldest written {oldest} frames ago, \
++                     {oldest_ms} ms; the longest due {longest_ms} ms; {promoted} served ahead for age since the last line, \
++                     VICTORY_TEXTURE_MAX_AGE_MS={}, VICTORY_TEXTURE_BUDGET_MS_PER_S={}), \
+                      {away} waiting for their memory, {partly} uploaded in part; since the start: {} slots found uploaded already by \
+                      the draws that read them through tables, {} writes of tables' slots (due some frames later), {} slots taken out \
+                      as read through a table, {parts} uploads of textures not all mapped ({tails} of them without their first page), \
+                      {same} looks that found no more mapped; {} slots made stale by a newer view of other memory there, \
+                      {} ranges of memory mapped, unmapped or written under texture views ({} gaps joined at capacity), {} slots made due by them, \
+                      {} made slots found unmapped and made null",
++                    crate::draw::texture_max_age_ms(),
++                    crate::draw::texture_budget_ms_per_s(),
+                     crate::draw::HEAP_TEXTURES_TABLED.load(Ordering::Relaxed),
+                     crate::descriptor::host::TABLED_WRITES[0].load(Ordering::Relaxed),
+                     crate::descriptor::host::TABLED_WRITES[1].load(Ordering::Relaxed),
+@@ -9818,3 +9938,60 @@
+         eprintln!("mask_tests: {} title bytes put in by one masked merge; the other {} bytes kept", masked.len(), LEN - masked.len());
+     }
+ }
++
++#[cfg(test)]
++mod written_source_tests {
++    use super::*;
++
++    /// A copy out of a range this list's shaders write is staged from the
++    /// host copy on the card, after what the list wrote there before (a
++    /// copy into the host copy stands in for the shader), not from title
++    /// memory as it was before the list (allforks a9b474f, PalmVIDev
++    /// 4d1ce258); a range no shader of the list writes is not staged.
++    #[test]
++    fn a_copy_source_the_list_wrote_is_staged_from_the_host_copy() {
++        use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
++        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
++        let Some(host) = host() else {
++            return; // no host GPU here
++        };
++        if !copy_written_source() {
++            return; // VICTORY_COPY_WRITTEN_SOURCE=0
++        }
++        const LEN: usize = 1 << 16;
++        // "Title memory": write-watched, as the title's is.
++        // SAFETY: a plain allocation of our own.
++        let title = unsafe { VirtualAlloc(std::ptr::null(), LEN, MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH, PAGE_READWRITE) } as *mut u8;
++        assert!(!title.is_null());
++        // SAFETY: inside the allocation.
++        unsafe { std::ptr::write_bytes(title, 0x11, LEN) };
++        let start = title as u64;
++        let resource = 0x7e57_0a9busize;
++        crate::shadow::register(resource, start, LEN as u64);
++        let shadow = crate::shadow::find(start, LEN as u64).expect("a host copy");
++        let offset = shadow.offset_in(start).expect("the copy holds its start");
++        let list = host.new_list().unwrap();
++        // Nothing declared written: no staging.
++        assert!(list.staged_written_source(host, start + 256, 256).is_none());
++        // The "shader" declares and writes 256 bytes of the copy.
++        list.defer_gpu_write(&shadow, start as usize + 256, 256);
++        let pattern: Vec<u8> = (0..256u32).map(|i| (i * 5 + 1) as u8).collect();
++        let (upload, data) = host.upload_buffer(256).unwrap();
++        // SAFETY: the upload buffer holds 256 mapped bytes; an open list,
++        // live buffers, ranges inside them.
++        unsafe {
++            std::ptr::copy_nonoverlapping(pattern.as_ptr(), data, 256);
++            list.list.CopyBufferRegion(&shadow.buffer, offset + 256, &upload, 0, 256);
++        }
++        let staged = list.staged_written_source(host, start + 256, 256).expect("staged");
++        let (back, mapped) = host.shared_buffer(256).expect("read-back memory");
++        // SAFETY: an open list; the staged buffer is in the copy source state.
++        unsafe { list.list.CopyBufferRegion(&back, 0, &staged, 0, 256) };
++        list.close();
++        host.execute(&[&list]);
++        // SAFETY: the copies finished (execute waits); 256 mapped bytes.
++        let read = unsafe { std::slice::from_raw_parts(mapped, 256).to_vec() };
++        assert_eq!(read, pattern, "what the list wrote, not the title's 0x11");
++        crate::shadow::unregister(resource, start);
++    }
++}
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/inplace.rs Y/crates/victory-gpu/src/inplace.rs
+--- S/crates/victory-gpu/src/inplace.rs	2026-11-25 19:11:21.000000000 +0200
++++ Y/crates/victory-gpu/src/inplace.rs	2026-11-25 21:34:12.128599300 +0200
+@@ -472,8 +472,9 @@
+         return None;
+     }
+     // No mapping changes until the bytes are in: the view found below
+-    // shows these pages for as long as this is held.
+-    let _still = crate::watch::title_memory_reading_now()?;
++    // shows these pages for as long as this is held (with
++    // `VICTORY_MAPPING_RANGES`, the whole 64 KiB page of `at`).
++    let _still = crate::watch::title_memory_reading_now(at - at % K64, K64)?;
+     let (section, offset, shown, section_bytes) = {
+         let v = views();
+         let (&base, &(len, section, offset)) = v.views.range(..=at).next_back()?;
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/list.rs Y/crates/victory-gpu/src/list.rs
+--- S/crates/victory-gpu/src/list.rs	2026-11-25 20:33:18.000000000 +0200
++++ Y/crates/victory-gpu/src/list.rs	2026-11-25 21:53:48.891140600 +0200
+@@ -1148,12 +1148,22 @@
+             let Some(data) = buffer_range(src.resource, src.footprint.offset, bytes) else {
+                 return;
+             };
+-            let Some((buffer, staging)) = list.upload(host, bytes) else {
+-                return;
++            // Bytes a shader of this list writes (a dispatch encodes
++            // texture blocks into the buffer, this copy puts them into the
++            // texture) are not in title memory yet when the upload is
++            // filled at submission: they come from the memory's host copy,
++            // on the card, after the dispatch (`VICTORY_COPY_WRITTEN_SOURCE`).
++            let buffer = if let Some(staged) = list.staged_written_source(host, data as u64, bytes) {
++                staged
++            } else {
++                let Some((buffer, staging)) = list.upload(host, bytes) else {
++                    return;
++                };
++                // The list owns this mapped D3D12 upload buffer. Wine can report
++                // its address as MEM_FREE, so use the host-upload path.
++                list.defer_fill(staging, data, bytes as usize);
++                buffer
+             };
+-            // The list owns this mapped D3D12 upload buffer. Wine can report
+-            // its address as MEM_FREE, so use the host-upload path.
+-            list.defer_fill(staging, data, bytes as usize);
+             from.resource = buffer.as_raw().cast_const().cast();
+             from.footprint.offset = 0;
+             #[cfg(feature = "diagnostics")]
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/pipeline/make.rs Y/crates/victory-gpu/src/pipeline/make.rs
+--- S/crates/victory-gpu/src/pipeline/make.rs	2026-11-25 19:11:21.000000000 +0200
++++ Y/crates/victory-gpu/src/pipeline/make.rs	2026-11-25 21:50:48.352598400 +0200
+@@ -33,6 +33,8 @@
+     /// whether a draw or dispatch has requested it yet.
+     key: String,
+     used: AtomicBool,
++    /// When a worker (or a thread making it itself) began it ([`slow`]).
++    begun: OnceLock<Instant>,
+ }
+ 
+ // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
+@@ -42,6 +44,11 @@
+ unsafe impl Sync for Pending {}
+ 
+ impl Pending {
++    /// Whether it is a compute pipeline.
++    fn computes(&self) -> bool {
++        matches!(self.shaders.as_slice(), [only] if only.stage == "compute")
++    }
++
+     pub(crate) fn new(shaders: Vec<Arc<Shader>>, graphics: Option<Box<GraphicsState>>) -> Pending {
+         let mut key = blake3::Hasher::new();
+         for s in &shaders {
+@@ -56,10 +63,12 @@
+             made: OnceLock::new(),
+             key: key.finalize().to_hex()[..32].to_owned(),
+             used: AtomicBool::new(false),
++            begun: OnceLock::new(),
+         }
+     }
+ 
+     fn make(&self) {
++        let _ = self.begun.set(Instant::now());
+         self.made
+             .get_or_init(|| HostPipeline::new(&self.shaders, self.graphics.as_deref()));
+         let (lock, done) = &DONE;
+@@ -106,6 +115,64 @@
+     })
+ }
+ 
++/// Whether a frame may wait longer for its pipelines while a world loads
++/// (`VICTORY_PIPELINE_LOAD_WAIT=0`: the budget per frame alone, as
++/// before). On by default. From allforks 4eac58d (myokex/victory-amd
++/// 4436f8f), without its leaving out of the ray-tracing resolve programs.
++///
++/// "While a world loads" is told as the source tells it: by no sign of the
++/// title's, but by what has been waited. Every wait may go past the budget
++/// per frame up to [`LOADING_FRAME`] (graphics) or
++/// [`LOADING_FRAME_COMPUTE`] (compute, counted apart), until such waits
++/// past the budget come to `VICTORY_PIPELINE_GATE_S` (120 s) in the run;
++/// pipelines are asked for by the hundred only while a world loads, so
++/// that is when the time goes. A pipeline the driver has been at for long
++/// ([`slow`]) is not waited for. A frame waits at most 4 + 12 s more, well
++/// under the title's GPU watchdog of about 30 s; with
++/// `VICTORY_PIPELINE_WAIT_SHARED=0` (a budget per thread, so five
++/// recording threads could each wait it) the longer waits are not taken.
++fn load_wait() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_PIPELINE_LOAD_WAIT").is_none_or(|v| v != "0"))
++}
++
++/// Whether the host's driver has been at `p` for longer than most take
++/// (one of the title's takes 85 s): no frame waits for it ([`load_wait`]).
++fn slow(p: &Pending) -> bool {
++    // A pass a title runs once (it unpacks a model, say) is lost if its
++    // pipeline is not there; a draw comes again in the next frame.
++    let most = if p.computes() { 10 } else { 3 };
++    p.begun.get().is_some_and(|at| at.elapsed() > Duration::from_secs(most))
++}
++
++/// What a frame may wait while a world loads ([`load_wait`]): pipelines
++/// are asked for by the hundred then, and a pass the title runs once is
++/// lost if its pipeline is not there.
++const LOADING_FRAME: Duration = Duration::from_secs(4);
++/// The same for compute pipelines, waited for apart: the passes that unpack
++/// a world's models are dispatched once, and in a run whose pipelines were
++/// all still to be loaded 130 of them were dropped, and with them walls,
++/// floor, ceiling and faces (they never came back).
++const LOADING_FRAME_COMPUTE: Duration = Duration::from_secs(12);
++
++/// What is left of `VICTORY_PIPELINE_GATE_S` (120 s; 0: no longer waits)
++/// after `spent` of waits past the budget per frame.
++fn loading_left(spent: Duration) -> Duration {
++    static TOTAL: OnceLock<Duration> = OnceLock::new();
++    let total = *TOTAL.get_or_init(|| {
++        let seconds = std::env::var("VICTORY_PIPELINE_GATE_S")
++            .ok()
++            .and_then(|value| value.trim().parse::<u64>().ok())
++            .unwrap_or(120);
++        Duration::from_secs(seconds)
++    });
++    total.saturating_sub(spent)
++}
++
++/// Since the start, in milliseconds: what frames waited for graphics and
++/// for compute pipelines past the budget per frame ([`load_wait`]).
++pub(crate) static LOADING_WAITED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
++
+ /// Pipelines queued and not made yet.
+ static WAITING: AtomicU64 = AtomicU64::new(0);
+ 
+@@ -160,16 +227,30 @@
+ 
+ /// Waits for `p` while frame `frame` has budget left.
+ fn wait(p: &Pending, frame: u64) {
+-    let budget = wait_budget();
+-    if budget.is_zero() {
++    let plain = wait_budget();
++    let shared = shared_budget();
++    let loads = load_wait() && shared;
++    if plain.is_zero() || (loads && slow(p)) {
+         return;
+     }
++    // While a world loads: longer, compute pipelines apart.
++    let compute = loads && p.computes();
++    let past_total = &LOADING_WAITED[usize::from(compute)];
++    let budget = if loads {
++        let loading = loading_left(Duration::from_millis(
++            LOADING_WAITED.iter().map(|w| w.load(Ordering::Relaxed)).sum(),
++        ));
++        plain.max((if compute { LOADING_FRAME_COMPUTE } else { LOADING_FRAME }).min(loading))
++    } else {
++        plain
++    };
+     // The frame the budget belongs to, and what was waited of it (or is
+-    // taken by a thread waiting now).
+-    static SPENT: Mutex<(u64, Duration)> = Mutex::new((u64::MAX, Duration::ZERO));
+-    let shared = shared_budget();
++    // taken by a thread waiting now); compute pipelines' apart while a
++    // world loads.
++    static SPENTS: [Mutex<(u64, Duration)>; 2] = [const { Mutex::new((u64::MAX, Duration::ZERO)) }; 2];
++    let frame_spent = &SPENTS[usize::from(compute)];
+     let left = {
+-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
++        let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
+         if spent.0 != frame {
+             *spent = (frame, Duration::ZERO);
+         }
+@@ -185,17 +266,33 @@
+     let started = Instant::now();
+     let (lock, done) = &DONE;
+     let mut held = lock.lock().unwrap_or_else(|e| e.into_inner());
+-    while p.made.get().is_none() {
++    while p.made.get().is_none() && !(loads && slow(p)) {
+         let rest = left.saturating_sub(started.elapsed());
+         if rest.is_zero() {
+             break;
+         }
++        // Woken now and then to see whether it has become a slow one.
++        let rest = if loads { rest.min(Duration::from_millis(250)) } else { rest };
+         held = done.wait_timeout(held, rest).unwrap_or_else(|e| e.into_inner()).0;
+     }
+     drop(held);
+     let waited = started.elapsed().min(left);
++    if loads {
++        let past = waited.saturating_sub(plain);
++        if !past.is_zero() {
++            let before = past_total.fetch_add(past.as_millis() as u64, Ordering::Relaxed);
++            if before == 0 {
++                tracing::info!(
++                    compute,
++                    waited_ms = waited.as_millis() as u64,
++                    "a frame waited for a pipeline past its budget while a world loads \
++                     (VICTORY_PIPELINE_LOAD_WAIT; at most 4 s graphics, 12 s compute a frame, VICTORY_PIPELINE_GATE_S in all)"
++                );
++            }
++        }
++    }
+     {
+-        let mut spent = SPENT.lock().unwrap_or_else(|e| e.into_inner());
++        let mut spent = frame_spent.lock().unwrap_or_else(|e| e.into_inner());
+         // A frame that began meanwhile has its own budget.
+         if spent.0 == frame {
+             if shared {
+@@ -377,6 +474,23 @@
+         assert!(super::super::library::wanted_early(&p.key));
+     }
+ 
++    /// While a world loads no frame waits for a pipeline the driver has
++    /// been at for long (3 s for one that is not a compute pipeline), and
++    /// the longer waits of the run end when their bound is spent.
++    #[test]
++    fn long_compiles_are_not_waited_for() {
++        let p = Pending::new(Vec::new(), None);
++        assert!(!p.computes());
++        assert!(!slow(&p), "not begun");
++        let _ = p.begun.set(Instant::now() - Duration::from_secs(4));
++        assert!(slow(&p));
++        let q = Pending::new(Vec::new(), None);
++        let _ = q.begun.set(Instant::now());
++        assert!(!slow(&q));
++        assert_eq!(loading_left(Duration::from_secs(500)), Duration::ZERO);
++        assert!(LOADING_FRAME + LOADING_FRAME_COMPUTE < Duration::from_secs(20), "well under the title's 30 s watchdog");
++    }
++
+     #[test]
+     fn draws_promote_early_pipelines_without_claiming_them_twice() {
+         let earlier = Arc::new(Pending::new(Vec::new(), None));
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/resource.rs Y/crates/victory-gpu/src/resource.rs
+--- S/crates/victory-gpu/src/resource.rs	2026-11-25 20:33:18.000000000 +0200
++++ Y/crates/victory-gpu/src/resource.rs	2026-11-25 22:00:11.122188500 +0200
+@@ -3247,6 +3247,38 @@
+     Some(*found as This)
+ }
+ 
++/// The bytes of title memory the mips from `first` on of a texture with the
++/// resource description `desc` take where the title placed it
++/// (`crate::texture::first_mip_switch`; off: [`placed_bytes`]). A title
++/// that streams textures describes every mip of them and has memory for the
++/// ones it streamed in, which a view of it shows, and puts the next texture
++/// right behind them. (myokex c3723f3.)
++#[cfg(windows)]
++pub(crate) fn placed_bytes_from(desc: &[u32; 14], first: u32) -> Option<u64> {
++    // SAFETY: 56 bytes in the description's layout.
++    let d = unsafe { desc.as_ptr().cast::<ResourceDesc>().read_unaligned() };
++    if first == 0 || d.dimension == BUFFER || !crate::texture::first_mip_switch() {
++        return placed_bytes(desc);
++    }
++    let whole = placed_bytes(desc)?;
++    let Some(t) = texture_layout(&d).filter(|t| t.planes.len() == 1) else {
++        return Some(whole);
++    };
++    let bytes = t.planes[0].layout.bytes_from(first);
++    Some(bytes.next_multiple_of(t.alignment.max(1)).min(whole))
++}
++
++/// The first mip a placed texture's view shows: of views of one 2D texture
++/// (the others show whole textures). (myokex c3723f3.)
++#[cfg(windows)]
++pub(crate) fn first_mip(view: &[u32]) -> u32 {
++    const TEXTURE_2D_VIEW: u32 = 4;
++    match *view {
++        [_, TEXTURE_2D_VIEW, _, _, first, ..] => first.min(15),
++        _ => 0,
++    }
++}
++
+ /// The resource for a texture placed at `address` with the resource
+ /// description `desc` (as words), made on first use.
+ #[cfg(windows)]
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/sampler.rs Y/crates/victory-gpu/src/sampler.rs
+--- S/crates/victory-gpu/src/sampler.rs	2026-11-25 19:11:21.000000000 +0200
++++ Y/crates/victory-gpu/src/sampler.rs	2026-11-25 21:56:03.563476500 +0200
+@@ -47,6 +47,39 @@
+         } else {
+             linear(self.min) << 4 | linear(self.mag) << 2 | u32::from(self.mip == 2)
+         };
++        if sanitised() {
++            let (min_lod, max_lod) = if self.mip == 0 {
++                // Without a mip filter the console samples mip 0 only.
++                (0.0, 0.0)
++            } else {
++                let min_lod = finite_lod(self.min_lod, 0.0);
++                let max_lod = finite_lod(self.max_lod, min_lod).max(min_lod);
++                (min_lod, max_lod)
++            };
++            return D3D12_SAMPLER_DESC {
++                Filter: D3D12_FILTER((reduction << 7 | filter) as i32),
++                AddressU: address_mode(self.address[0]),
++                AddressV: address_mode(self.address[1]),
++                AddressW: address_mode(self.address[2]),
++                MipLODBias: if self.bias.is_nan() {
++                    0.0
++                } else {
++                    self.bias.clamp(D3D12_MIP_LOD_BIAS_MIN, D3D12_MIP_LOD_BIAS_MAX)
++                },
++                MaxAnisotropy: if aniso { self.anisotropy.clamp(1, 16) } else { 1 },
++                // A comparison sampler (reduction 1: a real test, 2..=7)
++                // keeps its function as before; the host ignores the
++                // function of every other sampler, which gets a valid one.
++                ComparisonFunc: if reduction == 1 {
++                    D3D12_COMPARISON_FUNC(self.compare as i32)
++                } else {
++                    D3D12_COMPARISON_FUNC_NEVER
++                },
++                BorderColor: self.border,
++                MinLOD: min_lod,
++                MaxLOD: max_lod,
++            };
++        }
+         D3D12_SAMPLER_DESC {
+             Filter: D3D12_FILTER((reduction << 7 | filter) as i32),
+             AddressU: D3D12_TEXTURE_ADDRESS_MODE(self.address[0] as i32),
+@@ -71,6 +104,37 @@
+     }
+ }
+ 
++/// Whether the console's sampler descriptions are given host bounds
++/// (`VICTORY_SAMPLER_SANITISE=0`: as they come, as before). On by default
++/// (allforks e7c125c): a sampler without a mip filter samples level 0 only
++/// (MinLOD = MaxLOD = 0, where it took the console's minimum LOD, so a
++/// sampler with a minimum of 3 read a smaller level than the console);
++/// NaN and infinite LODs, a maximum under the minimum, a bias past the
++/// host's range and address modes the host does not have are made
++/// valid; the comparison function of a sampler that does not compare is
++/// "never" (comparison samplers, the shadow maps', keep theirs).
++fn sanitised() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_SAMPLER_SANITISE").is_none_or(|v| v != "0"))
++}
++
++/// Maps a console address mode (`1..=5`) to host D3D12, falling back to `CLAMP`.
++fn address_mode(mode: u32) -> D3D12_TEXTURE_ADDRESS_MODE {
++    match mode {
++        1..=5 => D3D12_TEXTURE_ADDRESS_MODE(mode as i32),
++        _ => D3D12_TEXTURE_ADDRESS_MODE_CLAMP,
++    }
++}
++
++/// Sanitizes an LOD bound for D3D12, substituting `fallback` for `NaN` and clamping infinities.
++fn finite_lod(value: f32, fallback: f32) -> f32 {
++    if value.is_nan() {
++        fallback
++    } else {
++        value.clamp(-D3D12_FLOAT32_MAX, D3D12_FLOAT32_MAX)
++    }
++}
++
+ /// The console's sampler description (27 words): flags, magnification,
+ /// minification, mip and depth filters, filter mode, three address modes,
+ /// minimum and maximum LOD, LOD bias, secondary bias, anisotropy, its bias
+@@ -116,4 +180,91 @@
+         w[16] = 1;
+         assert_eq!(console(&w).Filter.0, 0x5);
+     }
++
++    #[test]
++    fn mip_none_forces_base_level_and_inverted_lod_range_clamps() {
++        if !sanitised() {
++            return;
++        }
++        let mut w = [0u32; 27];
++        w[3] = 0; // mip none
++        w[9] = 3.0f32.to_bits();
++        w[10] = 8.0f32.to_bits();
++        let d = console(&w);
++        assert_eq!((d.MinLOD, d.MaxLOD), (0.0, 0.0));
++
++        w[3] = 2; // linear mips
++        w[9] = 4.0f32.to_bits();
++        w[10] = 1.0f32.to_bits();
++        let d = console(&w);
++        assert_eq!((d.MinLOD, d.MaxLOD), (4.0, 4.0));
++
++        w[9] = f32::NAN.to_bits();
++        w[10] = f32::INFINITY.to_bits();
++        let d = console(&w);
++        assert_eq!((d.MinLOD, d.MaxLOD), (0.0, D3D12_FLOAT32_MAX));
++
++        w[9] = 2.5f32.to_bits();
++        w[10] = f32::NAN.to_bits();
++        let d = console(&w);
++        assert_eq!((d.MinLOD, d.MaxLOD), (2.5, 2.5));
++
++        w[9] = f32::NEG_INFINITY.to_bits();
++        w[10] = f32::NEG_INFINITY.to_bits();
++        let d = console(&w);
++        assert_eq!((d.MinLOD, d.MaxLOD), (-D3D12_FLOAT32_MAX, -D3D12_FLOAT32_MAX));
++    }
++
++    #[test]
++    fn bias_address_and_comparison_stay_in_host_bounds() {
++        if !sanitised() {
++            return;
++        }
++        let mut w = [0u32; 27];
++        w[6..9].copy_from_slice(&[0, 6, 3]);
++        w[11] = 24.0f32.to_bits();
++        w[16] = 99;
++        let d = console(&w);
++        assert_eq!(d.MipLODBias, D3D12_MIP_LOD_BIAS_MAX);
++        assert_eq!([d.AddressU, d.AddressV, d.AddressW], [D3D12_TEXTURE_ADDRESS_MODE_CLAMP; 3]);
++        assert_eq!(d.ComparisonFunc, D3D12_COMPARISON_FUNC_NEVER);
++
++        w[11] = (-24.0f32).to_bits();
++        w[5] = 1; // minimum reduction
++        w[16] = 4; // less-or-equal, ignored when reduction != 1
++        let d = console(&w);
++        assert_eq!(d.MipLODBias, D3D12_MIP_LOD_BIAS_MIN);
++        assert_eq!(d.ComparisonFunc, D3D12_COMPARISON_FUNC_NEVER);
++
++        w[11] = f32::NAN.to_bits();
++        w[5] = 0; // plain mode, reduction == 1 from compare == 4
++        w[6..9].copy_from_slice(&[1, 4, 5]);
++        w[16] = 4;
++        let d = console(&w);
++        assert_eq!(d.MipLODBias, 0.0);
++        assert_eq!(
++            [d.AddressU, d.AddressV, d.AddressW],
++            [D3D12_TEXTURE_ADDRESS_MODE_WRAP, D3D12_TEXTURE_ADDRESS_MODE_BORDER, D3D12_TEXTURE_ADDRESS_MODE_MIRROR_ONCE]
++        );
++        assert_eq!(d.ComparisonFunc, D3D12_COMPARISON_FUNC_LESS_EQUAL);
++    }
++
++    /// Comparison samplers (the shadow maps') come out as before, with
++    /// every real test: the same filter and the same function.
++    #[test]
++    fn comparison_samplers_keep_their_test() {
++        let mut w = [0u32; 27];
++        w[1] = 1;
++        w[2] = 1;
++        w[3] = 1;
++        w[6..9].copy_from_slice(&[3, 3, 3]);
++        w[10] = 13.0f32.to_bits();
++        for compare in 2..=7u32 {
++            w[16] = compare;
++            let d = console(&w);
++            assert_eq!(d.Filter.0 >> 7, 1, "a comparison filter");
++            assert_eq!(d.ComparisonFunc, D3D12_COMPARISON_FUNC(compare as i32));
++            assert_eq!((d.MinLOD, d.MaxLOD), (0.0, 13.0));
++        }
++    }
+ }
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/shadow.rs Y/crates/victory-gpu/src/shadow.rs
+--- S/crates/victory-gpu/src/shadow.rs	2026-11-25 20:51:04.000000000 +0200
++++ Y/crates/victory-gpu/src/shadow.rs	2026-11-25 21:46:04.330967100 +0200
+@@ -1557,6 +1557,26 @@
+     wide(jobs);
+ }
+ 
++/// Hands `jobs` to the kept threads of [`wide`] and returns at once,
++/// without waiting for them and without running any job of the queue on
++/// this thread (which [`wide_run`] does: a caller holding a read of title
++/// memory in place or a texture's lock must not run another texture's
++/// refresh). For helpers that look for work of their own and end when
++/// there is none (`crate::texture`'s bands).
++pub(crate) fn wide_offer(jobs: Vec<Box<dyn FnOnce() + Send>>) {
++    if jobs.is_empty() {
++        return;
++    }
++    let workers = workers();
++    workers.jobs.lock().unwrap_or_else(|e| e.into_inner()).extend(jobs);
++    workers.more.notify_all();
++}
++
++/// How many threads [`wide`] keeps.
++pub(crate) fn wide_threads() -> usize {
++    std::thread::available_parallelism().map_or(4, |n| n.get() / 4).clamp(2, 6)
++}
++
+ /// About this many bytes to a piece of work for [`wide`].
+ const WIDE_JOB: usize = 1 << 20;
+ 
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/texture.rs Y/crates/victory-gpu/src/texture.rs
+--- S/crates/victory-gpu/src/texture.rs	2026-11-25 20:33:18.000000000 +0200
++++ Y/crates/victory-gpu/src/texture.rs	2026-11-25 22:01:54.046728400 +0200
+@@ -47,6 +47,10 @@
+     first_mip: u32,
+     /// Full title extent for the indexed upload budget and residency checks.
+     title_bytes: usize,
++    /// The host subresource of the staging buffer's first part: the first
++    /// mip a view shows, when only those from it on are uploaded
++    /// ([`first_mip_switch`]); else 0.
++    view_first: u32,
+     /// The staging buffer's bytes (counted in `STAGED` while it lives).
+     bytes: u64,
+     memory: *const u8,
+@@ -83,6 +87,24 @@
+     piece: Option<Piece>,
+ }
+ 
++/// Whether a texture the title placed is staged, read and uploaded from the
++/// first mip its view shows (`VICTORY_TEXTURE_FIRST_MIP=0`: from mip 0,
++/// all of its description, as before). On by default (myokex c3723f3).
++///
++/// A title that streams textures describes every mip of them and has
++/// memory for the ones it streamed in, the smaller ones, which lie at the
++/// texture's start; right behind them it places the next texture. Read for
++/// its whole description such a texture lay over its neighbours (in
++/// myokex's runs 109,638 views were taken for stale in 8 minutes and showed
++/// nothing from then on, and 700 KB were read for the 12 KB there). Only
++/// a single 2D slice, not with levels on demand, nor for a host copy made
++/// without its largest levels (which has its own prefix,
++/// [`staging_layout`]).
++pub(crate) fn first_mip_switch() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_FIRST_MIP").is_none_or(|v| v != "0"))
++}
++
+ /// A staging buffer nothing holds: the buffer, where it is mapped, and
+ /// when it was given back (`crate::host::moment`), for [`trim_pools`].
+ struct Spare(ID3D12Resource, usize, u64);
+@@ -411,6 +433,32 @@
+     asked: u64,
+     /// The frame a partly mapped texture was last read in.
+     partial: Option<u64>,
++    /// The texture was found changed without a write the guard saw
++    /// ([`Staging::unseen_write`]): it is hashed at every check until this
++    /// frame.
++    unguarded: u64,
++}
++
++/// Whether a guarded texture found changed with no write the guard saw is
++/// hashed at every check for a while, and a linear one-level picture at
++/// every check (`VICTORY_TEXTURE_UNSEEN=0`: every eighth frame, as before).
++/// On by default (myokex c3723f3: the intro's movie, three pictures in turn
++/// that only changed every eighth frame, one old picture after another).
++fn unseen_switch() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_UNSEEN").is_none_or(|v| v != "0"))
++}
++
++/// Whether, with `VICTORY_TEXTURE_NO_WAIT`, a texture nothing was read for
++/// yet whose pages are not all there when the runtime remaps is read
++/// around the missing ones (zeros, as a partly mapped texture is)
++/// (`VICTORY_TEXTURE_READ_AROUND=0`: left for its next refresh, as
++/// before). On by default (myokex c3723f3): its upload is recorded behind
++/// the refresh, and copied a staging buffer of zeros (black) over what the
++/// host texture showed, for good until more memory was mapped.
++fn read_around_switch() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_READ_AROUND").is_none_or(|v| v != "0"))
+ }
+ 
+ // SAFETY: the staging mapping is written only at submission, under
+@@ -664,7 +712,13 @@
+ /// Since the last frame-rate line, with [`no_wait`]: refreshes that read
+ /// through the kernel because title memory was being remapped, and those
+ /// left for the next refresh because a page was not there.
+-pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
++/// Then those of the latter that had nothing uploaded yet and were read
++/// around the pages that were not there ([`read_around_switch`]).
++pub(crate) static UNLOCKED: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
++
++/// Since the start: textures found changed with no write the guard saw
++/// ([`unseen_switch`]).
++pub(crate) static UNSEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ 
+ /// Since the last frame-rate line, of texture refreshes on every thread, in
+ /// microseconds: waiting for the texture's own lock (another thread is
+@@ -939,6 +993,13 @@
+ /// submission if the memory changed. Leaves the texture in the copy
+ /// destination state.
+ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
++    upload_from(list, resource, texture, 0);
++}
++
++/// [`upload`] of the mips from `first` on, the ones a view shows: of a
++/// placed texture the title may have no memory for the larger ones, and
++/// what lies there is another texture's ([`first_mip_switch`]).
++pub(crate) fn upload_from(list: &HostList, resource: This, texture: &ID3D12Resource, first: u32) {
+     let host_written = HOST_WRITTEN
+         .lock()
+         .unwrap_or_else(|e| e.into_inner())
+@@ -946,10 +1007,10 @@
+         .is_some_and(|set| set.contains(&(resource as usize)));
+     // shortcut: a texture the host copied into keeps the host's contents
+     // even if the title later writes its memory too.
+-    if host_written || !list.first_use(resource as usize) {
++    if host_written || !list.first_use(resource as usize) && staged_from(resource) <= first {
+         return;
+     }
+-    let Some(staging) = staging(resource, texture) else {
++    let Some(staging) = staging(resource, texture, first) else {
+         return;
+     };
+     use std::sync::atomic::Ordering::Relaxed;
+@@ -1030,7 +1091,7 @@
+             pResource: unsafe { std::mem::transmute_copy(texture) },
+             Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
+             Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
+-                SubresourceIndex: i as u32,
++                SubresourceIndex: staging.view_first + i as u32,
+             },
+         };
+         let from = D3D12_TEXTURE_COPY_LOCATION {
+@@ -1312,16 +1373,25 @@
+         // texture's address, so the textures take turns.
+         // `VICTORY_TEXTURE_GUARD=0` hashes at every check, as before.
+         static GUARD: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        // A texture that changed without the guard seeing it is hashed at
++        // every check for a while (`unseen_switch`).
++        let mut unseen = false;
+         if *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
+             && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+         {
+             const HASH_EVERY: u64 = 8;
+             let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+             last.asked = now;
+-            let turn = crate::frame::current().wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
+-            if unwritten && !turn {
++            let frame = crate::frame::current();
++            let turn = frame.wrapping_add((start >> 16) as u64).is_multiple_of(HASH_EVERY);
++            // Linear pictures of one level are what the processor draws (the
++            // planes of a movie), through a view of its own.
++            let desc = &self.layout.desc;
++            let watched = unseen_switch() && (desc.swizzle.0 == 0 && desc.mips == 1 || frame < last.unguarded);
++            if unwritten && !turn && !watched {
+                 return 0;
+             }
++            unseen = unwritten && unseen_switch();
+         }
+         // From here on the texture's memory may be read in place. Held until
+         // that read is done: the runtime changes what title memory shows
+@@ -1333,12 +1403,18 @@
+             // Not waited for: while the runtime remaps title memory the
+             // texture is read through the kernel instead, whole or not at
+             // all (`no_wait`).
+-            let Some(mapped) = crate::watch::title_memory_reading_now() else {
+-                return self.refresh_unlocked(last, size);
++            let Some(mapped) = crate::watch::title_memory_reading_now(start, size) else {
++                let never = last.hash.is_none();
++                let read = self.refresh_unlocked(last, size);
++                if read != 0 || !never || !read_around_switch() {
++                    return read;
++                }
++                UNLOCKED[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                return self.refresh_around(last, size);
+             };
+             mapped
+         } else {
+-            waited(2, crate::watch::title_memory_reading)
++            waited(2, || crate::watch::title_memory_reading(start, size))
+         };
+         if !committed(self.memory, size) {
+             // Partly mapped: a streamed texture with only some mips' pages
+@@ -1383,6 +1459,9 @@
+                 if last.hash == Some(hash) {
+                     return size;
+                 }
++                if unseen && last.hash.is_some() {
++                    self.unseen_write(last);
++                }
+                 last.hash = Some(hash);
+                 self.detile(tiled);
+                 #[cfg(feature = "diagnostics")]
+@@ -1399,6 +1478,9 @@
+         if last.hash == Some(hash) {
+             return size;
+         }
++        if unseen && last.hash.is_some() {
++            self.unseen_write(last);
++        }
+         last.hash = Some(hash);
+         self.detile(tiled);
+         #[cfg(feature = "diagnostics")]
+@@ -1406,6 +1488,46 @@
+         size
+     }
+ 
++    /// The texture's memory changed and the guard says nothing wrote it: it
++    /// is hashed at every check for the next frames, the longer the more
++    /// often this happens (a texture streamed in once is soon guarded
++    /// again, a movie's is not). (myokex c3723f3.)
++    fn unseen_write(&self, last: &mut Last) {
++        let frame = crate::frame::current();
++        let more = if frame < last.unguarded { 120 } else { 16 };
++        let n = UNSEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        if n < 24 || n.is_multiple_of(1000) {
++            tracing::info!(
++                frame,
++                so_far = n + 1,
++                memory = ?self.memory,
++                size = self.layout.size,
++                "a guarded texture changed and no write to it was seen: hashed at every check for a while (VICTORY_TEXTURE_UNSEEN=0: not)"
++            );
++        }
++        last.unguarded = frame + more;
++    }
++
++    /// A refresh of a texture that has been given nothing yet, while the
++    /// runtime is remapping its memory ([`no_wait`], [`read_around_switch`]):
++    /// read around the pages that are not there, through the kernel (the
++    /// fault-guarded copy), as a partly mapped texture is. Nothing but zeros
++    /// is taken for "not there yet". Returns the bytes read. (myokex
++    /// c3723f3.)
++    fn refresh_around(&self, last: &mut Last, size: usize) -> usize {
++        with_read(size, |read| {
++            crate::host::copy_mapped(read.as_mut_ptr(), self.memory, size, false);
++            if read.iter().all(|&b| b == 0) {
++                last.asked = 0;
++                return 0;
++            }
++            last.hash = Some(blake3::hash(read));
++            last.partial = Some(crate::frame::current());
++            self.detile(read);
++            size
++        })
++    }
++
+     /// A refresh while the runtime is remapping title memory ([`no_wait`]):
+     /// the texture is read through the kernel, which fails if a page of it
+     /// is not there at this moment. Then nothing is taken and the texture
+@@ -1474,10 +1596,7 @@
+                 linear.fill(0);
+                 continue;
+             }
+-            if let Err(e) =
+-                self.layout
+-                    .detile(tiled, mip + self.first_mip, slice, linear, pitch, pitch * rows as usize)
+-            {
++            if let Err(e) = detile_wide(&self.layout, tiled, mip + self.first_mip, slice, linear, pitch, rows) {
+                 tracing::warn!(?e, mip, slice, "texture not detiled");
+                 return;
+             }
+@@ -1485,6 +1604,137 @@
+     }
+ }
+ 
++/// A subresource of at least twice this many bytes is detiled in bands of
++/// about this many on the kept threads ([`detile_wide`]): one thread
++/// detiles some 4.5 GB/s, and a 33-67 MB texture went 1.7-2 times as fast
++/// on four (Trexies 58c7bb0: 33 MB 7.3 -> 4.2 ms, 67 MB 16.6-17.1 ->
++/// 7.4-8.5 ms).
++const BAND_BYTES: usize = 4 << 20;
++
++/// Whether big subresources are detiled in bands on several threads
++/// (`VICTORY_TEXTURE_BANDS=0`: whole, on the refreshing thread, as
++/// before). On by default. The bytes are the same either way.
++fn banded() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_BANDS").is_none_or(|v| v != "0"))
++}
++
++/// One subresource's bands ([`detile_wide`]): what each needs, as
++/// addresses (the caller's borrows, alive until every band taken is done),
++/// the next band to take, and the bands done.
++struct Bands {
++    layout: usize,
++    tiled: (usize, usize),
++    linear: usize,
++    pitch: usize,
++    height: u32,
++    band: u32,
++    count: u32,
++    mip: u32,
++    slice: u32,
++    next: std::sync::atomic::AtomicU32,
++    done: Mutex<u32>,
++    all_done: std::sync::Condvar,
++    failed: Mutex<Option<victory_formats::texture::Error>>,
++}
++
++impl Bands {
++    /// Takes bands until none is left. A helper that starts after the
++    /// last band was taken touches nothing of the caller's.
++    fn work(&self) {
++        use std::sync::atomic::Ordering::Relaxed;
++        loop {
++            let k = self.next.fetch_add(1, Relaxed);
++            if k >= self.count {
++                return;
++            }
++            let y = k * self.band;
++            let end = (y + self.band).min(self.height);
++            // SAFETY: band `k` was taken, so the caller of `detile_wide`
++            // waits for it to be counted done before its borrows of the
++            // layout and both buffers end; the bands are disjoint rows of
++            // `linear`.
++            let (layout, tiled, part) = unsafe {
++                (
++                    &*(self.layout as *const victory_formats::texture::Layout),
++                    std::slice::from_raw_parts(self.tiled.0 as *const u8, self.tiled.1),
++                    std::slice::from_raw_parts_mut(
++                        (self.linear + y as usize * self.pitch) as *mut u8,
++                        (end - y) as usize * self.pitch,
++                    ),
++                )
++            };
++            if let Err(e) = layout.detile_rows(tiled, self.mip, self.slice, part, self.pitch, y..end) {
++                *self.failed.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
++            }
++            let mut done = self.done.lock().unwrap_or_else(|e| e.into_inner());
++            *done += 1;
++            if *done == self.count {
++                self.all_done.notify_all();
++            }
++        }
++    }
++}
++
++/// [`Layout::detile`](victory_formats::texture::Layout::detile) of one
++/// subresource into `linear` (`rows` rows `pitch` bytes apart, depth slices
++/// `pitch * rows` apart); a big one of one slice deep is cut into bands of
++/// rows that the kept threads ([`crate::shadow::wide_offer`]) and this one
++/// detile at once (Trexies 58c7bb0). This thread takes bands of its own
++/// subresource only, never another job of the queue: it may hold a read of
++/// title memory in place and the texture's lock.
++fn detile_wide(
++    layout: &victory_formats::texture::Layout,
++    tiled: &[u8],
++    mip: u32,
++    slice: u32,
++    linear: &mut [u8],
++    pitch: usize,
++    rows: u32,
++) -> Result<(), victory_formats::texture::Error> {
++    let height = layout.mips.get(mip as usize).map_or(0, |m| m.height);
++    let deep = layout.subresource_depth(mip) != 1;
++    if !banded() || deep || linear.len() < 2 * BAND_BYTES || pitch == 0 || height < 2 || height > rows {
++        return layout.detile(tiled, mip, slice, linear, pitch, pitch * rows as usize);
++    }
++    let band = (BAND_BYTES / pitch).clamp(1, height as usize) as u32;
++    let count = height.div_ceil(band);
++    let bands = Arc::new(Bands {
++        layout: std::ptr::from_ref(layout) as usize,
++        tiled: (tiled.as_ptr() as usize, tiled.len()),
++        linear: linear.as_mut_ptr() as usize,
++        pitch,
++        height,
++        band,
++        count,
++        mip,
++        slice,
++        next: std::sync::atomic::AtomicU32::new(0),
++        done: Mutex::new(0),
++        all_done: std::sync::Condvar::new(),
++        failed: Mutex::new(None),
++    });
++    let helpers = crate::shadow::wide_threads().min(count as usize - 1);
++    crate::shadow::wide_offer(
++        (0..helpers)
++            .map(|_| {
++                let bands = bands.clone();
++                Box::new(move || bands.work()) as Box<dyn FnOnce() + Send>
++            })
++            .collect(),
++    );
++    bands.work();
++    let mut done = bands.done.lock().unwrap_or_else(|e| e.into_inner());
++    while *done < count {
++        done = bands.all_done.wait(done).unwrap_or_else(|e| e.into_inner());
++    }
++    drop(done);
++    match bands.failed.lock().unwrap_or_else(|e| e.into_inner()).take() {
++        Some(e) => Err(e),
++        None => Ok(()),
++    }
++}
++
+ /// Lets go of a title texture's staging buffer (lists that recorded an
+ /// upload from it hold it until they have run); the next upload makes one
+ /// anew.
+@@ -1563,6 +1813,13 @@
+     Some((size as u64, committed(s.memory, size)))
+ }
+ 
++/// The first mip a title texture's staging buffer holds of its host copy
++/// ([`first_mip_switch`]); `u32::MAX` without one.
++fn staged_from(resource: This) -> u32 {
++    let map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
++    map.as_ref().and_then(|map| map.get(&(resource as usize))).map_or(u32::MAX, |s| s.view_first)
++}
++
+ /// Whether `[at, at + len)` is committed memory (streamed textures may be
+ /// unmapped until their pages arrive).
+ pub(crate) fn committed(at: *const u8, len: usize) -> bool {
+@@ -1745,14 +2002,18 @@
+     (layout, 0)
+ }
+ 
+-/// The staging state of a title texture, made on first use.
+-fn staging(resource: This, texture: &ID3D12Resource) -> Option<Arc<Staging>> {
++/// The staging state of a title texture from the mip `first` on
++/// ([`first_mip_switch`]), made on first use (and made anew for a view of
++/// larger mips than the one there holds).
++fn staging(resource: This, texture: &ID3D12Resource, first: u32) -> Option<Arc<Staging>> {
+     // Asked before the table is locked: the sweep lets go of a staging
+     // buffer with its texture's host side locked, in that order.
+     let on_demand = crate::resource::host_tiled(resource).is_some();
+     let mut map = STAGING.lock().unwrap_or_else(|e| e.into_inner());
+     let map = map.get_or_insert_with(HashMap::new);
+-    if let Some(s) = map.get(&(resource as usize)) {
++    if let Some(s) = map.get(&(resource as usize))
++        && s.view_first <= first
++    {
+         return Some(s.clone());
+     }
+     let (memory, desc) = crate::resource::texture_memory(resource)?;
+@@ -1771,10 +2032,29 @@
+     let host = host()?;
+     // SAFETY: a live resource.
+     let d = unsafe { texture.GetDesc() };
++    // From the view's first mip only where the title's layout can end
++    // behind the smaller mips: one 2D slice, all its mips in the host copy.
++    let drop = crate::resource::drop_levels(&desc);
++    let first = if first_mip_switch()
++        && first > 0
++        && !on_demand
++        && drop == 0
++        && d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D
++        && d.DepthOrArraySize == 1
++        && first < u32::from(d.MipLevels)
++        && first < layout.desc.mips
++        && layout.slices == 1
++        && layout.desc.dimension == victory_formats::texture::Dimension::Tex2d
++        && layout.bytes_from(first) < layout.size
++    {
++        first
++    } else {
++        0
++    };
+     let count = if d.Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE3D {
+         u32::from(d.MipLevels)
+     } else {
+-        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize)
++        u32::from(d.MipLevels) * u32::from(d.DepthOrArraySize) - first
+     };
+     let mut footprints = vec![D3D12_PLACED_SUBRESOURCE_FOOTPRINT::default(); count as usize];
+     let mut rows = vec![0u32; count as usize];
+@@ -1783,7 +2063,7 @@
+     unsafe {
+         host.device.GetCopyableFootprints(
+             &d,
+-            0,
++            first,
+             count,
+             0,
+             Some(footprints.as_mut_ptr()),
+@@ -1807,8 +2087,13 @@
+     tracing::debug!(?desc, total, "texture contents uploaded from title memory");
+     STAGED[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+     STAGED[1].fetch_add(total, std::sync::atomic::Ordering::Relaxed);
+-    let title_bytes = layout.size as usize;
+-    let (layout, first_mip) = staging_layout(layout, crate::resource::drop_levels(&desc));
++    let (title_bytes, (layout, first_mip)) = if first > 0 {
++        // The smaller mips' prefix, read, hashed and watched as the whole.
++        let (layout, _) = staging_layout(layout, first);
++        (layout.size as usize, (layout, 0))
++    } else {
++        (layout.size as usize, staging_layout(layout, drop))
++    };
+     let s = Arc::new(Staging {
+         buffer,
+         #[cfg(feature = "diagnostics")]
+@@ -1820,6 +2105,7 @@
+         mips: u32::from(d.MipLevels),
+         first_mip,
+         title_bytes,
++        view_first: first,
+         bytes: total,
+         memory,
+         last: Mutex::default(),
+@@ -1995,7 +2281,7 @@
+                 ),
+                 object::S_OK
+             );
+-            let upload = staging(image, resource::host_resource(image).unwrap()).unwrap();
++            let upload = staging(image, resource::host_resource(image).unwrap(), 0).unwrap();
+             let (at, size) = staged_memory(image).unwrap();
+             assert_eq!(at, address);
+             let cropped = drop > 0 && slices == 1;
+@@ -2182,3 +2468,100 @@
+         );
+     }
+ }
++
++#[cfg(test)]
++mod detile_tests {
++    use super::{BAND_BYTES, detile_wide};
++    use victory_formats::texture::{Desc, Dimension, Layout, Swizzle};
++
++    /// Big subresources detiled in bands on several threads, and small ones
++    /// whole, give the bytes of one whole detile, rows and padding alike,
++    /// in every tiling mode the layout can address, with 16-byte block
++    /// compressed elements, odd sizes and the mips of a big texture.
++    #[test]
++    fn a_texture_detiled_in_bands_is_the_one_detiled_whole() {
++        let desc = |w, h, mips, bpe, block, swizzle| Desc {
++            dimension: Dimension::Tex2d,
++            width: w,
++            height: h,
++            depth: 1,
++            mips,
++            element_bytes: bpe,
++            block,
++            samples: 1,
++            swizzle,
++        };
++        let mut modes = 0;
++        for swizzle in (0..32).map(Swizzle).filter(|s| s.block_log2().is_some()) {
++            let cases = [
++                desc(2048, 1500, 3, 4, 1, swizzle),
++                desc(1024, 1024, 2, 16, 4, swizzle),
++                desc(1030, 2051, 1, 8, 1, swizzle),
++                desc(256, 256, 1, 4, 1, swizzle),
++            ];
++            let mut banded_here = false;
++            for d in cases {
++                let Ok(l) = Layout::new(&d) else {
++                    continue;
++                };
++                if !l.addressable() {
++                    continue;
++                }
++                let tiled: Vec<u8> = (0..l.size as usize).map(|i| (i * 7 + i / 4093) as u8).collect();
++                for mip in 0..d.mips {
++                    let m = &l.mips[mip as usize];
++                    let pitch = (m.width as usize * d.element_bytes as usize).next_multiple_of(256);
++                    let rows = m.height;
++                    let size = pitch * rows as usize;
++                    banded_here |= size >= 2 * BAND_BYTES;
++                    let mut whole = vec![0xA5u8; size];
++                    l.detile(&tiled, mip, 0, &mut whole, pitch, size).unwrap();
++                    let mut banded = vec![0xA5u8; size];
++                    detile_wide(&l, &tiled, mip, 0, &mut banded, pitch, rows).unwrap();
++                    assert!(banded == whole, "{d:?} mip {mip} ({} bands)", size.div_ceil(BAND_BYTES));
++                }
++            }
++            if banded_here {
++                modes += 1;
++            }
++        }
++        // linear, 256 B, 4 KiB and 64 KiB, standard and display
++        assert_eq!(modes, 7, "modes detiled in bands");
++    }
++
++    /// Many big detiles at once from several threads (as the kept threads
++    /// refresh textures together, `VICTORY_WIDE_TEXTURES=1`): each comes
++    /// out whole, and none waits for another's bands.
++    #[test]
++    fn bands_of_several_textures_at_once_do_not_mix() {
++        let d = Desc {
++            dimension: Dimension::Tex2d,
++            width: 2048,
++            height: 2048,
++            depth: 1,
++            mips: 1,
++            element_bytes: 4,
++            block: 1,
++            samples: 1,
++            swizzle: Swizzle::SW_64KB_S,
++        };
++        let l = Layout::new(&d).unwrap();
++        let pitch = 2048 * 4;
++        let size = pitch * 2048;
++        std::thread::scope(|s| {
++            for t in 0..6u8 {
++                let l = &l;
++                s.spawn(move || {
++                    let tiled: Vec<u8> = (0..l.size as usize).map(|i| (i as u8) ^ t).collect();
++                    let mut whole = vec![0u8; size];
++                    l.detile(&tiled, 0, 0, &mut whole, pitch, size).unwrap();
++                    for _ in 0..4 {
++                        let mut banded = vec![0u8; size];
++                        detile_wide(l, &tiled, 0, 0, &mut banded, pitch, 2048).unwrap();
++                        assert!(banded == whole, "thread {t}");
++                    }
++                });
++            }
++        });
++    }
++}
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/watch.rs Y/crates/victory-gpu/src/watch.rs
+--- S/crates/victory-gpu/src/watch.rs	2026-11-25 19:11:21.000000000 +0200
++++ Y/crates/victory-gpu/src/watch.rs	2026-11-25 21:33:49.849766900 +0200
+@@ -1300,11 +1300,115 @@
+ /// had asked whether the texture was all mapped and been told yes. Asking
+ /// cannot help; not changing the mapping while such a read is under way
+ /// does.
++///
++/// Only with `VICTORY_MAPPING_RANGES=0` ([`by_range`]); otherwise reads and
++/// changes hold the bytes they touch ([`SPANS`]).
+ static MAPPING: std::sync::RwLock<()> = std::sync::RwLock::new(());
+ 
++/// Whether a read in place and a change of mapping keep apart only when
++/// their bytes meet ([`SPANS`]), not whatever memory each touches
++/// ([`MAPPING`]); `VICTORY_MAPPING_RANGES=0` holds all of title memory for
++/// each, as before. On by default (allforks c79c751).
++///
++/// With one lock over all of title memory each texture refresh waited for
++/// every change of mapping anywhere (or, with `VICTORY_TEXTURE_NO_WAIT`,
++/// was read through the kernel and often left for later), and each change
++/// waited for the refresh under way. While the world streams in the title
++/// changes mappings 650-1,100 times a frame, a page at a time. With this a
++/// refresh waits for, or with `VICTORY_TEXTURE_NO_WAIT` steps around, only
++/// changes of its own bytes.
++///
++/// Lock order: [`SPANS`] is a leaf, held only to look at and change its
++/// lists, never while anything else is asked for (the wait on
++/// [`SPANS_LEFT`] lets it go). A read or a change waits here only where the
++/// one lock made it wait as well (bytes that meet are some of all bytes,
++/// and a change that waits keeps new reads of its bytes out as the lock's
++/// waiting writer kept all reads out), so no wait is added to those the
++/// locks taken around these already had (the runtime's page table,
++/// `JOURNAL`, `GUARDS`, the buffer table's `VICTORY_MIRROR_FAST` lock).
++pub(crate) fn by_range() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_MAPPING_RANGES").is_none_or(|v| v != "0"))
++}
++
++/// Reads of title memory in place under way, and changes of its mapping,
++/// by the bytes they touch ([`by_range`]).
++struct Spans {
++    /// To tell them apart.
++    next: u64,
++    /// Reads under way: number, start and end.
++    reads: Vec<(u64, usize, usize)>,
++    /// Changes: number, start, end, and whether under way (else waiting for
++    /// the reads over its bytes to end; no read begins over them meanwhile,
++    /// so that one read after another cannot keep a change waiting).
++    changes: Vec<(u64, usize, usize, bool)>,
++    /// Threads waiting on [`SPANS_LEFT`].
++    waiting: usize,
++}
++
++static SPANS: Mutex<Spans> = Mutex::new(Spans {
++    next: 0,
++    reads: Vec::new(),
++    changes: Vec::new(),
++    waiting: 0,
++});
++
++/// Told when a read or a change ends while a thread waits.
++static SPANS_LEFT: std::sync::Condvar = std::sync::Condvar::new();
++
++fn spans() -> std::sync::MutexGuard<'static, Spans> {
++    SPANS.lock().unwrap_or_else(|e| e.into_inner())
++}
++
++/// Waits until a read or a change ends.
++fn spans_wait(mut s: std::sync::MutexGuard<'static, Spans>) -> std::sync::MutexGuard<'static, Spans> {
++    s.waiting += 1;
++    let mut s = SPANS_LEFT.wait(s).unwrap_or_else(|e| e.into_inner());
++    s.waiting -= 1;
++    s
++}
++
++/// Whether `[a, b)` and `[c, d)` share a byte.
++fn meet(a: usize, b: usize, c: usize, d: usize) -> bool {
++    a < d && c < b
++}
++
++impl Spans {
++    fn read(&mut self, at: usize, end: usize) -> Span {
++        self.next += 1;
++        self.reads.push((self.next, at, end));
++        Span(self.next, false)
++    }
++}
++
++/// A read's or a change's place in [`SPANS`] (its number, and whether a
++/// change), given up when dropped.
++struct Span(u64, bool);
++
++impl Drop for Span {
++    fn drop(&mut self) {
++        let mut s = spans();
++        if self.1 {
++            s.changes.retain(|c| c.0 != self.0);
++        } else if let Some(i) = s.reads.iter().position(|r| r.0 == self.0) {
++            s.reads.swap_remove(i);
++        }
++        if s.waiting > 0 {
++            SPANS_LEFT.notify_all();
++        }
++    }
++}
++
++/// What a read or a change of mapping holds: its bytes ([`by_range`]) or
++/// the lock over all of title memory.
++enum Held<G> {
++    All(#[allow(dead_code)] G),
++    Bytes(#[allow(dead_code)] Span),
++}
++
+ /// What the runtime holds while it changes what title memory shows
+ /// ([`title_memory_remapping`]).
+-pub struct Remapping(#[allow(dead_code)] std::sync::RwLockWriteGuard<'static, ()>, std::time::Instant);
++pub struct Remapping(#[allow(dead_code)] Held<std::sync::RwLockWriteGuard<'static, ()>>, std::time::Instant);
+ 
+ impl Drop for Remapping {
+     fn drop(&mut self) {
+@@ -1314,37 +1418,74 @@
+ }
+ 
+ /// The runtime is about to map, unmap or move physical pages of title
+-/// memory: until what it returns is dropped, no read of title memory in
+-/// place is under way and none begins ([`title_memory_reading`]). Taken
+-/// around the whole change, the unmapping and the mapping again.
+-pub fn title_memory_remapping() -> Remapping {
++/// memory `[at, at + len)`: until what it returns is dropped, no read of
++/// those bytes in place is under way and none begins
++/// ([`title_memory_reading`]). Taken around the whole change, the
++/// unmapping and the mapping again, over all the bytes whose mapping it
++/// changes (with `VICTORY_MAPPING_RANGES=0`, all of title memory).
++pub fn title_memory_remapping(at: usize, len: usize) -> Remapping {
+     let asked = std::time::Instant::now();
+-    let held = MAPPING.write().unwrap_or_else(|e| e.into_inner());
++    let held = if by_range() {
++        let end = at.saturating_add(len);
++        let mut s = spans();
++        s.next += 1;
++        let id = s.next;
++        s.changes.push((id, at, end, false));
++        while s.reads.iter().any(|r| meet(r.1, r.2, at, end))
++            || s.changes.iter().any(|c| c.3 && meet(c.1, c.2, at, end))
++        {
++            s = spans_wait(s);
++        }
++        if let Some(c) = s.changes.iter_mut().find(|c| c.0 == id) {
++            c.3 = true;
++        }
++        Held::Bytes(Span(id, true))
++    } else {
++        Held::All(MAPPING.write().unwrap_or_else(|e| e.into_inner()))
++    };
+     crate::framelog::add(crate::framelog::T::Remaps, 1);
+     crate::framelog::add(crate::framelog::T::RemapWaitUs, asked.elapsed().as_micros() as u64);
+     Remapping(held, asked)
+ }
+ 
+ /// What a read of title memory in place holds ([`title_memory_reading`]).
+-pub struct Reading(#[allow(dead_code)] std::sync::RwLockReadGuard<'static, ()>);
++pub struct Reading(#[allow(dead_code)] Held<std::sync::RwLockReadGuard<'static, ()>>);
+ 
+-/// For reading title memory in place: until what it returns is dropped,
+-/// the runtime changes no mapping, so memory found mapped stays mapped.
+-/// Not to be taken twice by one thread, nor held across anything that
+-/// maps title memory.
+-pub fn title_memory_reading() -> Reading {
+-    Reading(MAPPING.read().unwrap_or_else(|e| e.into_inner()))
++/// For reading title memory `[at, at + len)` in place: until what it
++/// returns is dropped, the runtime changes no mapping of those bytes (with
++/// `VICTORY_MAPPING_RANGES=0`, of any title memory), so memory found mapped
++/// stays mapped. Not to be taken twice by one thread, nor held across
++/// anything that maps title memory.
++pub fn title_memory_reading(at: usize, len: usize) -> Reading {
++    if !by_range() {
++        return Reading(Held::All(MAPPING.read().unwrap_or_else(|e| e.into_inner())));
++    }
++    let end = at.saturating_add(len);
++    let mut s = spans();
++    while s.changes.iter().any(|c| meet(c.1, c.2, at, end)) {
++        s = spans_wait(s);
++    }
++    Reading(Held::Bytes(s.read(at, end)))
+ }
+ 
+ /// [`title_memory_reading`] if it can be had at once: `None` while the
+-/// runtime changes a mapping (or waits to), for a caller that has another
+-/// way to read and would rather not wait.
+-pub fn title_memory_reading_now() -> Option<Reading> {
+-    match MAPPING.try_read() {
+-        Ok(guard) => Some(Reading(guard)),
+-        Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(e.into_inner())),
+-        Err(std::sync::TryLockError::WouldBlock) => None,
++/// runtime changes a mapping of those bytes (or waits to; with
++/// `VICTORY_MAPPING_RANGES=0`, of any title memory), for a caller that has
++/// another way to read and would rather not wait.
++pub fn title_memory_reading_now(at: usize, len: usize) -> Option<Reading> {
++    if !by_range() {
++        return match MAPPING.try_read() {
++            Ok(guard) => Some(Reading(Held::All(guard))),
++            Err(std::sync::TryLockError::Poisoned(e)) => Some(Reading(Held::All(e.into_inner()))),
++            Err(std::sync::TryLockError::WouldBlock) => None,
++        };
++    }
++    let end = at.saturating_add(len);
++    let mut s = spans();
++    if s.changes.iter().any(|c| meet(c.1, c.2, at, end)) {
++        return None;
+     }
++    Some(Reading(Held::Bytes(s.read(at, end))))
+ }
+ 
+ /// The runtime mapped or unmapped title memory `[at, at + len)`: what it
+@@ -2016,24 +2157,27 @@
+ 
+ #[cfg(test)]
+ mod mapping_tests {
+-    use super::{title_memory_reading, title_memory_remapping};
++    use super::{PAGE, by_range, title_memory_reading, title_memory_remapping};
+     use std::sync::atomic::{AtomicBool, Ordering};
+     use std::sync::{Arc, mpsc};
+     use std::time::Duration;
+ 
+-    /// A change of mapping waits for a read in place that is under way, and
+-    /// a read in place waits for a change of mapping.
++    /// Addresses only these tests hold (nothing is read there).
++    const HERE: usize = 0x7e00_0000_0000;
++
++    /// A change of mapping waits for a read in place of its bytes that is
++    /// under way, and such a read waits for the change.
+     #[test]
+     fn reads_in_place_and_remappings_wait_for_each_other() {
+         // A reader holds; the change does not begin until it lets go.
+         let changed = Arc::new(AtomicBool::new(false));
+-        let reading = title_memory_reading();
++        let reading = title_memory_reading(HERE + PAGE / 2, PAGE);
+         let (began, wait) = mpsc::channel();
+         let change = {
+             let changed = changed.clone();
+             std::thread::spawn(move || {
+                 began.send(()).unwrap();
+-                let _changing = title_memory_remapping();
++                let _changing = title_memory_remapping(HERE + PAGE, PAGE);
+                 changed.store(true, Ordering::SeqCst);
+             })
+         };
+@@ -2045,13 +2189,13 @@
+         assert!(changed.load(Ordering::SeqCst));
+         // A change holds; the read does not begin until it is done.
+         let read = Arc::new(AtomicBool::new(false));
+-        let changing = title_memory_remapping();
++        let changing = title_memory_remapping(HERE, 2 * PAGE);
+         let (began, wait) = mpsc::channel();
+         let reader = {
+             let read = read.clone();
+             std::thread::spawn(move || {
+                 began.send(()).unwrap();
+-                let _reading = title_memory_reading();
++                let _reading = title_memory_reading(HERE + PAGE + 16, 16);
+                 read.store(true, Ordering::SeqCst);
+             })
+         };
+@@ -2062,4 +2206,51 @@
+         reader.join().unwrap();
+         assert!(read.load(Ordering::SeqCst));
+     }
++
++    /// Reads and changes whose bytes do not meet do not wait for each other,
++    /// and a change waiting for a read keeps new reads of its bytes out (but
++    /// not of others).
++    #[test]
++    fn reads_and_remappings_of_other_bytes_go_on() {
++        if !by_range() {
++            return; // VICTORY_MAPPING_RANGES=0: one lock over all of it
++        }
++        let at = HERE + 16 * PAGE;
++        let reading = title_memory_reading(at, PAGE);
++        // Another page changes while the read is under way, and another
++        // read goes on while that change is.
++        let (done, finished) = mpsc::channel();
++        std::thread::spawn(move || {
++            let changing = title_memory_remapping(at + PAGE, PAGE);
++            let (read, was_read) = mpsc::channel();
++            std::thread::spawn(move || {
++                let _reading = title_memory_reading(at + 2 * PAGE, PAGE);
++                read.send(()).unwrap();
++            });
++            let other = was_read.recv_timeout(Duration::from_secs(10)).is_ok();
++            drop(changing);
++            done.send(other).unwrap();
++        });
++        assert_eq!(finished.recv_timeout(Duration::from_secs(10)), Ok(true), "kept apart though their bytes do not meet");
++        // A change of the read's page waits, and keeps a new read of its
++        // bytes out meanwhile; a read elsewhere is not kept out.
++        let changed = Arc::new(AtomicBool::new(false));
++        let change = {
++            let changed = changed.clone();
++            std::thread::spawn(move || {
++                let _changing = title_memory_remapping(at, PAGE);
++                changed.store(true, Ordering::SeqCst);
++            })
++        };
++        while !super::spans().changes.iter().any(|c| c.1 == at) {
++            std::thread::yield_now();
++        }
++        assert!(super::title_memory_reading_now(at + 8, 8).is_none(), "a read began over a change that waits");
++        assert!(super::title_memory_reading_now(at + 3 * PAGE, 8).is_some());
++        std::thread::sleep(Duration::from_millis(50));
++        assert!(!changed.load(Ordering::SeqCst), "the mapping changed under a read in place");
++        drop(reading);
++        change.join().unwrap();
++        assert!(changed.load(Ordering::SeqCst));
++    }
+ }
+diff -ruN '--exclude=target' S/crates/victory-hle/src/modules/xmem.rs Y/crates/victory-hle/src/modules/xmem.rs
+--- S/crates/victory-hle/src/modules/xmem.rs	2026-11-25 19:11:21.000000000 +0200
++++ Y/crates/victory-hle/src/modules/xmem.rs	2026-11-25 21:34:12.153124700 +0200
+@@ -688,8 +688,10 @@
+     // Until the pages are mapped again: `unmap` takes whole views away and
+     // maps what stays of them again, and a mapped view is a reservation
+     // until it is committed. A read of title memory in place must not fall
+-    // into that gap (`victory_gpu::title_memory_remapping`).
+-    let _changing = victory_gpu::title_memory_remapping();
++    // into that gap (`victory_gpu::title_memory_remapping`); reads of other
++    // bytes go on.
++    let (from, to) = reach(&physical, base, n * PAGE);
++    let _changing = victory_gpu::title_memory_remapping(from, to - from);
+     unmap(&mut physical, base, n * PAGE);
+     if pages.is_null() {
+         return address;
+@@ -758,7 +760,8 @@
+     let (to, from, len) = (to as usize, from as usize, len as usize);
+     let mut physical = physical();
+     // As in `XMemMapPhysicalPages`: no read in place meets the gap.
+-    let _changing = victory_gpu::title_memory_remapping();
++    let (start, end) = reach(&physical, to, len);
++    let _changing = victory_gpu::title_memory_remapping(start, end - start);
+     unmap(&mut physical, to, len);
+     for k in (0..len).step_by(PAGE) {
+         if from == 0 {
+@@ -881,6 +884,29 @@
+     message
+ }
+ 
++/// Start and end of the bytes whose mapping `unmap(physical, base, len)`
++/// and mapping `[base, base + len)` again change: the range, and the whole
++/// of the views reaching out of it (`unmap` takes them away and maps what
++/// stays of them again). Under the page table's lock, as `unmap` is.
++fn reach(physical: &Physical, base: usize, len: usize) -> (usize, usize) {
++    let end = base.saturating_add(len);
++    if len == 0 {
++        return (base, end); // `unmap` changes nothing
++    }
++    let mut reach = (base, end);
++    // As `unmap` finds them: the view holding `base`, the last starting
++    // inside (views do not overlap).
++    if let Some((&at, &(size, _))) = physical.views.range(..=base).next_back()
++        && at + size > base
++    {
++        reach = (at, end.max(at + size));
++    }
++    if let Some((&at, &(size, _))) = physical.views.range(base + 1..end).next_back() {
++        reach.1 = reach.1.max(at + size);
++    }
++    reach
++}
++
+ /// Returns `[base, base + len)` to placeholders; views reaching past it
+ /// are mapped again outside it.
+ fn unmap(physical: &mut Physical, base: usize, len: usize) {
+@@ -1271,7 +1297,7 @@
+             std::thread::spawn(move || {
+                 let mut reads = 0u64;
+                 while !stop.load(Ordering::Relaxed) {
+-                    let _reading = victory_gpu::title_memory_reading();
++                    let _reading = victory_gpu::title_memory_reading(first, 1);
+                     // SAFETY: the page is mapped whenever no change of
+                     // mapping is under way, and none is while `_reading`
+                     // is held.

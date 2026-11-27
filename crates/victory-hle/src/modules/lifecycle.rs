@@ -268,7 +268,12 @@ extern "system" fn window_proc(
             wm::RemovePropW(hwnd, TITLE_PROC);
         }
         let title = std::mem::transmute::<*mut c_void, wm::WNDPROC>(title);
-        wm::CallWindowProcW(title, hwnd, message, wparam, lparam)
+        let result = wm::CallWindowProcW(title, hwnd, message, wparam, lparam);
+        // The icons the host gave the window (the game's logos) go with it.
+        if message == wm::WM_NCDESTROY {
+            victory_gpu::shell::window_destroyed(hwnd as usize);
+        }
+        result
     }
 }
 

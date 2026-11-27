@@ -97,6 +97,15 @@ pub(crate) fn other_threads() -> Vec<u32> {
     ids
 }
 
+/// Names an address of ours (function, inlined calls, source line), for
+/// [`dump_stacks`]: set by a crate that reads symbols (the GPU layer's).
+static SYMBOLS: std::sync::OnceLock<fn(usize) -> Option<String>> = std::sync::OnceLock::new();
+
+/// Registers [`SYMBOLS`] (once).
+pub fn set_symbolizer(f: fn(usize) -> Option<String>) {
+    let _ = SYMBOLS.set(f);
+}
+
 /// Prints every other thread's stack to stderr. Each thread is suspended
 /// only while its context is read and unwound into a buffer allocated
 /// beforehand (it may hold the heap lock).
@@ -121,8 +130,39 @@ pub fn dump_stacks() {
             name_of(thread),
             locate(start_of(thread))
         );
+        let symbols = SYMBOLS.get();
+        // (Hang watch) Our innermost frame named, and the outermost frame
+        // of ours the thread entered from other code (a title thread: the
+        // entry point it is inside).
+        let (mut innermost, mut entry) = (None, None);
         for (i, pc) in frames.into_iter().enumerate() {
-            eprintln!("    #{i:<2} {}", locate(pc as usize));
+            let at = locate(pc as usize);
+            // Return addresses: the call is the byte before.
+            let name = symbols.and_then(|s| s(if i == 0 { pc as usize } else { (pc as usize).saturating_sub(1) }));
+            if let Some(n) = &name
+                && at.starts_with("victory.exe+")
+            {
+                // The frame's functions, outermost first (inlined calls).
+                let chain: Vec<&str> = n.split(" (").next().unwrap_or(n).split(" > ").collect();
+                let runtime = |s: &&str| ["std::", "core::", "alloc::"].iter().any(|p| s.starts_with(p));
+                if innermost.is_none()
+                    && let Some(ours) = chain.iter().rev().find(|s| !runtime(s))
+                {
+                    // Our innermost function, its line, and the runtime
+                    // call it is in (a lock, a wait), if any.
+                    let line = n.find(" (").map_or("", |i| &n[i..]);
+                    let inner = chain.last().filter(|s| runtime(s)).map_or(String::new(), |s| format!(" in {s}"));
+                    innermost = Some(format!("{ours}{line}{inner}"));
+                }
+                entry = Some(chain[0].to_string());
+            }
+            match name {
+                Some(n) => eprintln!("    #{i:<2} {at}  {n}"),
+                None => eprintln!("    #{i:<2} {at}"),
+            }
+        }
+        if let (Some(inner), Some(entry)) = (innermost, entry) {
+            eprintln!("    = in {inner}, entered at {entry}");
         }
         // SAFETY: we opened it.
         unsafe { CloseHandle(thread) };

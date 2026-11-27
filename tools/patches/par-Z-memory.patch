@@ -1,0 +1,1096 @@
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/draw.rs Z/crates/victory-gpu/src/draw.rs
+--- S/crates/victory-gpu/src/draw.rs	2026-11-25 19:54:13.000000000 +0200
++++ Z/crates/victory-gpu/src/draw.rs	2026-11-25 22:01:15.975886800 +0200
+@@ -1158,6 +1158,28 @@
+                 }
+             }
+             for &(slot, param) in &stage.root_uavs {
++                if slot == victory_shader::emit::SLOT_HEAP_MARKS {
++                    // Ours: where shaders mark the heap slots of the buffer
++                    // views they pick by index and store through. The root
++                    // signature declares it a root descriptor
++                    // (`pipeline/host.rs`); handed to the title's path below
++                    // it was set as a one-view table, which the driver read
++                    // as an address and faulted on (run-9-memory, frame 1660).
++                    let Some(marks) = crate::heap_marks::bind(list, &stage.shader) else {
++                        once!("a shader that stores through buffers it picks by index, and no buffer for its marks: the draw is dropped");
++                        return false;
++                    };
++                    // SAFETY: an open list; the buffer lives as long as the
++                    // process and the list holds it.
++                    unsafe {
++                        if compute {
++                            l.SetComputeRootUnorderedAccessView(param, marks);
++                        } else {
++                            l.SetGraphicsRootUnorderedAccessView(param, marks);
++                        }
++                    }
++                    continue;
++                }
+                 if slot == victory_shader::emit::SLOT_FAULTS {
+                     // Ours: where shaders note the pages they found empty.
+                     if let Some(m) = &memory {
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/ranges.rs Z/crates/victory-gpu/src/ranges.rs
+--- S/crates/victory-gpu/src/ranges.rs	2026-11-25 20:33:24.000000000 +0200
++++ Z/crates/victory-gpu/src/ranges.rs	2026-11-25 21:38:53.351456500 +0200
+@@ -32,7 +32,6 @@
+ 
+     /// Free bytes in all (an upper bound for what [`take`](Self::take)
+     /// can give).
+-    #[cfg(any(test, feature = "diagnostics"))]
+     pub(crate) fn room(&self) -> u64 {
+         self.room
+     }
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/resource.rs Z/crates/victory-gpu/src/resource.rs
+--- S/crates/victory-gpu/src/resource.rs	2026-11-25 20:33:18.000000000 +0200
++++ Z/crates/victory-gpu/src/resource.rs	2026-11-25 22:09:40.535018300 +0200
+@@ -1865,6 +1865,170 @@
+     *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_SWEEP").is_none_or(|v| v != "0"))
+ }
+ 
++/// Whether host copies of textures the title fills that nothing holds are
++/// kept by the card's budget instead of a fixed idle time ([`let_go_idle`]):
++/// kept while the card's memory in use ([`video_memory_net`]) is at or
++/// under the high water mark, and past it the least recently used go down
++/// to the low one ([`water_marks`]). A short idle time let go of 47 GB of
++/// copies in seven minutes of run-6, 17 GB of which were made again.
++/// `VICTORY_TEXTURE_LRU=0`: the idle time, as before.
++#[cfg(windows)]
++fn lru_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_LRU").is_none_or(|v| v != "0"))
++}
++
++/// Whether idle copies placed in draining texture heaps ([`TextureHeap`])
++/// go at once, to empty the heap (made again elsewhere on their next use).
++/// `VICTORY_HEAP_DRAIN_EVICT=0`: they stay until the title lets them go.
++#[cfg(windows)]
++fn drain_evict_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        drain_on() && std::env::var_os("VICTORY_HEAP_DRAIN_EVICT").is_none_or(|v| v != "0")
++    })
++}
++
++/// The least time a copy nothing holds is kept under the budget rule: a
++/// thread that was handed the host texture ([`host_resource`]) and has not
++/// recorded its use yet is protected by it (as by the shortest idle time).
++#[cfg(windows)]
++const LRU_FLOOR_MS: u64 = 1_000;
++
++/// The percentages of the card's budget of the high and low water marks:
++/// `VICTORY_VRAM_HIGH_PCT` (85) and `VICTORY_VRAM_LOW_PCT` (75), from 10 to
++/// 99 each, the low one at most the high one.
++fn marks_pct() -> (u64, u64) {
++    static PCT: std::sync::OnceLock<(u64, u64)> = std::sync::OnceLock::new();
++    *PCT.get_or_init(|| {
++        let read = |name: &str, default: u64| {
++            std::env::var(name)
++                .ok()
++                .and_then(|v| v.trim().parse::<u64>().ok())
++                .map_or(default, |p| p.clamp(10, 99))
++        };
++        marks_of(read("VICTORY_VRAM_HIGH_PCT", 85), read("VICTORY_VRAM_LOW_PCT", 75))
++    })
++}
++
++/// High and low percentages as set, the low one at most the high one.
++fn marks_of(high: u64, low: u64) -> (u64, u64) {
++    (high, low.min(high))
++}
++
++/// The high and low water marks in bytes of a budget of `budget` bytes.
++pub(crate) fn water_marks(budget: u64) -> (u64, u64) {
++    let (high, low) = marks_pct();
++    (budget / 100 * high, budget / 100 * low)
++}
++
++/// Of `candidates` (key, last use as `crate::host::moment`, bytes), sorted
++/// here least recently used first, how many from the front go for room:
++/// none while `used` is at or under `high`; past it, as many as take
++/// `used` down to `low`.
++fn for_room(candidates: &mut [(usize, u64, u64)], used: u64, high: u64, low: u64) -> usize {
++    if used <= high {
++        return 0;
++    }
++    candidates.sort_unstable_by_key(|&(key, at, _)| (at, key));
++    let mut left = used;
++    let mut n = 0;
++    for &(_, _, bytes) in candidates.iter() {
++        if left <= low {
++            break;
++        }
++        left = left.saturating_sub(bytes);
++        n += 1;
++    }
++    n
++}
++
++/// The card's bytes a host copy holds: its own, or the tiles given to it.
++#[cfg(windows)]
++fn copy_bytes(host: &HostTexture) -> u64 {
++    host.tiled.as_ref().map_or(host.bytes, crate::tiles::Tiled::given_bytes)
++}
++
++/// The budget rule's counts: copies nothing holds kept past the old idle
++/// time now and their bytes; let go for room since the start and their
++/// bytes; sweeps that found the card past the high mark; copies let go
++/// from draining heaps since the start and their bytes.
++pub(crate) static LRU: [std::sync::atomic::AtomicU64; 7] = [const { std::sync::atomic::AtomicU64::new(0) }; 7];
++
++/// When copies were last let go for room (`crate::host::now_ms`) and their
++/// bytes: taken off the card's use for two seconds ([`recent_room`]).
++static RECENT_ROOM: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
++
++#[cfg(windows)]
++fn recent_room() -> u64 {
++    use std::sync::atomic::Ordering::Relaxed;
++    let at = RECENT_ROOM[0].load(Relaxed);
++    if at != 0 && crate::host::now_ms() < at + 2_000 { RECENT_ROOM[1].load(Relaxed) } else { 0 }
++}
++
++/// Once every five seconds, from the sweep: one line of what the layer
++/// holds and gave back. `VICTORY_HOUSEKEEPING_LOG=0`: none.
++#[cfg(windows)]
++fn housekeeping() {
++    use std::sync::atomic::Ordering::Relaxed;
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    static LAST: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++    if !*ON.get_or_init(|| std::env::var_os("VICTORY_HOUSEKEEPING_LOG").is_none_or(|v| v != "0")) {
++        return;
++    }
++    let now = crate::host::now_ms();
++    let last = LAST.load(Relaxed);
++    if now < last + 5_000 || LAST.compare_exchange(last, now, Relaxed, Relaxed).is_err() {
++        return;
++    }
++    let mb = |b: u64| b >> 20;
++    // Let go for room and made again, at the line before.
++    static BEFORE: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
++    let [room_now, again_now] = [LRU[3].load(Relaxed), KINDS[5].load(Relaxed)];
++    let room_since = room_now.saturating_sub(BEFORE[0].swap(room_now, Relaxed));
++    let again_since = again_now.saturating_sub(BEFORE[1].swap(again_now, Relaxed));
++    let [budget, used] = video_memory_net().map_or([0, 0], |v| [v[0], v[1]]);
++    let (high, low) = water_marks(budget);
++    let (alive, draining) = {
++        let heaps = TEXTURE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
++        (heaps.iter().flatten().count(), heaps.iter().flatten().filter(|h| h.draining).count())
++    };
++    let [windows, window_bytes] = crate::shadow::windows_alive();
++    let [_, windows_gone_bytes] = crate::shadow::windows_let_go();
++    let free_ram = crate::host::available_physical_ram().map_or(0, |b| b >> 20);
++    let [tiles_back, tiles_back_bytes] = crate::tiles::taken_back();
++    tracing::info!(
++        "memory housekeeping: card {} MB in use of {} MB (high {} MB, low {} MB); texture copies alive {} MB, kept past \
++         the idle time {} ({} MB), let go for room {} MB ({} MB in the last 5 s), made again {} MB ({} MB in the last 5 s), \
++         let go from draining heaps {} MB; texture heaps \
++         {} alive, {} draining, {} released ({} of them drained, {} MB given back); level tiles taken back {} ({} MB); \
++         windows {} alive {} MB, let go {} MB; free RAM {} MB",
++        mb(used),
++        mb(budget),
++        mb(high),
++        mb(low),
++        mb(KINDS[1].load(Relaxed) + crate::tiles::given_total()),
++        LRU[0].load(Relaxed),
++        mb(LRU[1].load(Relaxed)),
++        mb(room_now),
++        mb(room_since),
++        mb(again_now),
++        mb(again_since),
++        mb(LRU[6].load(Relaxed)),
++        alive,
++        draining,
++        TEXTURES_MADE[3].load(Relaxed),
++        DRAINED[1].load(Relaxed),
++        mb(TEXTURES_MADE[3].load(Relaxed) * TEXTURE_HEAP),
++        tiles_back,
++        mb(tiles_back_bytes),
++        windows,
++        mb(window_bytes),
++        mb(windows_gone_bytes),
++        free_ram,
++    );
++}
++
+ /// Lets go of the host copies of textures the title fills that nothing
+ /// names any more: placed textures were never released (one host texture
+ /// per address and description ever viewed: 18,639 of them, 2.5 GB, after
+@@ -1877,7 +2041,12 @@
+ /// - only the host copy holds the host texture: no descriptor slot views
+ ///   it (a slot keeps what it views, `HostHeap::kept`), so no shader can
+ ///   read it through a slot made earlier, by a table or by an index;
+-/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames.
++/// - nothing asked for it for `IDLE_MS` and `IDLE_FRAMES` frames; with
++///   the budget rule ([`lru_on`], the default) instead: the card is past
++///   its high water mark and it is among the least recently used (asked
++///   for, or held by a list or a slot at a sweep), or it lies in a
++///   draining heap ([`drain_on`]), and nothing asked for it for a second.
++///   A copy whose placed source the title unmapped goes at once either way.
+ ///
+ /// The next use makes the host copy anew and uploads the title's memory
+ /// again (its staging state goes with it). The title resource stays: its
+@@ -1897,10 +2066,22 @@
+     // host copies below is set to).
+     sweep_leaving();
+     trim_texture_heaps(crate::host::vram_idle_ms(video_memory_net()), IDLE_FRAMES);
++    housekeeping();
+     if !sweeping() {
+         return;
+     }
+-    let idle_ms = crate::host::vram_idle_ms(video_memory_net());
++    let net = video_memory_net();
++    let idle_ms = crate::host::vram_idle_ms(net);
++    // The budget rule ([`lru_on`]): a copy nothing holds is kept while the
++    // card is under its high water mark, whatever its idle time; past it
++    // the least recently used go down to the low mark, after the loop.
++    let lru = lru_on() && net.is_some_and(|v| v[0] > 0);
++    // Copies placed in draining heaps ([`drain_evict_on`]) go once idle.
++    let draining = if lru && drain_evict_on() { draining_heaps() } else { Vec::new() };
++    // Copies the budget rule may let go for room: (texture, last use,
++    // bytes); and the copies let go from draining heaps, their bytes.
++    let mut candidates: Vec<(usize, u64, u64)> = Vec::new();
++    let mut drained = [0u64; 2];
+     // What the title unmapped since the last sweep ([`note_unmapped`]): a
+     // placed texture filled from there has lost its source and goes now
+     // rather than after the idle time.
+@@ -1931,12 +2112,37 @@
+         };
+         let gone = {
+             let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
+-            let idle = made.as_ref().is_some_and(|(host, _)| {
+-                (source_gone
+-                    || crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES))
+-                    && std::sync::Arc::strong_count(host) == 1
+-                    && crate::host::references(&host.texture) == 1
+-            });
++            let idle = if lru {
++                made.as_ref().is_some_and(|(host, _)| {
++                    let free = std::sync::Arc::strong_count(host) == 1
++                        && crate::host::references(&host.texture) == 1;
++                    let used = r.host.used.load(Relaxed);
++                    if !free {
++                        // Held by a list or a slot: in use now, for the
++                        // order in which copies go for room.
++                        r.host.used.store(crate::host::moment(), Relaxed);
++                        false
++                    } else if source_gone {
++                        true
++                    } else if !crate::host::long_ago(used, LRU_FLOOR_MS, IDLE_FRAMES) {
++                        false
++                    } else if host.cut.as_ref().is_some_and(|c| draining.binary_search(&c.heap).is_ok()) {
++                        drained[0] += 1;
++                        drained[1] += host.bytes;
++                        true
++                    } else {
++                        candidates.push((at, used, copy_bytes(host)));
++                        false
++                    }
++                })
++            } else {
++                made.as_ref().is_some_and(|(host, _)| {
++                    (source_gone
++                        || crate::host::long_ago(r.host.used.load(Relaxed), idle_ms, IDLE_FRAMES))
++                        && std::sync::Arc::strong_count(host) == 1
++                        && crate::host::references(&host.texture) == 1
++                })
++            };
+             if idle {
+                 // Under the lock: the next use must not find the staging
+                 // state of the texture let go (it says "uploaded").
+@@ -1958,6 +2164,68 @@
+             crate::host::retire(host);
+         }
+     }
++    if lru && let Some([budget, used, ..]) = net {
++        let (high, low) = water_marks(budget);
++        // What was let go for room just before may not be off the count
++        // the system gives yet (retired, ranges on their way back).
++        let used = used.saturating_sub(recent_room());
++        if used > high {
++            LRU[4].fetch_add(1, Relaxed);
++        }
++        let n = for_room(&mut candidates, used, high, low);
++        let mut room = [0u64; 2];
++        for &(at, _, _) in &candidates[..n] {
++            // SAFETY: as above; `all` is still held.
++            let r = unsafe { &*(at as *const Resource) };
++            let gone = {
++                let mut made = r.host.made.lock().unwrap_or_else(|e| e.into_inner());
++                // Looked at again under the lock: asked for or held since?
++                let still = made.as_ref().is_some_and(|(host, _)| {
++                    crate::host::long_ago(r.host.used.load(Relaxed), LRU_FLOOR_MS, IDLE_FRAMES)
++                        && std::sync::Arc::strong_count(host) == 1
++                        && crate::host::references(&host.texture) == 1
++                });
++                if still {
++                    crate::texture::unstage(at as This);
++                    made.take()
++                } else {
++                    None
++                }
++            };
++            if let Some((host, _)) = gone {
++                let b = copy_bytes(&host);
++                r.host.gone.store(true, Relaxed);
++                KINDS[2].fetch_add(1, Relaxed);
++                KINDS[3].fetch_add(host.bytes, Relaxed);
++                room[0] += 1;
++                room[1] += b;
++                went += 1;
++                bytes += host.bytes;
++                if first.is_none() {
++                    first = Some(at);
++                }
++                crate::host::retire(host);
++            }
++        }
++        // The copies kept past the old idle time ([`crate::host::vram_idle_ms`]).
++        let (mut kept, mut kept_bytes) = (0u64, 0u64);
++        for &(_, used, b) in &candidates[n..] {
++            if crate::host::long_ago(used, idle_ms, IDLE_FRAMES) {
++                kept += 1;
++                kept_bytes += b;
++            }
++        }
++        LRU[0].store(kept, Relaxed);
++        LRU[1].store(kept_bytes, Relaxed);
++        LRU[2].fetch_add(room[0], Relaxed);
++        LRU[3].fetch_add(room[1], Relaxed);
++        LRU[5].fetch_add(drained[0], Relaxed);
++        LRU[6].fetch_add(drained[1], Relaxed);
++        if room[0] > 0 {
++            RECENT_ROOM[0].store(crate::host::now_ms(), Relaxed);
++            RECENT_ROOM[1].store(room[1], Relaxed);
++        }
++    }
+     if went > 0 {
+         crate::host::trail(|| {
+             format!(
+@@ -2335,6 +2603,11 @@
+     heap: windows::Win32::Graphics::Direct3D12::ID3D12Heap,
+     ranges: crate::ranges::Ranges,
+     empty_since: u64,
++    /// Nothing new is placed in it ([`drain_on`]): its textures leave as
++    /// the title turns them over and it goes when it is empty.
++    draining: bool,
++    /// Since when less than [`sparse_pct`] of it is used (`moment`; 0: more).
++    sparse_since: u64,
+ }
+ // SAFETY: a free-threaded D3D12 object.
+ #[cfg(windows)]
+@@ -2351,6 +2624,95 @@
+ pub(crate) static TEXTURES_MADE: [std::sync::atomic::AtomicU64; 4] =
+     [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+ 
++/// Since the start: texture heaps that began draining, and draining heaps
++/// released once empty ([`trim_texture_heaps`]).
++pub(crate) static DRAINED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
++
++/// Whether a texture heap that is mostly free stops taking textures
++/// ("draining") so that it empties and goes: when less than
++/// [`sparse_pct`] of it is used, and the card is past its low water mark
++/// or the heap has been that sparse for 30 seconds; and new textures go to
++/// the fullest heap they fit ([`heap_order`]). Run-6: 23 heaps, 3 GB of
++/// them free in holes, none ever empty.
++/// shortcut: off unless `VICTORY_HEAP_DRAIN=1` until a game run has shown
++/// it safe (best fit reuses ranges given back far more often than the
++/// newest-heap-first order, and run-10 lost the device with it on, cause
++/// not found); off: the newest heap first, nothing drains, as before.
++#[cfg(windows)]
++fn drain_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_DRAIN").is_some_and(|v| v == "1"))
++}
++
++/// Under what share of its bytes in use a heap counts as sparse, in
++/// percent: `VICTORY_HEAP_DRAIN_PCT` (10; 1 to 50).
++fn sparse_pct() -> u64 {
++    static PCT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    *PCT.get_or_init(|| {
++        std::env::var("VICTORY_HEAP_DRAIN_PCT")
++            .ok()
++            .and_then(|v| v.trim().parse::<u64>().ok())
++            .map_or(10, |p| p.clamp(1, 50))
++    })
++}
++
++/// A heap's next draining state and sparse-since moment. `sparse`: under
++/// the share in use; `fits_elsewhere`: what is in it would fit in what the
++/// other heaps that take textures have free; `over_low`: the card is past
++/// its low mark; `long`: whether a moment lies 30 seconds back. Once
++/// draining, a heap drains until it goes.
++fn drain_next(
++    draining: bool,
++    sparse_since: u64,
++    sparse: bool,
++    fits_elsewhere: bool,
++    over_low: bool,
++    now: u64,
++    long: impl Fn(u64) -> bool,
++) -> (bool, u64) {
++    if draining {
++        return (true, sparse_since);
++    }
++    if !sparse {
++        return (false, 0);
++    }
++    let since = if sparse_since == 0 { now } else { sparse_since };
++    (fits_elsewhere && (over_low || long(since)), since)
++}
++
++/// The order in which heaps are tried for a texture of `len` bytes, of
++/// `heaps` (index, free bytes, draining): the fullest that may fit first
++/// (so that the sparse ones drain), heaps that take textures before
++/// draining ones, which are tried only when `tight` (no room on the card
++/// for another heap); ties by index.
++fn heap_order(heaps: &[(usize, u64, bool)], len: u64, tight: bool) -> Vec<usize> {
++    let mut order: Vec<(bool, u64, usize)> = heaps
++        .iter()
++        .filter(|&&(_, free, draining)| free >= len && (!draining || tight))
++        .map(|&(index, free, draining)| (draining, free, index))
++        .collect();
++    order.sort_unstable();
++    order.into_iter().map(|(_, _, index)| index).collect()
++}
++
++/// The indices of the draining heaps that are still sparse, in order: the
++/// ones whose last copies the sweep lets go ([`drain_evict_on`]). (A
++/// draining heap filled again while the card had no room for another heap
++/// is left to the title's turnover: its copies would only come back.)
++#[cfg(windows)]
++fn draining_heaps() -> Vec<usize> {
++    let heaps = TEXTURE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
++    heaps
++        .iter()
++        .enumerate()
++        .filter_map(|(i, h)| {
++            h.as_ref()
++                .is_some_and(|h| h.draining && (TEXTURE_HEAP - h.ranges.room()) * 100 < TEXTURE_HEAP * sparse_pct())
++                .then_some(i)
++        })
++        .collect()
++}
++
+ /// Bytes of the texture heaps that no texture is placed in. The system
+ /// counts a heap whole as the card's memory in use, whatever is placed in
+ /// it: [`video_memory_net`] takes these off for every decision made by
+@@ -2466,17 +2828,42 @@
+ fn trim_texture_heaps(idle_ms: u64, idle_frames: u64) {
+     use std::sync::atomic::Ordering::Relaxed;
+     let mut went = Vec::new();
++    // Draining ([`drain_on`]): whether the card is past its low mark.
++    let over_low = drain_on()
++        && video_memory_net().is_some_and(|[budget, used, ..]| budget > 0 && used > water_marks(budget).1);
++    let mut began = 0u64;
++    let mut drained = 0u64;
+     {
+         let mut heaps = TEXTURE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
++        if drain_on() {
++            let now = crate::host::moment().max(1);
++            // Free bytes of the heaps that take textures.
++            let mut open: u64 = heaps.iter().flatten().filter(|h| !h.draining).map(|h| h.ranges.room()).sum();
++            for h in heaps.iter_mut().flatten() {
++                let room = h.ranges.room();
++                let used = TEXTURE_HEAP - room;
++                let sparse = used * 100 < TEXTURE_HEAP * sparse_pct();
++                let elsewhere = open.saturating_sub(room) >= used;
++                let was = h.draining;
++                (h.draining, h.sparse_since) = drain_next(was, h.sparse_since, sparse, elsewhere, over_low, now, |at| {
++                    crate::host::long_ago(at, 30_000, 0)
++                });
++                if h.draining && !was {
++                    began += 1;
++                    open = open.saturating_sub(room);
++                }
++            }
++        }
+         for slot in heaps.iter_mut() {
+             let idle = slot.as_ref().is_some_and(|h| {
+                 h.ranges.whole()
+                     && h.empty_since != 0
+-                    && crate::host::long_ago(h.empty_since, idle_ms, idle_frames)
++                    && (h.draining || crate::host::long_ago(h.empty_since, idle_ms, idle_frames))
+             });
+             if idle && let Some(heap) = slot.take() {
+                 HEAP_FREE.fetch_sub(TEXTURE_HEAP, Relaxed);
+                 TEXTURES_MADE[3].fetch_add(1, Relaxed);
++                drained += u64::from(heap.draining);
+                 went.push(heap.heap);
+             }
+         }
+@@ -2484,6 +2871,17 @@
+             heaps.pop();
+         }
+     }
++    if began > 0 || drained > 0 {
++        DRAINED[0].fetch_add(began, Relaxed);
++        DRAINED[1].fetch_add(drained, Relaxed);
++        tracing::info!(
++            "texture heaps draining (VICTORY_HEAP_DRAIN): {began} began draining, {drained} drained heaps released \
++             ({} MB given back to the card); since the start {} began, {} released",
++            (drained * TEXTURE_HEAP) >> 20,
++            DRAINED[0].load(Relaxed),
++            DRAINED[1].load(Relaxed)
++        );
++    }
+     if !went.is_empty() {
+         let n = went.len();
+         crate::host::trail(|| {
+@@ -2553,13 +2951,40 @@
+     sweep_leaving();
+     let (heap, cut) = {
+         let mut heaps = TEXTURE_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+-        // The newest heap first: the older ones are full but for holes.
+-        let found = heaps
+-            .iter_mut()
+-            .enumerate()
+-            .rev()
+-            .filter_map(|(i, h)| h.as_mut().map(|h| (i, h)))
+-            .find_map(|(i, h)| h.ranges.take(len, align).map(|offset| (i, offset)));
++        let found = if drain_on() {
++            // The fullest heap it fits first, then the first range there
++            // that fits ([`heap_order`]): sparse heaps empty and go. Draining
++            // heaps only when the card has no room for another heap.
++            let rooms: Vec<(usize, u64, bool)> = heaps
++                .iter()
++                .enumerate()
++                .filter_map(|(i, h)| h.as_ref().map(|h| (i, h.ranges.room(), h.draining)))
++                .collect();
++            let mut try_in = |order: Vec<usize>| {
++                order.into_iter().find_map(|i| {
++                    let h = heaps[i].as_mut()?;
++                    h.ranges.take(len, align).map(|offset| (i, offset))
++                })
++            };
++            try_in(heap_order(&rooms, len, false)).or_else(|| {
++                // (The system asked only when a draining heap could help.)
++                let some = rooms.iter().any(|&(_, free, draining)| draining && free >= len);
++                let tight = some
++                    && host.video_memory().is_some_and(|[budget, used, ..]| {
++                        net_use(used, HEAP_FREE.load(std::sync::atomic::Ordering::Relaxed)) + TEXTURE_HEAP
++                            >= water_marks(budget).0
++                    });
++                if tight { try_in(heap_order(&rooms, len, true)) } else { None }
++            })
++        } else {
++            // The newest heap first: the older ones are full but for holes.
++            heaps
++                .iter_mut()
++                .enumerate()
++                .rev()
++                .filter_map(|(i, h)| h.as_mut().map(|h| (i, h)))
++                .find_map(|(i, h)| h.ranges.take(len, align).map(|offset| (i, offset)))
++        };
+         let index = match found {
+             Some((index, offset)) => (index, offset),
+             None => {
+@@ -2600,6 +3025,8 @@
+                     heap,
+                     ranges,
+                     empty_since: 0,
++                    draining: false,
++                    sparse_since: 0,
+                 };
+                 if index == heaps.len() {
+                     heaps.push(Some(made));
+@@ -2819,6 +3246,82 @@
+     }
+ }
+ 
++#[cfg(test)]
++mod memory_rule_tests {
++    use super::{drain_next, for_room, heap_order, marks_of};
++
++    /// Under the high mark nothing goes; past it the least recently used
++    /// go first, down to the low mark and no further.
++    #[test]
++    fn copies_go_for_room_least_recently_used_first_down_to_the_low_mark() {
++        // (texture, last use, bytes)
++        let mut c = vec![(1, 50, 10), (2, 10, 10), (3, 30, 10), (4, 20, 10)];
++        assert_eq!(for_room(&mut c, 85, 85, 75), 0, "at the high mark: kept");
++        assert_eq!(for_room(&mut c, 60, 85, 75), 0);
++        let n = for_room(&mut c, 90, 85, 75);
++        assert_eq!(n, 2, "90 -> 80 -> 70: two go");
++        assert_eq!(c[..n].iter().map(|c| c.0).collect::<Vec<_>>(), [2, 4], "oldest use first");
++        // Not enough to reach the low mark: all go, oldest first.
++        let mut c = vec![(7, 5, 1), (8, 1, 1)];
++        assert_eq!(for_room(&mut c, 100, 85, 75), 2);
++        assert_eq!(c[0].0, 8);
++        // The same use: by key, so the order is stable.
++        let mut c = vec![(9, 5, 20), (3, 5, 20)];
++        assert_eq!(for_room(&mut c, 90, 85, 75), 1);
++        assert_eq!(c[0].0, 3);
++        // Copies of no bytes (no tiles yet) do not stop the count.
++        let mut c = vec![(1, 1, 0), (2, 2, 30)];
++        assert_eq!(for_room(&mut c, 100, 85, 75), 2);
++    }
++
++    /// Draining heaps (and best-fit placement with them) are opt-in.
++    #[test]
++    fn heap_draining_is_off_unless_asked_for() {
++        if std::env::var_os("VICTORY_HEAP_DRAIN").is_none() {
++            assert!(!super::drain_on() && !super::drain_evict_on());
++        }
++    }
++
++    #[test]
++    fn the_low_mark_is_never_over_the_high_one() {
++        assert_eq!(marks_of(85, 75), (85, 75));
++        assert_eq!(marks_of(70, 80), (70, 70));
++    }
++
++    /// The fullest heap that may fit first; draining heaps only when tight.
++    #[test]
++    fn textures_go_to_the_fullest_heap_that_fits() {
++        // (index, free bytes, draining)
++        let heaps = [(0, 200, false), (1, 50, false), (2, 10, false), (3, 30, true), (4, 120, false)];
++        assert_eq!(heap_order(&heaps, 40, false), [1, 4, 0], "fullest first, too full and draining left out");
++        assert_eq!(heap_order(&heaps, 20, true), [1, 4, 0, 3], "draining ones last, when tight");
++        assert_eq!(heap_order(&heaps, 300, true), Vec::<usize>::new());
++        // Equal room: by index.
++        assert_eq!(heap_order(&[(5, 64, false), (2, 64, false)], 1, false), [2, 5]);
++    }
++
++    /// A sparse heap drains when the card is past its low mark or it has
++    /// been sparse long enough, if what it holds fits elsewhere; once
++    /// draining it stays so; a heap no longer sparse forgets since when.
++    #[test]
++    fn sparse_heaps_drain_by_pressure_or_time() {
++        let never = |_: u64| false;
++        let always = |_: u64| true;
++        // Not sparse: nothing, and the moment is forgotten.
++        assert_eq!(drain_next(false, 7, false, true, true, 9, always), (false, 0));
++        // Sparse, card under its low mark, not long: noted, not draining.
++        assert_eq!(drain_next(false, 0, true, true, false, 9, never), (false, 9));
++        // Long enough: draining, the first moment kept.
++        assert_eq!(drain_next(false, 9, true, true, false, 20, |at| at == 9), (true, 9));
++        // Past the low mark: at once.
++        assert_eq!(drain_next(false, 0, true, true, true, 9, never), (true, 9));
++        // What it holds does not fit elsewhere: not draining.
++        assert_eq!(drain_next(false, 0, true, false, true, 9, always), (false, 9));
++        // Draining stays draining, sparse or not.
++        assert_eq!(drain_next(true, 9, false, false, false, 30, never), (true, 9));
++    }
++}
++
+ /// The host copy of title texture `this` if it is made and was made
+ /// without memory of its own (`crate::tiles`); it is not made here.
+ #[cfg(windows)]
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/shadow.rs Z/crates/victory-gpu/src/shadow.rs
+--- S/crates/victory-gpu/src/shadow.rs	2026-11-25 20:51:04.000000000 +0200
++++ Z/crates/victory-gpu/src/shadow.rs	2026-11-25 21:41:21.018164800 +0200
+@@ -82,6 +82,10 @@
+     /// bits together if both); 0 for every other copy. What is copied back
+     /// from such a copy is counted for [`exact_line`].
+     raw_own: AtomicU8,
++    /// Title buffers that use this window as their copy ([`Shadow::add_user`]):
++    /// a window with any is in use and never let go as idle. 0 for every
++    /// copy that nothing registers on.
++    users: std::sync::atomic::AtomicU32,
+ }
+ 
+ /// What a copy in the card's memory ([`cards`]) has beside the buffer
+@@ -2327,6 +2331,35 @@
+     }
+ }
+ 
++#[cfg(test)]
++mod window_idle_tests {
++    use super::{window_free, window_idle_ms};
++
++    /// A window goes only when the table alone holds it and no title
++    /// buffer is registered on it as its copy.
++    #[test]
++    fn a_window_with_users_is_in_use() {
++        assert!(window_free(1, 0));
++        assert!(!window_free(2, 0), "a list or a folded buffer's entry holds it");
++        assert!(!window_free(1, 1), "a buffer uses it as its copy");
++        assert!(!window_free(3, 2));
++    }
++
++    /// 20 seconds by default, 5 under 3 GB of free memory, 2 under 2 GB;
++    /// 0 keeps the old idle time of the PC's caches.
++    #[test]
++    fn the_idle_time_shortens_when_memory_runs_low() {
++        const GIB: u64 = 1 << 30;
++        assert_eq!(window_idle_ms(20, Some(8 * GIB)), 20_000);
++        assert_eq!(window_idle_ms(20, None), 20_000);
++        assert_eq!(window_idle_ms(20, Some(3 * GIB)), 20_000);
++        assert_eq!(window_idle_ms(20, Some(3 * GIB - 1)), 5_000);
++        assert_eq!(window_idle_ms(20, Some(GIB)), 2_000);
++        assert_eq!(window_idle_ms(3, Some(GIB / 2 * 5)), 3_000, "a shorter setting stays");
++        assert_eq!(window_idle_ms(0, Some(8 * GIB)), crate::host::ram_idle_ms(Some(8 * GIB)));
++    }
++}
++
+ /// Copies of windows outside buffers let go since the start, and their
+ /// bytes.
+ static LET_GO: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+@@ -2406,11 +2439,11 @@
+         if map.is_empty() {
+             return;
+         }
+-        let idle_ms = crate::host::ram_idle_ms(crate::host::available_physical_ram());
++        let idle_ms = window_idle_ms(window_idle_s(), crate::host::available_physical_ram());
+         let idle: Vec<(u64, u64)> = map
+             .iter()
+             .filter(|(_, s)| {
+-                Arc::strong_count(s) == 1
++                window_free(Arc::strong_count(s), s.users.load(Ordering::Relaxed))
+                     && crate::host::long_ago(s.used.load(Ordering::Relaxed), idle_ms, IDLE_FRAMES)
+                     && crate::host::references(&s.buffer) == 1
+             })
+@@ -2433,6 +2466,55 @@
+     }
+ }
+ 
++/// The idle time of windows outside buffers in seconds:
++/// `VICTORY_WINDOW_IDLE_S` (20; 0: the idle time of the PC's other caches,
++/// `crate::host::ram_idle_ms`, as before).
++fn window_idle_s() -> u64 {
++    static S: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    *S.get_or_init(|| {
++        std::env::var("VICTORY_WINDOW_IDLE_S")
++            .ok()
++            .and_then(|v| v.trim().parse::<u64>().ok())
++            .map_or(20, |s| s.min(3600))
++    })
++}
++
++/// The idle time in milliseconds after which a window nothing holds goes,
++/// for a setting of `seconds` ([`window_idle_s`]) and `avail` bytes of free
++/// physical memory (asked once a second, by the sweep): the setting, or
++/// under 3 GB free 5 seconds (2 under 2 GB, as the other caches).
++fn window_idle_ms(seconds: u64, avail: Option<u64>) -> u64 {
++    const GIB: u64 = 1 << 30;
++    if seconds == 0 {
++        return crate::host::ram_idle_ms(avail);
++    }
++    let set = seconds * 1000;
++    match avail {
++        Some(avail) if avail < 3 * GIB => set.min(5_000).min(crate::host::ram_idle_ms(Some(avail))),
++        _ => set,
++    }
++}
++
++/// Whether a window may go as far as its holders say: only the table of
++/// windows holds it (`strong`: its count; a title buffer folded into it
++/// holds it too), and no title buffer registered on it as its copy.
++fn window_free(strong: usize, users: u32) -> bool {
++    strong == 1 && users == 0
++}
++
++/// Windows outside buffers alive (each once) and their bytes.
++pub(crate) fn windows_alive() -> [u64; 2] {
++    let loose = LOOSE.lock().unwrap_or_else(|e| e.into_inner());
++    let mut seen = std::collections::HashSet::new();
++    let bytes: u64 = loose.values().filter(|s| seen.insert(Arc::as_ptr(s) as usize)).map(|s| s.len).sum();
++    [seen.len() as u64, bytes]
++}
++
++/// Windows outside buffers let go since the start, and their bytes.
++pub(crate) fn windows_let_go() -> [u64; 2] {
++    [LET_GO[0].load(Ordering::Relaxed), LET_GO[1].load(Ordering::Relaxed)]
++}
++
+ /// For the memory line: host copies alive and their bytes, of them the
+ /// windows of memory outside buffers and their bytes, and the snapshot
+ /// buffers kept for reuse and the bytes they reserve.
+@@ -2470,6 +2552,19 @@
+ unsafe impl Sync for Shadow {}
+ 
+ impl Shadow {
++    /// A title buffer now uses this copy (a window) as its own: it is not
++    /// let go as idle until every such user is gone ([`Shadow::drop_user`]).
++    #[allow(dead_code)]
++    pub(crate) fn add_user(&self) {
++        self.users.fetch_add(1, Ordering::Relaxed);
++    }
++
++    /// A user registered with [`Shadow::add_user`] is gone.
++    #[allow(dead_code)]
++    pub(crate) fn drop_user(&self) {
++        let _ = self.users.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1));
++    }
++
+     /// Where the title buffer starts (`crate::census`).
+     pub(crate) fn title_start(&self) -> u64 {
+         self.start
+@@ -2562,6 +2657,7 @@
+             window: false,
+             place: None,
+             raw_own: AtomicU8::new(0),
++            users: std::sync::atomic::AtomicU32::new(0),
+         }
+     }
+ 
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/tiles.rs Z/crates/victory-gpu/src/tiles.rs
+--- S/crates/victory-gpu/src/tiles.rs	2026-11-25 19:11:21.000000000 +0200
++++ Z/crates/victory-gpu/src/tiles.rs	2026-11-25 22:09:40.535018300 +0200
+@@ -38,10 +38,12 @@
+ //!   that is held and has tiles ([`show_from`], `descriptor/host.rs`
+ //!   `make`), and the slots of a texture are made again when that level
+ //!   changes (`HostHeap::texture_views_remade`).
+-//! - shortcut: tiles are not taken back while the host copy lives. A level
+-//!   the title lets go of, or that turns out to be the next texture's,
+-//!   keeps its tiles; it is hidden by the views and written with zeros at
+-//!   the next upload. Its tiles go back when the host copy does.
++//! - A level the title lets go of, or that turns out to be the next
++//!   texture's, is hidden by the views; at the next upload its tiles are
++//!   kept, written with zeros, until the host copy goes; with
++//!   `VICTORY_LEVELS_GIVE_BACK=1` they are taken back at the next upload
++//!   (`Tiled::take_back_locked`).
++//!   shortcut: not for a texture the card itself wrote or has a claim on.
+ //!
+ //! Only for a texture the title places in memory and fills, two-dimensional,
+ //! one layer, more than one level, of [`floor`] bytes or more, whose memory
+@@ -237,14 +239,55 @@
+     }
+ }
+ 
++/// Since the start: levels whose tiles were taken back while their
++/// texture lived ([`Tiled::take_back_locked`]), and those tiles' bytes.
++static TAKEN_BACK: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
++
++/// [`TAKEN_BACK`], for the housekeeping line.
++pub(crate) fn taken_back() -> [u64; 2] {
++    [TAKEN_BACK[0].load(Ordering::Relaxed), TAKEN_BACK[1].load(Ordering::Relaxed)]
++}
++
++/// Whether the tiles of levels the title no longer holds are taken back
++/// while the host copy lives, and the pool's heaps that are then all free
++/// go back to the card: run-6 gave back none in seven minutes.
++/// shortcut: off unless `VICTORY_LEVELS_GIVE_BACK=1`. Not shown safe: a
++/// card copy into the texture recorded while a level still had tiles and
++/// submitted after an upload took them back lands in fresh tiles, and
++/// run-10 lost the device with it on (cause not found). Off: tiles are
++/// kept until the host copy goes, as before.
++fn give_back_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_LEVELS_GIVE_BACK").is_some_and(|v| v == "1"))
++}
++
++/// Runs of the pool's heaps taken back from a texture's levels: given back
++/// to the pool when dropped, which [`Tiled::take_back_locked`] has wait
++/// for the submissions in the air.
++struct Returning(Vec<(usize, u32, u32)>);
++
++impl Drop for Returning {
++    fn drop(&mut self) {
++        let mut by_heap: std::collections::BTreeMap<usize, Vec<(u32, u32)>> = std::collections::BTreeMap::new();
++        for &(index, start, tiles) in &self.0 {
++            by_heap.entry(index).or_default().push((start, tiles));
++        }
++        for (index, runs) in by_heap {
++            give_back(index, &runs);
++        }
++    }
++}
++
+ /// What is given so far to one texture.
+ struct Given {
+     /// Per level with tiles of its own: whether it has them.
+     levels: Vec<bool>,
+     /// Whether the small levels the card packs together have theirs.
+     packed: bool,
+-    /// The runs taken: the heap's place, first tile, tiles.
+-    runs: Vec<(usize, u32, u32)>,
++    /// The runs taken: the heap's place, first tile, tiles, and the
++    /// subresource they were given to (the first packed level for the
++    /// packed ones).
++    runs: Vec<(usize, u32, u32, u32)>,
+ }
+ 
+ /// A host texture made without memory, and the tiles its levels have been
+@@ -380,6 +423,9 @@
+         // waiting: a write of the card's into no memory is lost.
+         let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+         let missing = self.without_locked(&given, named) != 0;
++        if give_back_on() {
++            self.take_back_locked(&mut given, queue, texture, named);
++        }
+         (changed, missing)
+     }
+ 
+@@ -574,7 +620,7 @@
+                 None => given.packed = true,
+             }
+             for &(start, count) in &runs {
+-                given.runs.push((index, start, count));
++                given.runs.push((index, start, count, subresource));
+             }
+             STATS[2].fetch_add(u64::from(tiles) * TILE, Ordering::Relaxed);
+             STATS[5].fetch_add(1, Ordering::Relaxed);
+@@ -590,6 +636,93 @@
+         self.shown.swap(shown, Ordering::Relaxed) != shown
+     }
+ 
++    /// Takes the tiles back from the levels of `texture` that have tiles
++    /// and that `named` does not name (a bit a level): the title no longer
++    /// holds them (unmapped, or the next texture's, or below the first
++    /// level its views show). To be called from the same submission-time
++    /// step as [`Tiled::uploaded_on`]: the mapping to nothing is ahead of
++    /// that list on `queue`, and the list writes such a level with zeros,
++    /// which a level without memory drops while reads of it give zeros (as
++    /// tier 2 says): what a shader sees of the level is what it saw. The
++    /// tiles go back to the pool only once the submissions started by then
++    /// have run (`crate::host::retire`), so no list in the air reads
++    /// another texture's bytes through this one. A level held again later
++    /// is given new tiles by the upload that writes it whole.
++    /// Not for a texture the card itself wrote or has a claim on
++    /// ([`Tiled::claim`]): those levels' bytes exist on the card alone.
++    fn take_back_locked(&self, given: &mut Given, queue: &ID3D12CommandQueue, texture: &ID3D12Resource, named: u32) {
++        if self.card.load(Ordering::Relaxed) != 0 || self.claimed.load(Ordering::Relaxed) != 0 {
++            return;
++        }
++        let first_packed = self.standard.len() as u32;
++        let named_level = |level: u32| level < 32 && named & (1 << level) != 0;
++        // (subresource, tiles) to map to nothing.
++        let mut gone: Vec<(u32, u32)> = Vec::new();
++        for level in 0..first_packed {
++            if given.levels[level as usize] && !named_level(level) {
++                gone.push((level, self.standard[level as usize]));
++            }
++        }
++        if self.packed > 0 && given.packed && !(first_packed..self.levels).any(named_level) {
++            gone.push((first_packed, self.packed));
++        }
++        if gone.is_empty() {
++            return;
++        }
++        for &(subresource, tiles) in &gone {
++            let at = D3D12_TILED_RESOURCE_COORDINATE {
++                X: 0,
++                Y: 0,
++                Z: 0,
++                Subresource: subresource,
++            };
++            let size = D3D12_TILE_REGION_SIZE {
++                NumTiles: tiles,
++                ..Default::default()
++            };
++            let flags = [D3D12_TILE_RANGE_FLAG_NULL];
++            let starts = [0u32];
++            let counts = [tiles];
++            // SAFETY: a live reserved texture; one region of `tiles` tiles
++            // from the subresource's first tile, mapped to no heap by one
++            // range of the null flag; arrays that live through the call.
++            unsafe {
++                queue.UpdateTileMappings(
++                    texture,
++                    1,
++                    Some(&raw const at),
++                    Some(&raw const size),
++                    None::<&ID3D12Heap>,
++                    1,
++                    Some(flags.as_ptr()),
++                    Some(starts.as_ptr()),
++                    Some(counts.as_ptr()),
++                    D3D12_TILE_MAPPING_FLAG_NONE,
++                );
++            }
++            STATS[6].fetch_add(1, Ordering::Relaxed);
++            if subresource < first_packed {
++                given.levels[subresource as usize] = false;
++            } else {
++                given.packed = false;
++            }
++        }
++        let subs: Vec<u32> = gone.iter().map(|g| g.0).collect();
++        let mut back: Vec<(usize, u32, u32)> = Vec::new();
++        given.runs.retain(|&(index, start, tiles, sub)| {
++            let goes = subs.contains(&sub);
++            if goes {
++                back.push((index, start, tiles));
++            }
++            !goes
++        });
++        let bytes: u64 = back.iter().map(|run| u64::from(run.2) * TILE).sum();
++        STATS[2].fetch_sub(bytes, Ordering::Relaxed);
++        TAKEN_BACK[0].fetch_add(gone.len() as u64, Ordering::Relaxed);
++        TAKEN_BACK[1].fetch_add(bytes, Ordering::Relaxed);
++        crate::host::retire(Returning(back));
++    }
++
+     /// The first level a view of the texture may show; `None` while no
+     /// level is both held and given (the views are then as the title made
+     /// them, and read zeros).
+@@ -632,7 +765,7 @@
+         let given = self.given.get_mut().unwrap_or_else(|e| e.into_inner());
+         let mut bytes = 0;
+         let mut by_heap: std::collections::BTreeMap<usize, Vec<(u32, u32)>> = std::collections::BTreeMap::new();
+-        for &(index, start, tiles) in &given.runs {
++        for &(index, start, tiles, _) in &given.runs {
+             by_heap.entry(index).or_default().push((start, tiles));
+             bytes += u64::from(tiles) * TILE;
+         }
+@@ -1435,6 +1568,46 @@
+         assert_eq!(tiled.claim(small), small);
+     }
+ 
++    fn levels_let_go_give_their_tiles_back(rig: &mut Rig) {
++        rig.step = "step 8, levels the title lets go of give their tiles back";
++        let desc = Rig::desc(DXGI_FORMAT_BC7_UNORM, SIDE, LEVELS, true);
++        let (texture, tiled) = rig.reserved(&desc);
++        let layout = rig.footprints(&desc);
++        let upload = rig.filled(&layout, |level| level as u8 + 1);
++        let read_as_given = |rig: &mut Rig, what: &str| {
++            let read = rig.round_trip(&texture, &layout, Some(&upload));
++            for (level, bytes) in read.iter().enumerate() {
++                let want = if tiled.has_tiles(level as u32) { level as u8 + 1 } else { 0 };
++                assert!(all(bytes, want), "{what}: level {level} reads {bytes:?}, wanted {want}");
++            }
++        };
++        let (_, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), true);
++        rig.check("held from level 1");
++        assert!(!waiting && tiled.has_tiles(1) && tiled.has_tiles(2) && !tiled.has_tiles(0));
++        let before = tiled.given_bytes();
++        let back = taken_back();
++        // The title holds from level 3 on now: levels 1 and 2 give theirs back.
++        let (changed, _) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(3), true);
++        // (As `uploaded_on` does with `VICTORY_LEVELS_GIVE_BACK=1`.)
++        if !give_back_on() {
++            let mut given = tiled.given.lock().unwrap();
++            tiled.take_back_locked(&mut given, &rig.queue, &texture, from_level(3));
++        }
++        rig.check("fewer levels held");
++        assert!(changed, "the first level shown moved");
++        assert_eq!(tiled.first_shown(), Some(3));
++        assert!(!tiled.has_tiles(1) && !tiled.has_tiles(2) && tiled.has_tiles(3));
++        assert!(tiled.given_bytes() < before, "tiles were taken back");
++        assert_eq!(taken_back()[0], back[0] + 2, "two levels taken back");
++        read_as_given(rig, "fewer levels held");
++        // Held again: new tiles, written whole by the same upload.
++        let (changed, waiting) = tiled.uploaded_on(&rig.queue, &rig.device, &texture, from_level(1), true);
++        rig.check("held again from level 1");
++        assert!(changed && !waiting && tiled.has_tiles(1) && tiled.has_tiles(2));
++        assert_eq!(tiled.given_bytes(), before);
++        read_as_given(rig, "held again");
++    }
++
+     /// On the software adapter unless `VICTORY_TILES_TEST_CARD=1`.
+     #[test]
+     #[ignore = "on the card: run it by name with --ignored --nocapture"]
+@@ -1451,6 +1624,7 @@
+         a_level_on_several_ranges(&mut rig);
+         a_full_card_keeps_new_levels_waiting(&mut rig);
+         a_claim_given_up_is_made_again(&mut rig);
++        levels_let_go_give_their_tiles_back(&mut rig);
+         if the_view_starts_at_the_first_level_with_tiles(&mut rig).is_none() {
+             eprintln!("the view test's shader or objects could not be made; that part was skipped");
+         }
+@@ -1471,6 +1645,14 @@
+         );
+     }
+ 
++    /// Taking tiles back from levels let go is opt-in.
++    #[test]
++    fn giving_tiles_back_is_off_unless_asked_for() {
++        if std::env::var_os("VICTORY_LEVELS_GIVE_BACK").is_none() {
++            assert!(!give_back_on());
++        }
++    }
++
+     #[test]
+     fn floor_saturates_instead_of_wrapping() {
+         assert_eq!(parse_floor(None), 1 << 20);

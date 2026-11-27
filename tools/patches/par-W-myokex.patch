@@ -1,0 +1,2305 @@
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/cardmeter.rs W/crates/victory-gpu/src/cardmeter.rs
+--- S/crates/victory-gpu/src/cardmeter.rs	2026-11-25 19:11:21.000000000 +0200
++++ W/crates/victory-gpu/src/cardmeter.rs	2026-11-25 22:02:57.817885900 +0200
+@@ -38,12 +38,15 @@
+     Check,
+     /// Every other host list: the title's own, our present copies.
+     Lists,
++    /// Inside one of those: from where a pipeline is bound to where the
++    /// next one is, or the list ends ([`begin_named`]).
++    Pipeline,
+ }
+ 
+ /// Pairs of timestamps in the ring.
+-const PAIRS: u32 = 8192;
++const PAIRS: u32 = 32768;
+ /// A pair is read this long after it was recorded.
+-const AFTER: std::time::Duration = std::time::Duration::from_millis(1500);
++const AFTER: std::time::Duration = std::time::Duration::from_millis(1000);
+ 
+ /// A pair being recorded: its place in the ring, or none.
+ #[derive(Clone, Copy)]
+@@ -70,6 +73,16 @@
+     next: u32,
+     /// Pairs recorded and not read yet: place, kind, when recorded.
+     pending: std::collections::VecDeque<(u32, Kind, std::time::Instant)>,
++    /// What the list of a pair mostly is ([`end_named`]), by place, until
++    /// the pair is read.
++    names: std::collections::HashMap<u32, String>,
++    /// Since the last table: by name, the lists and their microseconds.
++    by_name: std::collections::HashMap<String, (u64, u64)>,
++    /// The same by pipeline ([`begin_named`]): the times it was bound and
++    /// the microseconds until the next one was.
++    by_pipeline: std::collections::HashMap<String, (u64, u64)>,
++    /// Frames since the last table.
++    frames: u64,
+     /// What each place held when it was last read: a place the card has
+     /// not written since (its list never ran) still holds that, and is
+     /// not counted again.
+@@ -127,7 +140,19 @@
+         tracing::info!(
+             "the card's time is measured by kind of list, a timestamp where each list begins and ends (VICTORY_CARD_METER=0: not)"
+         );
+-        Some(Meter { heap, back, mapped: mapped as usize, frequency, next: 0, pending: Default::default(), seen: vec![(0, 0); PAIRS as usize] })
++        Some(Meter {
++            heap,
++            back,
++            mapped: mapped as usize,
++            frequency,
++            next: 0,
++            pending: Default::default(),
++            names: Default::default(),
++            by_name: Default::default(),
++            by_pipeline: Default::default(),
++            frames: 0,
++            seen: vec![(0, 0); PAIRS as usize],
++        })
+     }
+ }
+ 
+@@ -170,6 +195,61 @@
+     }
+ }
+ 
++/// Whether the card's time is also measured pipeline by pipeline inside the
++/// title's lists (`VICTORY_CARD_METER_PIPELINES=1`; off by default: two
++/// more queries and a resolve at every change of pipeline).
++pub(crate) fn pipelines() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| on() && std::env::var_os("VICTORY_CARD_METER_PIPELINES").is_some_and(|v| v == "1"))
++}
++
++/// The pipeline `name` is bound on `list` here: the first timestamp of a
++/// pair that [`end`] closes where the next pipeline is bound or the list
++/// ends. What the card does between the two (the draws or dispatches of
++/// that pipeline, and what the layer records around them) is that
++/// pipeline's time in the table.
++pub(crate) fn begin_named(list: &ID3D12GraphicsCommandList, name: &str) -> Span {
++    let span = begin(list, Kind::Pipeline);
++    if span.0 != u32::MAX {
++        let mut meter = METER.lock().unwrap_or_else(|e| e.into_inner());
++        if let Some(Some(m)) = meter.as_mut() {
++            m.names.insert(span.0, name.to_owned());
++        }
++    }
++    span
++}
++
++/// [`end`] for one of the title's lists, with what it mostly is: the
++/// pipelines it binds (`names`, in order, as the list keeps them). Every
++/// 256 frames the card's time is logged by that name: which of the title's
++/// passes the card's time goes to, in a run like any other (the timing run
++/// that names every command sends each list alone and needs the
++/// device-removed notes).
++pub(crate) fn end_named(list: &ID3D12GraphicsCommandList, span: Span, names: &std::collections::BTreeSet<String>) {
++    if span.0 == u32::MAX {
++        return;
++    }
++    end(list, span);
++    let name = name_of(names);
++    let mut meter = METER.lock().unwrap_or_else(|e| e.into_inner());
++    if let Some(Some(m)) = meter.as_mut() {
++        m.names.insert(span.0, name);
++    }
++}
++
++/// A list's name in the table: how many pipelines it binds and the first
++/// two of them (the set is in the order of the names, so a pass has the
++/// same name every frame).
++fn name_of(names: &std::collections::BTreeSet<String>) -> String {
++    let short = |n: &String| n.chars().take(60).collect::<String>();
++    let mut first = names.iter();
++    match (first.next(), first.next()) {
++        (None, _) => "no pipeline (copies, clears, barriers)".to_string(),
++        (Some(a), None) => format!("1 pipeline: {}", short(a)),
++        (Some(a), Some(b)) => format!("{} pipelines: {} / {}", names.len(), short(a), short(b)),
++    }
++}
++
+ /// Microseconds between two timestamps of a clock of `frequency` ticks a
+ /// second; 0 if the second is not after the first (a pair the card has not
+ /// written, or a list that never ran).
+@@ -219,9 +299,59 @@
+             Kind::Lists => {
+                 add(T::CardListsUs, us);
+                 add(T::CardLists, 1);
++                if let Some(name) = m.names.remove(&pair) {
++                    let e = m.by_name.entry(name).or_insert((0, 0));
++                    e.0 += 1;
++                    e.1 += us;
++                }
++            }
++            Kind::Pipeline => {
++                if let Some(name) = m.names.remove(&pair) {
++                    let e = m.by_pipeline.entry(name).or_insert((0, 0));
++                    e.0 += 1;
++                    e.1 += us;
++                }
+             }
+         }
+     }
++    m.frames += 1;
++    if m.frames >= 256 {
++        let frames = m.frames as f64;
++        let mut table: Vec<(String, (u64, u64))> = m.by_name.drain().collect();
++        table.sort_by_key(|&(_, (_, us))| std::cmp::Reverse(us));
++        let all: u64 = table.iter().map(|&(_, (_, us))| us).sum();
++        tracing::info!(
++            "card time of the title's lists by what they bind, per frame over {} frames: {:.1} ms in {:.0} lists of {} kinds; the largest follow",
++            m.frames,
++            all as f64 / 1e3 / frames,
++            table.iter().map(|&(_, (n, _))| n).sum::<u64>() as f64 / frames,
++            table.len()
++        );
++        for (name, (n, us)) in table.into_iter().take(24) {
++            tracing::info!("  card {:6.2} ms a frame in {:5.1} lists: {name}", us as f64 / 1e3 / frames, n as f64 / frames);
++        }
++        if !m.by_pipeline.is_empty() {
++            let mut table: Vec<(String, (u64, u64))> = m.by_pipeline.drain().collect();
++            table.sort_by_key(|&(_, (_, us))| std::cmp::Reverse(us));
++            let all: u64 = table.iter().map(|&(_, (_, us))| us).sum();
++            tracing::info!(
++                "card time by pipeline (from where it is bound to where the next is), per frame over {} frames: {:.1} ms in {:.0} bindings of {} pipelines; the largest follow",
++                m.frames,
++                all as f64 / 1e3 / frames,
++                table.iter().map(|&(_, (n, _))| n).sum::<u64>() as f64 / frames,
++                table.len()
++            );
++            for (name, (n, us)) in table.into_iter().take(48) {
++                tracing::info!(
++                    "  pipeline {:6.2} ms a frame in {:6.1} bindings ({:7.1} us each): {name}",
++                    us as f64 / 1e3 / frames,
++                    n as f64 / frames,
++                    us as f64 / n.max(1) as f64
++                );
++            }
++        }
++        m.frames = 0;
++    }
+ }
+ 
+ #[cfg(test)]
+@@ -229,6 +359,17 @@
+     use super::*;
+ 
+     #[test]
++    fn a_list_is_named_by_the_pipelines_it_binds() {
++        let mut names = std::collections::BTreeSet::new();
++        assert_eq!(name_of(&names), "no pipeline (copies, clears, barriers)");
++        names.insert("compute CS_Blur".to_string());
++        assert_eq!(name_of(&names), "1 pipeline: compute CS_Blur");
++        names.insert("mesh VS_A, pixel PS_B".to_string());
++        names.insert("a".repeat(100));
++        assert_eq!(name_of(&names), format!("3 pipelines: {} / compute CS_Blur", "a".repeat(60)));
++    }
++
++    #[test]
+     fn a_pairs_length_is_in_microseconds_of_the_queues_clock() {
+         assert_eq!(micros(1_000, 11_000, 10_000_000), 1_000);
+         assert_eq!(micros(0, 25_000_000, 25_000_000), 1_000_000);
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/descriptor/host.rs W/crates/victory-gpu/src/descriptor/host.rs
+--- S/crates/victory-gpu/src/descriptor/host.rs	2026-11-25 19:54:13.000000000 +0200
++++ W/crates/victory-gpu/src/descriptor/host.rs	2026-11-25 21:48:47.355051700 +0200
+@@ -1502,6 +1502,24 @@
+             None => null_view(self.cpu(index)),
+         }
+         self.keep(index, None);
++        // `VICTORY_MIRROR_EXACT`: the fingerprint of the record the slot was
++        // made from no longer says what it shows (`making`, then `copied`).
++        if mirror_exact() {
++            self.forget_copied(index);
++        }
++    }
++
++    /// Forgets the fingerprint the pass over records copied in as bytes
++    /// last saw at title slot `index` (myokex c3723f3): the host slot was
++    /// changed by something else (a call, a slot made stale, a texture let
++    /// go), and a later copy of the record it showed before must not be
++    /// taken for the one last seen. Takes `copied`; the caller may hold
++    /// `making`, never `copied`.
++    fn forget_copied(&self, index: u32) {
++        let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
++        if let Some(last) = copied.get_mut(index as usize) {
++            *last = 0;
++        }
+     }
+ 
+     /// Title slot `index` is a table's ([`HostHeap::tabled`]). `read`: a
+@@ -1911,15 +1929,49 @@
+                 return false;
+             };
+             // A slot never looked at that holds nothing: as it was.
+-            if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0)) {
++            // (`VICTORY_MIRROR_EXACT`: unless a call made it.)
++            if *last == print || (*last == 0 && record[..n].iter().all(|&b| b == 0) && !self.made_by_call(index)) {
+                 return false;
+             }
+             *last = print;
+         }
++        if let Some(bytes) = exact_words(record) {
++            self.mirror_copied_exact(index, handle, bytes, mirror_fast());
++            return true;
++        }
+         self.mirror(index, handle, false);
+         true
+     }
+ 
++    /// `VICTORY_MIRROR_EXACT`: a zero record in a slot the pass never
++    /// looked at is mirrored if the slot is made (by a call: the title
++    /// zeroed a view it made), where it was left showing that view.
++    fn made_by_call(&self, index: u32) -> bool {
++        mirror_exact()
++            && self
++                .made
++                .get(index as usize)
++                .is_some_and(|made| made.load(std::sync::atomic::Ordering::Acquire) != 0)
++    }
++
++    /// `VICTORY_MIRROR_EXACT`, for [`HostHeap::mirror_copied`]: the record
++    /// at `handle` made as [`HostHeap::mirror`] makes it (with `fast`, as
++    /// [`mirror_fast`] says), from the words read there once (myokex
++    /// c3723f3: one read, not a second one of the title's slot). Those are
++    /// the fingerprinted `bytes` unless the slot was written since the page
++    /// was read; then the slot shows the newer record (an older one made
++    /// over a newer one would stay until the page is written again) and its
++    /// fingerprint is forgotten, so it never names a record other than the
++    /// one the slot shows.
++    fn mirror_copied_exact(&self, index: u32, handle: u64, bytes: [u32; 3], fast: bool) {
++        let live = record_words(handle);
++        self.mirror_from(index, handle, false, fast, live, false);
++        if live != bytes {
++            COPIED_REWRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++            self.forget_copied(index);
++        }
++    }
++
+     /// [`HostHeap::mirror_copied`] for every record of one changed page of
+     /// the title's heap (`super::sync_heaps`): title slots `slots`, the
+     /// record of slot `i` at title address `start + i * step`, and `page`
+@@ -1941,10 +1993,12 @@
+         (start, step): (u64, u64),
+         from: usize,
+         page: &[u8],
++        straddling: impl Fn(u64, &mut [u8; 32]) -> bool,
+     ) -> (u64, u64) {
+         let (frame, tables) = (crate::frame::current(), sync_tables());
+         let mut looked = 0u64;
+-        let mut due: Vec<(u32, u64)> = Vec::new();
++        // With `VICTORY_MIRROR_EXACT`, the record's first words as read.
++        let mut due: Vec<(u32, u64, Option<[u32; 3]>)> = Vec::new();
+         {
+             let mut copied = self.copied.lock().unwrap_or_else(|e| e.into_inner());
+             if copied.is_empty() {
+@@ -1953,12 +2007,20 @@
+             for index in slots {
+                 let handle = start + index * step;
+                 // A record that straddles the range's ends is left to the
+-                // range that holds its first byte.
+-                let Some(at) = (handle as usize).checked_sub(from) else {
+-                    continue;
+-                };
+-                let Some(record) = page.get(at..at + step as usize) else {
+-                    continue;
++                // range that holds its first byte. `VICTORY_MIRROR_EXACT`:
++                // one that straddles a 64 KiB page is read whole by
++                // `straddling` (myokex c3723f3), where neither page's pass
++                // looked at it.
++                let mut whole = [0u8; 32];
++                let record = match (handle as usize).checked_sub(from).and_then(|at| page.get(at..at + step as usize)) {
++                    Some(record) => record,
++                    None => {
++                        if !mirror_exact() || step as usize > whole.len() || !straddling(handle, &mut whole) {
++                            continue;
++                        }
++                        STRADDLING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                        &whole[..step as usize]
++                    }
+                 };
+                 looked += 1;
+                 // None past the host heap's slots, as `mirror_copied`.
+@@ -1969,7 +2031,8 @@
+                 let print = record_print(record) | 1;
+                 // The record last seen, or a slot never looked at that
+                 // holds nothing: as it was.
+-                if *last == print || (*last == 0 && record.iter().all(|&b| b == 0)) {
++                // (`VICTORY_MIRROR_EXACT`: unless a call made the slot.)
++                if *last == print || (*last == 0 && record.iter().all(|&b| b == 0) && !self.made_by_call(index as u32)) {
+                     continue;
+                 }
+                 // A table's slot lately: left to its draws, and looked at
+@@ -1979,7 +2042,7 @@
+                     continue;
+                 }
+                 *last = print;
+-                due.push((index as u32, handle));
++                due.push((index as u32, handle, exact_words(record)));
+             }
+         }
+         if mirror_fast() && !due.is_empty() {
+@@ -1988,14 +2051,31 @@
+             // 17,000 to 18,700 records a frame this way, and every taking
+             // made the recording threads that wanted the lock wait).
+             let making = self.making.lock().unwrap_or_else(|e| e.into_inner());
+-            for &(index, handle) in &due {
++            let mut rewritten: Vec<u32> = Vec::new();
++            for &(index, handle, bytes) in &due {
+                 MIRRORED[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+-                let (key, view) = read_record(handle);
++                // Read once, under `making` (`read_record`), and compared
++                // as `mirror_copied_exact` compares.
++                let live = record_words(handle);
++                let (key, view) = record_view(live);
+                 self.mirror_locked(&making, index, handle, false, key, view);
++                if bytes.is_some_and(|bytes| bytes != live) {
++                    rewritten.push(index);
++                }
++            }
++            drop(making);
++            for index in rewritten {
++                COPIED_REWRITTEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                self.forget_copied(index);
+             }
+         } else {
+-            for &(index, handle) in &due {
+-                self.mirror(index, handle, false);
++            for &(index, handle, bytes) in &due {
++                match bytes {
++                    Some(bytes) => self.mirror_copied_exact(index, handle, bytes, false),
++                    None => {
++                        self.mirror(index, handle, false);
++                    }
++                }
+             }
+         }
+         (looked, due.len() as u64)
+@@ -2027,16 +2107,28 @@
+     /// `fast` saying whether answers that change nothing are given without
+     /// `making` ([`mirror_fast`]; tests ask for either).
+     fn mirror_with(&self, index: u32, handle: u64, for_draw: bool, fast: bool) -> Option<View> {
++        self.mirror_from(index, handle, for_draw, fast, record_words(handle), mirror_exact())
++    }
++
++    /// [`HostHeap::mirror_with`] of the record `words` read at `handle`.
++    /// `forget`: a slot this changes has the fingerprint of the record last
++    /// copied there as bytes forgotten (`VICTORY_MIRROR_EXACT`: a call or a
++    /// draw wrote it; not for that pass itself, which keeps its own).
++    fn mirror_from(&self, index: u32, handle: u64, for_draw: bool, fast: bool, words: [u32; 3], forget: bool) -> Option<View> {
+         use std::sync::atomic::Ordering::{Acquire, Relaxed};
+         if !fast {
+             // As before: the record read, then the lock taken, and its view
+             // looked up under it.
+-            let words = record_words(handle);
+             let making = self.making.lock().unwrap_or_else(|e| e.into_inner());
+             let (key, view) = record_view(words);
++            if forget && self.changes(index, key, view.is_some()) {
++                let view = self.mirror_locked(&making, index, handle, for_draw, key, view);
++                self.forget_copied(index);
++                return view;
++            }
+             return self.mirror_locked(&making, index, handle, for_draw, key, view);
+         }
+-        let (key, view) = read_record(handle);
++        let (key, view) = record_view(words);
+         // The two cases in which the body below changes nothing, answered
+         // without the lock: the slot is made from this very record (the
+         // body then only returns the view), or the record is no view, the
+@@ -2057,11 +2149,24 @@
+         }
+         let making = self.making.lock().unwrap_or_else(|e| e.into_inner());
+         MIRRORED[1].fetch_add(1, Relaxed);
++        if forget && self.changes(index, key, view.is_some()) {
++            let view = self.mirror_locked(&making, index, handle, for_draw, key, view);
++            self.forget_copied(index);
++            return view;
++        }
+         // The body looks at `made` again under the lock: another thread
+         // may have made the slot since.
+         self.mirror_locked(&making, index, handle, for_draw, key, view)
+     }
+ 
++    /// Whether [`HostHeap::mirror_locked`] changes host slot `index` for a
++    /// record of `key` (`view`: naming one of ours), as `made` tells it
++    /// under `making` (a view kept for its placed texture counts too).
++    fn changes(&self, index: u32, key: u64, view: bool) -> bool {
++        let made = self.made[index as usize].load(std::sync::atomic::Ordering::Relaxed);
++        if view { made != key } else { made != 0 }
++    }
++
+     /// The body of [`HostHeap::mirror`], under `making` (the guard says
+     /// so): `key` and `view` are what [`read_record`] found at `handle`.
+     fn mirror_locked(
+@@ -2154,7 +2259,7 @@
+ 
+     /// The key slot `index` was made from, 0 if none (tests).
+     #[cfg(test)]
+-    fn made_key(&self, index: u32) -> u64 {
++    pub(crate) fn made_key(&self, index: u32) -> u64 {
+         self.made
+             .get(index as usize)
+             .map_or(0, |key| key.load(std::sync::atomic::Ordering::Acquire))
+@@ -2440,8 +2545,47 @@
+ /// it (each record of [`HostHeap::mirror_copied_page`] counts as one).
+ pub(crate) static MIRRORED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+ 
++/// Whether the pass over records copied in as bytes is exact (myokex
++/// c3723f3; `VICTORY_MIRROR_EXACT=0`: as before): a slot changed by a
++/// call or a draw, made stale or let go forgets the fingerprint of the
++/// record last copied there; a zero record over a slot a call made makes
++/// it null; a record across a 64 KiB page is read whole; a record is made
++/// from one read of the slot, its fingerprint forgotten when that is not
++/// the record fingerprinted ([`HostHeap::mirror_copied_exact`]).
++pub(crate) fn mirror_exact() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        let on = std::env::var_os("VICTORY_MIRROR_EXACT").is_none_or(|v| v != "0");
++        tracing::info!(
++            "descriptor records copied as bytes: {} (VICTORY_MIRROR_EXACT={})",
++            if on {
++                "mirrored exactly: fingerprints forgotten when a slot changes otherwise, zeroed slots made null, records across 64 KiB pages read whole"
++            } else {
++                "as before"
++            },
++            if on { "1, the default" } else { "0" }
++        );
++        on
++    })
++}
++
++/// The first words of a copied `record`, with [`mirror_exact`].
++fn exact_words(record: &[u8]) -> Option<[u32; 3]> {
++    let header = record.first_chunk::<12>().filter(|_| mirror_exact())?;
++    let word = |at: usize| u32::from_le_bytes([header[at], header[at + 1], header[at + 2], header[at + 3]]);
++    Some([word(0), word(4), word(8)])
++}
++
++/// Since the last heap sync line, with [`mirror_exact`]: records the pass
++/// over records copied in as bytes read whole across a 64 KiB page, and
++/// slots written again between its read of their page and their making.
++pub(crate) static STRADDLING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++pub(crate) static COPIED_REWRITTEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
+ /// The key (generation and view index) of the record at `handle` and the
+-/// view it names, if it names one of ours.
++/// view it names, if it names one of ours. (Tests: the mirroring reads the
++/// words once and passes them on, `HostHeap::mirror_from`.)
++#[cfg_attr(not(test), allow(dead_code))]
+ fn read_record(handle: u64) -> (u64, Option<View>) {
+     record_view(record_words(handle))
+ }
+@@ -3404,6 +3548,279 @@
+ mod tests {
+     use super::*;
+ 
++    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
++    use windows::core::Interface;
++
++    #[test]
++    fn copied_sampler_uses_the_record_that_was_fingerprinted() {
++        let heap = HostHeap::new(true, 8).expect("D3D12 test sampler heap");
++        let mut a = [0u32; 4];
++        let mut b = [0u32; 4];
++        let mut live = [0u32; 4];
++        let clamp = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
++        let mut wrap = clamp;
++        wrap[1] = 1;
++        super::super::create_sampler(std::ptr::null(), &clamp, a.as_mut_ptr() as u64);
++        super::super::create_sampler(std::ptr::null(), &wrap, b.as_mut_ptr() as u64);
++        let key = |r: [u32; 4]| u64::from(r[2]) << 32 | u64::from(r[1]);
++        let bytes = |r: [u32; 4]| {
++            let mut out = [0u8; 16];
++            for (dst, word) in out.chunks_exact_mut(4).zip(r) {
++                dst.copy_from_slice(&word.to_le_bytes());
++            }
++            out
++        };
++        assert_ne!(key(a), key(b));
++        let handle = live.as_mut_ptr() as u64;
++        let installed = || heap.made_key(1);
++        // The sampler record interning is identical to the title's API
++        // writes. Both byte records and the later guest location are valid.
++        // Ours (`VICTORY_MIRROR_EXACT`, `mirror_copied_exact`): a slot
++        // written again since its page was read (bytes a, slot b) shows
++        // the newer record and its fingerprint is forgotten, where myokex
++        // makes a (its sync runs alone); the fingerprint never names a
++        // record other than the one the slot shows.
++        live.copy_from_slice(&b);
++        assert!(heap.mirror_copied(1, handle, &bytes(a)));
++        assert_eq!(installed(), key(b));
++        live.copy_from_slice(&a);
++        assert!(heap.mirror_copied(1, handle, &bytes(a)), "a copied in again is not taken for the record last seen");
++        let first = installed();
++        assert!(!heap.mirror_copied(1, handle, &bytes(a)));
++        assert_eq!((first, installed()), (key(a), key(a)));
++        live.copy_from_slice(&b);
++        assert!(heap.mirror_copied(1, handle, &bytes(b)));
++        assert_eq!(installed(), key(b));
++        assert!(!heap.made(2), "unrelated slot was modified");
++    }
++    #[test]
++    fn copied_sampler_controls_fenced_shader_output() {
++        const SOURCE: &str = include_str!("sampler-output.hlsl");
++        let host = host().expect("D3D12 test host");
++        let device = &host.device;
++        let samplers = HostHeap::new(true, 3).expect("D3D12 test sampler heap");
++        let mut clamp_record = [0u32; 4];
++        let mut wrap_record = [0u32; 4];
++        let mut live = [0u32; 4];
++        // D3D12 point samplers with identical fields except AddressU.
++        let clamp = [0, 3, 3, 3, 0, 1, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff];
++        let mut wrap = clamp;
++        wrap[1] = 1;
++        super::super::create_sampler(std::ptr::null(), &clamp, clamp_record.as_mut_ptr() as u64);
++        super::super::create_sampler(std::ptr::null(), &wrap, wrap_record.as_mut_ptr() as u64);
++        let bytes = |record: [u32; 4]| {
++            let mut out = [0u8; 16];
++            for (dst, word) in out.chunks_exact_mut(4).zip(record) {
++                dst.copy_from_slice(&word.to_le_bytes());
++            }
++            out
++        };
++        // Slot 0 is the copied-record path under test. Its captured bytes
++        // name clamp while the still-valid live record has already become wrap.
++        // Ours: the slot shows the live record, wrap (see
++        // `copied_sampler_uses_the_record_that_was_fingerprinted`).
++        live.copy_from_slice(&wrap_record);
++        assert!(samplers.mirror_copied(0, live.as_mut_ptr() as u64, &bytes(clamp_record)));
++        assert!(samplers.mirror(1, clamp_record.as_ptr() as u64, false).is_some());
++        assert!(samplers.mirror(2, wrap_record.as_ptr() as u64, false).is_some());
++
++        let texture = |state| {
++            let heap = D3D12_HEAP_PROPERTIES {
++                Type: D3D12_HEAP_TYPE_DEFAULT,
++                ..Default::default()
++            };
++            let desc = D3D12_RESOURCE_DESC {
++                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
++                Width: 2,
++                Height: 1,
++                DepthOrArraySize: 1,
++                MipLevels: 1,
++                Format: DXGI_FORMAT_R8_UNORM,
++                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++                ..Default::default()
++            };
++            let mut resource = None;
++            unsafe {
++                device
++                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut resource)
++                    .unwrap();
++            }
++            resource.unwrap()
++        };
++        let buffer = |size: u64, kind: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES| -> ID3D12Resource {
++            let heap = D3D12_HEAP_PROPERTIES {
++                Type: kind,
++                ..Default::default()
++            };
++            let desc = D3D12_RESOURCE_DESC {
++                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
++                Width: size,
++                Height: 1,
++                DepthOrArraySize: 1,
++                MipLevels: 1,
++                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
++                Flags: flags,
++                ..Default::default()
++            };
++            let mut resource = None;
++            unsafe {
++                device
++                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut resource)
++                    .unwrap();
++            }
++            resource.unwrap()
++        };
++        let target = texture(D3D12_RESOURCE_STATE_COPY_DEST);
++        let decoy = texture(D3D12_RESOURCE_STATE_COPY_DEST);
++        let upload = buffer(
++            1024,
++            D3D12_HEAP_TYPE_UPLOAD,
++            D3D12_RESOURCE_FLAG_NONE,
++            D3D12_RESOURCE_STATE_GENERIC_READ,
++        );
++        let output = buffer(
++            256,
++            D3D12_HEAP_TYPE_DEFAULT,
++            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
++            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++        );
++        let readback = buffer(
++            256,
++            D3D12_HEAP_TYPE_READBACK,
++            D3D12_RESOURCE_FLAG_NONE,
++            D3D12_RESOURCE_STATE_COPY_DEST,
++        );
++        let empty = D3D12_RANGE { Begin: 0, End: 0 };
++        let mut mapped = std::ptr::null_mut();
++        unsafe {
++            upload.Map(0, Some(&empty), Some(&mut mapped)).unwrap();
++            mapped.cast::<u8>().write(17);
++            mapped.cast::<u8>().add(1).write(231);
++            mapped.cast::<u8>().add(512).write(61);
++            mapped.cast::<u8>().add(513).write(199);
++            upload.Unmap(0, None);
++        }
++
++        let view_desc = D3D12_DESCRIPTOR_HEAP_DESC {
++            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
++            NumDescriptors: 2,
++            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
++            ..Default::default()
++        };
++        let views: ID3D12DescriptorHeap = unsafe { device.CreateDescriptorHeap(&view_desc).unwrap() };
++        let start = unsafe { views.GetCPUDescriptorHandleForHeapStart() };
++        let step = unsafe { device.GetDescriptorHandleIncrementSize(view_desc.Type) } as usize;
++        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
++            Format: DXGI_FORMAT_R8_UNORM,
++            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
++            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
++            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
++                Texture2D: D3D12_TEX2D_SRV {
++                    MipLevels: 1,
++                    ..Default::default()
++                },
++            },
++        };
++        unsafe {
++            device.CreateShaderResourceView(&target, Some(&srv), start);
++            device.CreateShaderResourceView(&decoy, Some(&srv), D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + step });
++        }
++
++        let code = crate::host::compile(
++            SOURCE,
++            windows::core::s!("main"),
++            windows::core::s!("cs_5_1"),
++        )
++        .expect("sampler output shader");
++        let root: ID3D12RootSignature = unsafe { device.CreateRootSignature(0, &code).unwrap() };
++        let pso: ID3D12PipelineState = unsafe {
++            device
++                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
++                    pRootSignature: std::mem::transmute_copy(&root),
++                    CS: D3D12_SHADER_BYTECODE {
++                        pShaderBytecode: code.as_ptr().cast(),
++                        BytecodeLength: code.len(),
++                    },
++                    ..Default::default()
++                })
++                .unwrap()
++        };
++        let allocator: ID3D12CommandAllocator =
++            unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap() };
++        let list: ID3D12GraphicsCommandList =
++            unsafe { device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, &pso).unwrap() };
++        let subresource = |resource: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
++            pResource: unsafe { std::mem::transmute_copy(resource) },
++            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
++            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
++        };
++        let placed = |offset| D3D12_TEXTURE_COPY_LOCATION {
++            pResource: unsafe { std::mem::transmute_copy(&upload) },
++            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
++            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
++                    Offset: offset,
++                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
++                        Format: DXGI_FORMAT_R8_UNORM,
++                        Width: 2,
++                        Height: 1,
++                        Depth: 1,
++                        RowPitch: 256,
++                    },
++                },
++            },
++        };
++        unsafe {
++            list.CopyTextureRegion(&subresource(&target), 0, 0, 0, &placed(0), None);
++            list.CopyTextureRegion(&subresource(&decoy), 0, 0, 0, &placed(512), None);
++            list.ResourceBarrier(&[
++                crate::host::transition(
++                    &target,
++                    D3D12_RESOURCE_STATE_COPY_DEST,
++                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++                ),
++                crate::host::transition(
++                    &decoy,
++                    D3D12_RESOURCE_STATE_COPY_DEST,
++                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++                ),
++            ]);
++            list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.heap.clone())]);
++            list.SetComputeRootSignature(&root);
++            list.SetComputeRootDescriptorTable(0, views.GetGPUDescriptorHandleForHeapStart());
++            list.SetComputeRootDescriptorTable(1, samplers.gpu_handle(0));
++            list.SetComputeRootUnorderedAccessView(2, output.GetGPUVirtualAddress());
++            list.Dispatch(1, 1, 1);
++            list.ResourceBarrier(&[crate::host::transition(
++                &output,
++                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                D3D12_RESOURCE_STATE_COPY_SOURCE,
++            )]);
++            list.CopyBufferRegion(&readback, 0, &output, 0, 12);
++            list.Close().unwrap();
++            let command: ID3D12CommandList = list.cast().unwrap();
++            host.queue().ExecuteCommandLists(&[Some(command)]);
++        }
++        let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap() };
++        let event = unsafe { CreateEventW(None, false, false, None).unwrap() };
++        unsafe {
++            host.queue().Signal(&fence, 1).unwrap();
++            fence.SetEventOnCompletion(1, event).unwrap();
++            WaitForSingleObject(event, INFINITE);
++            windows::Win32::Foundation::CloseHandle(event).unwrap();
++            device.GetDeviceRemovedReason().unwrap();
++            assert_eq!(fence.GetCompletedValue(), 1);
++            readback
++                .Map(0, Some(&D3D12_RANGE { Begin: 0, End: 12 }), Some(&mut mapped))
++                .unwrap();
++            let actual = std::slice::from_raw_parts(mapped.cast::<u32>(), 3);
++            eprintln!("SAMPLER-OUTPUT changed/clamp/decoy={actual:?}");
++            assert_eq!(actual, [17, 231, 61]);
++            readback.Unmap(0, Some(&empty));
++        }
++    }
++
+     /// A null texture UAV keeps the title's dimension (3D for the world's
+     /// wind field), and is 2D when the title names none.
+     #[test]
+@@ -4140,8 +4557,8 @@
+         drop(making);
+         assert_eq!((heap.made_key(0), heap.made_key(1)), (key_of(&records[0]), key_of(&records[1])));
+         // Looked at again unchanged: nothing is due.
+-        assert_eq!(heap.mirror_copied_page(0..2, (start, 16), start as usize, &page), (2, 2));
+-        assert_eq!(heap.mirror_copied_page(0..2, (start, 16), start as usize, &page), (2, 0));
++        assert_eq!(heap.mirror_copied_page(0..2, (start, 16), start as usize, &page, |_, _| false), (2, 2));
++        assert_eq!(heap.mirror_copied_page(0..2, (start, 16), start as usize, &page, |_, _| false), (2, 0));
+     }
+ }
+ 
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/descriptor/sampler-output.hlsl W/crates/victory-gpu/src/descriptor/sampler-output.hlsl
+--- S/crates/victory-gpu/src/descriptor/sampler-output.hlsl	1970-01-01 02:00:00.000000000 +0200
++++ W/crates/victory-gpu/src/descriptor/sampler-output.hlsl	2026-11-25 21:48:18.329293700 +0200
+@@ -0,0 +1,17 @@
++[RootSignature("DescriptorTable(SRV(t0,numDescriptors=2)),DescriptorTable(Sampler(s0,numDescriptors=3)),UAV(u0)")]
++[numthreads(1, 1, 1)]
++void main();
++
++Texture2D<float> target : register(t0);
++Texture2D<float> decoy : register(t1);
++SamplerState changed : register(s0);
++SamplerState known_clamp : register(s1);
++SamplerState known_wrap : register(s2);
++RWByteAddressBuffer output : register(u0);
++
++void main() {
++    const float2 uv = float2(1.25, 0.5);
++    output.Store3(0, uint3(round(255.0 * float3(target.SampleLevel(changed, uv, 0),
++                                               target.SampleLevel(known_clamp, uv, 0),
++                                               decoy.SampleLevel(known_wrap, uv, 0)))));
++}
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/descriptor.rs W/crates/victory-gpu/src/descriptor.rs
+--- S/crates/victory-gpu/src/descriptor.rs	2026-11-25 19:28:31.000000000 +0200
++++ W/crates/victory-gpu/src/descriptor.rs	2026-11-25 21:48:03.631821200 +0200
+@@ -189,6 +189,7 @@
+     let started = std::time::Instant::now();
+     let (mut pages, mut looked, mut mirrored) = (0u64, 0u64, 0u64);
+     let mut page_bytes: Vec<u8> = Vec::new();
++    let mut straddle = [0u8; 32];
+     let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
+     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+     for &(start, end, at) in heaps.iter() {
+@@ -219,7 +220,12 @@
+                     // (`HostHeap::mirror_copied_page`); one by one below
+                     // with `VICTORY_HEAP_SYNC_PAGE=0`.
+                     let slots = if page_at_once() {
+-                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes);
++                        // A record across the page's ends, read whole
++                        // (`VICTORY_MIRROR_EXACT`).
++                        let straddling = |handle: u64, into: &mut [u8; 32]| {
++                            handle + step <= end && crate::host::read_into(handle as *const u8, &mut into[..step as usize])
++                        };
++                        let (seen, made) = host.mirror_copied_page(slots, (start, step), from, &page_bytes, straddling);
+                         looked += seen;
+                         mirrored += made;
+                         0..0
+@@ -230,11 +236,21 @@
+                         let handle = start + index * step;
+                         // A record that straddles the range's ends is left
+                         // to the range that holds its first byte.
+-                        let Some(at) = (handle as usize).checked_sub(from) else {
+-                            continue;
+-                        };
+-                        let Some(record) = page_bytes.get(at..at + step as usize) else {
+-                            continue;
++                        // `VICTORY_MIRROR_EXACT`: one across a 64 KiB page
++                        // is read whole (myokex c3723f3).
++                        let record = match (handle as usize).checked_sub(from).and_then(|at| page_bytes.get(at..at + step as usize)) {
++                            Some(record) => record,
++                            None => {
++                                if !host::mirror_exact()
++                                    || handle + step > end
++                                    || step as usize > straddle.len()
++                                    || !crate::host::read_into(handle as *const u8, &mut straddle[..step as usize])
++                                {
++                                    continue;
++                                }
++                                host::STRADDLING.fetch_add(1, Relaxed);
++                                &straddle[..step as usize]
++                            }
+                         };
+                         looked += 1;
+                         // Only a record that is not the one last seen there
+@@ -290,6 +306,16 @@
+         host::COPIED_TABLED.swap(0, std::sync::atomic::Ordering::Relaxed) as f64 / frames,
+         micros as f64 / 1000.0 / frames
+     );
++    let [across, rewritten] =
++        [&host::STRADDLING, &host::COPIED_REWRITTEN].map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed));
++    if across + rewritten > 0 {
++        tracing::info!(
++            "descriptor records copied as bytes, exact (VICTORY_MIRROR_EXACT=0: as before), per frame: {:.1} read whole across \
++             a 64 KiB page, {:.1} written again before they were made (made from the newer record, fingerprint forgotten)",
++            across as f64 / frames,
++            rewritten as f64 / frames
++        );
++    }
+ }
+ 
+ /// Whether [`sync_heaps`] hands a changed page's records to the host heap
+@@ -1298,6 +1324,149 @@
+         }
+         slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
+         // SAFETY: this allocation belongs to the test.
++        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
++    }
++
++    /// Verifies `HostHeap::copied` cache invalidation across API writes,
++    /// `texture_slot_gone()` unmakes and raw zeroing of API-made slots
++    /// (myokex c3723f3, `VICTORY_MIRROR_EXACT`).
++    #[cfg(windows)]
++    #[test]
++    fn copied_fingerprint_invalidates_across_api_writes_unmake_and_zeroing() {
++        use windows_sys::Win32::System::Memory::{
++            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
++        };
++        const MEM_WRITE_WATCH: u32 = 0x20_0000;
++        let memory = unsafe {
++            VirtualAlloc(
++                std::ptr::null(),
++                crate::watch::PAGE,
++                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
++                PAGE_READWRITE,
++            )
++        };
++        assert!(!memory.is_null());
++        let desc = HeapDesc {
++            kind: SAMPLERS,
++            count: 64,
++            flags: SHADER_VISIBLE,
++            nodes: 1,
++        };
++        let placement = Placement {
++            address: memory as u64,
++            size: 64 * 16,
++        };
++        let mut h: This = std::ptr::null();
++        assert_eq!(create(desc, placement, &mut h), S_OK);
++        if let Some(host) = heap(h).host() {
++            let mut scratch_a = [0u8; 16];
++            let mut scratch_b = [0u8; 16];
++            let sampler_a = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
++            let sampler_b = [0, 1, 1, 1, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
++            create_sampler(std::ptr::null(), &sampler_a, scratch_a.as_mut_ptr() as u64);
++            create_sampler(std::ptr::null(), &sampler_b, scratch_b.as_mut_ptr() as u64);
++
++            // Scenario A: Raw A -> API B -> Raw A must update back to A (not stay stuck on B).
++            let slot5 = memory as u64 + 5 * 16;
++            unsafe { std::ptr::copy_nonoverlapping(scratch_a.as_ptr(), slot5 as *mut u8, 16) };
++            sync_heaps();
++            let key_a = host.made_key(5);
++            assert_ne!(key_a, 0);
++
++            create_sampler(std::ptr::null(), &sampler_b, slot5);
++            let key_b = host.made_key(5);
++            assert_ne!(key_b, 0);
++            assert_ne!(key_b, key_a);
++
++            unsafe { std::ptr::copy_nonoverlapping(scratch_a.as_ptr(), slot5 as *mut u8, 16) };
++            sync_heaps();
++            assert_eq!(
++                host.made_key(5),
++                key_a,
++                "raw-copying A back over API-written B must not be skipped by stale copied cache"
++            );
++
++            // Scenario B: API A -> raw zeroing must clear host slot (not skip via `*last == 0 && all_zero`).
++            let slot6 = memory as u64 + 6 * 16;
++            create_sampler(std::ptr::null(), &sampler_a, slot6);
++            assert_eq!(host.made_key(6), key_a);
++            unsafe { std::ptr::write_bytes(slot6 as *mut u8, 0, 16) };
++            sync_heaps();
++            assert!(
++                !host.made(6),
++                "raw-zeroing an API-created slot must clear its host descriptor"
++            );
++
++            // Scenario C: Raw A -> unmake (texture_slot_gone) -> Raw A must re-make A.
++            let slot7 = memory as u64 + 7 * 16;
++            unsafe { std::ptr::copy_nonoverlapping(scratch_a.as_ptr(), slot7 as *mut u8, 16) };
++            sync_heaps();
++            assert_eq!(host.made_key(7), key_a);
++            assert!(host.texture_slot_gone(7));
++            assert!(!host.made(7));
++            unsafe { std::ptr::copy_nonoverlapping(scratch_a.as_ptr(), slot7 as *mut u8, 16) };
++            sync_heaps();
++            assert_eq!(
++                host.made_key(7),
++                key_a,
++                "raw-copying A back after unmake must not be skipped by stale copied cache"
++            );
++        }
++        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
++        // SAFETY: this allocation belongs to the test.
++        unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
++    }
++
++    /// A descriptor record straddling a 64 KiB page boundary in an unaligned
++    /// placed heap must be mirrored instead of skipped by both pages.
++    #[cfg(windows)]
++    #[test]
++    fn straddling_record_across_page_boundary_is_mirrored_on_sync() {
++        use windows_sys::Win32::System::Memory::{
++            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc, VirtualFree,
++        };
++        const MEM_WRITE_WATCH: u32 = 0x20_0000;
++        let memory = unsafe {
++            VirtualAlloc(
++                std::ptr::null(),
++                2 * crate::watch::PAGE,
++                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
++                PAGE_READWRITE,
++            )
++        };
++        assert!(!memory.is_null());
++        // Place 4096 16-byte sampler slots starting 8 bytes into page 0 so slot
++        // 4095 spans [memory + PAGE - 8, memory + PAGE + 8).
++        let start = memory as u64 + 8;
++        let desc = HeapDesc {
++            kind: SAMPLERS,
++            count: 4096,
++            flags: SHADER_VISIBLE,
++            nodes: 1,
++        };
++        let placement = Placement {
++            address: start,
++            size: 4096 * 16,
++        };
++        let mut h: This = std::ptr::null();
++        assert_eq!(create(desc, placement, &mut h), S_OK);
++        if let Some(host) = heap(h).host() {
++            let mut elsewhere = [0u64; 2];
++            let source = elsewhere.as_mut_ptr() as u64;
++            let sampler = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
++            create_sampler(std::ptr::null(), &sampler, source);
++            let slot_addr = (start + 4095 * 16) as *mut u8;
++            // SAFETY: slot 4095 lies inside our 2-page allocation.
++            unsafe { std::ptr::copy_nonoverlapping(source as *const u8, slot_addr, 16) };
++            assert!(!host.made(4095));
++            sync_heaps();
++            assert!(
++                host.made(4095),
++                "straddling record across 64 KiB page boundary must be mirrored"
++            );
++        }
++        slot::<extern "system" fn(This) -> u32>(h, 0x10)(h);
++        // SAFETY: this allocation belongs to the test.
+         unsafe { VirtualFree(memory, 0, MEM_RELEASE) };
+     }
+ 
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/host.rs W/crates/victory-gpu/src/host.rs
+--- S/crates/victory-gpu/src/host.rs	2026-11-25 20:53:33.000000000 +0200
++++ W/crates/victory-gpu/src/host.rs	2026-11-25 22:02:57.886570400 +0200
+@@ -848,6 +848,9 @@
+     /// The pair of timestamps its run is timed with since its last reset
+     /// (`crate::cardmeter`), or none.
+     meter: AtomicU32,
++    /// With `crate::cardmeter::pipelines`: the pair of the pipeline bound
++    /// last, open until the next one is bound or the list closes.
++    pipeline_meter: AtomicU32,
+     /// The texts of the markers `note_op` set, in order (for device-removed
+     /// data without marker texts), with the host GPU range a copy reads.
+     #[cfg(feature = "diagnostics")]
+@@ -3612,6 +3615,30 @@
+     wait.met()
+ }
+ 
++/// [`late_met`] without its settle: whether a bottom-of-pipe write of a
++/// flight in the air, or of one being landed, is known to meet `wait`.
++/// False says nothing about what else the flights may write there.
++/// (`VICTORY_JOIN_PARTS`, fxceless 3973179.)
++pub(crate) fn late_met_known(wait: &crate::list::ValueWait) -> bool {
++    let (address, bytes) = wait.place();
++    let line = line();
++    let writes = line.in_hand.iter().map(|(at, what, n)| (at, what, n)).chain(line.line.iter().filter_map(|item| match item {
++        Late::Write(at, what, n) => Some((at, what, n)),
++        _ => None,
++    }));
++    for (at, what, n) in writes {
++        if let crate::queue::Written::Value(v) = what
++            && *at == address
++            && *n >= bytes
++            && wait.holds_for(*v)
++        {
++            LATE_STATS[13].fetch_add(1, Ordering::Relaxed);
++            return true;
++        }
++    }
++    false
++}
++
+ /// Settles the flights in the air, if any ([`Host::settle`]), for reason
+ /// `why` (one of the `WHY_` places). Not from inside a submission.
+ pub(crate) fn settle_now(why: usize) {
+@@ -4380,6 +4407,7 @@
+                 window_check: OnceLock::new(),
+                 _alive: Counted::new(),
+                 meter: AtomicU32::new(u32::MAX),
++                pipeline_meter: AtomicU32::new(u32::MAX),
+                 #[cfg(feature = "diagnostics")]
+                 notes: Mutex::default(),
+                 #[cfg(feature = "diagnostics")]
+@@ -6745,7 +6773,12 @@
+             self.indirect_common(&scratch);
+         }
+         self.card_budget_out();
+-        crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.meter.swap(u32::MAX, Ordering::Relaxed)));
++        crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed)));
++        crate::cardmeter::end_named(
++            &self.list,
++            crate::cardmeter::Span::from_raw(self.meter.swap(u32::MAX, Ordering::Relaxed)),
++            &self.pipelines.lock().unwrap_or_else(|e| e.into_inner()),
++        );
+         #[cfg(feature = "diagnostics")]
+         if let Some((heap, back)) = self.stamps() {
+             let count = (self.notes.lock().unwrap_or_else(|e| e.into_inner()).len() as u32).min(STAMPS - 1);
+@@ -7188,6 +7221,13 @@
+         if !pipelines.contains(name) {
+             pipelines.insert(name.to_owned());
+         }
++        drop(pipelines);
++        // `VICTORY_CARD_METER_PIPELINES=1` (fxceless 3973179): the pipeline
++        // before it ends here on the card's clock.
++        if crate::cardmeter::pipelines() {
++            crate::cardmeter::end(&self.list, crate::cardmeter::Span::from_raw(self.pipeline_meter.swap(u32::MAX, Ordering::Relaxed)));
++            self.pipeline_meter.store(crate::cardmeter::begin_named(&self.list, name).raw(), Ordering::Relaxed);
++        }
+     }
+ 
+     fn deferred(&self) -> std::sync::MutexGuard<'_, Deferred> {
+@@ -7276,6 +7316,17 @@
+         self.deferred().writes.push((dst as usize, what, bytes));
+     }
+ 
++    /// Whether the list, once it has run, stores at `address` a value of
++    /// `bytes` bytes or more for which `holds` says yes (one of its
++    /// bottom-of-pipe writes, as [`late_met`] reads them of a flight;
++    /// `VICTORY_JOIN_PARTS`, fxceless 3973179).
++    pub(crate) fn will_write(&self, address: usize, bytes: usize, holds: impl Fn(u64) -> bool) -> bool {
++        self.deferred()
++            .writes
++            .iter()
++            .any(|(at, what, n)| *at == address && *n >= bytes && matches!(what, crate::queue::Written::Value(v) if holds(*v)))
++    }
++
+     /// A mapped upload buffer of `size` bytes, alive until the list is
+     /// reset.
+     ///
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/inplace.rs W/crates/victory-gpu/src/inplace.rs
+--- S/crates/victory-gpu/src/inplace.rs	2026-11-25 19:11:21.000000000 +0200
++++ W/crates/victory-gpu/src/inplace.rs	2026-11-25 21:59:37.520948700 +0200
+@@ -290,6 +290,23 @@
+     let mut v = views();
+     v.sections.retain(|s| s.0 != section);
+     v.sections.push((section, bytes, committed));
++    drop(v);
++    // A view of our own made on an earlier section that had this handle's
++    // number shows that section's pages, not this one's: it is forgotten
++    // (left mapped: nothing reads it any more) and the next store through
++    // a view of ours maps this section (myokex 3973179).
++    // `VICTORY_OWN_VIEW_FORGET=0`: kept, as before.
++    static FORGET: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    if !*FORGET.get_or_init(|| std::env::var_os("VICTORY_OWN_VIEW_FORGET").is_none_or(|v| v != "0")) {
++        return;
++    }
++    let gone = OWN.lock().unwrap_or_else(|e| e.into_inner()).as_mut().and_then(|own| own.remove(&section)).flatten();
++    if gone.is_some() {
++        tracing::info!(
++            section,
++            "a section handle's number came round again: our own view of the earlier section is forgotten (VICTORY_OWN_VIEW_FORGET=0: kept)"
++        );
++    }
+ }
+ 
+ /// The runtime mapped `[at, at + len)` as a view of `section` from
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/queue.rs W/crates/victory-gpu/src/queue.rs
+--- S/crates/victory-gpu/src/queue.rs	2026-11-25 19:11:21.000000000 +0200
++++ W/crates/victory-gpu/src/queue.rs	2026-11-25 22:01:15.812805800 +0200
+@@ -500,6 +500,190 @@
+     static RELEASING_HERE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+ }
+ 
++/// Whether parts that follow one another in the queues' lines go to the
++/// host as one submission (`VICTORY_JOIN_PARTS=1`; `alt`: twenty seconds
++/// with, twenty without, in turn, each change said in the log). Off by
++/// default. Needs [`behind`].
++///
++/// Why: the title's lists wait for memory values (19 to 20 waits a frame
++/// in the first rooms, each met by the bottom-of-pipe write of the part
++/// before it), and every wait cuts a submission into parts: 29 host
++/// submissions a frame from about 15 of the title's (run 238). Each part
++/// is prepared on its own: 82 askings of the write watch, 666 refresh
++/// steps, a heap sync, a merge under the flights in the air, and on the
++/// card one list of ours that sends changed bytes and one that compares.
++/// The title hands a frame over in one burst at the end of its recording,
++/// then stands still until the line has finished it (its fence wait of
++/// the next frame: run 238), so the parts are all in the lines when our
++/// thread gets to them.
++///
++/// With the switch the thread that runs the lines takes parts off them
++/// in the order they would have run and gives them to the host together:
++/// the same host lists in the same order, prepared once. Between two
++/// parts a wait passes if memory meets it, if a write of a flight in the
++/// air is known to meet it, or if a bottom-of-pipe write of a part taken
++/// before it meets it (that part is ahead of it in the joined
++/// submission, which is the order the wait asks for). A signal met
++/// behind parts not sent yet is delivered right behind the joined
++/// submission: never before the part it followed has run. Anything else
++/// (a wait not known to be met, a present, the end of what is free to
++/// run) sends what was taken first. At most [`join_most`] parts or
++/// [`join_lists`] lists are joined, so that the card has work while the
++/// next ones are prepared. Each queue with a part taken keeps the mark
++/// [`Held::Running`] at the head of its line until the part is sent:
++/// what the title gives the queue meanwhile, signals too, stays behind.
++#[cfg(windows)]
++fn join_parts() -> bool {
++    /// 0 off, 1 on, 2 in turn.
++    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
++    let mode = *MODE.get_or_init(|| {
++        let mode = match std::env::var("VICTORY_JOIN_PARTS").as_deref() {
++            Ok("1") => 1,
++            Ok("alt") => 2,
++            _ => 0,
++        };
++        if mode != 0 {
++            tracing::info!(
++                "parts that follow one another in the queues' lines go to the host as one submission, at most {} parts or {} lists (VICTORY_JOIN_PARTS=1; alt: in turn)",
++                join_most(),
++                join_lists()
++            );
++        }
++        mode
++    });
++    match mode {
++        0 => false,
++        1 => true,
++        _ => {
++            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
++            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
++            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
++            if LAST.swap(u8::from(on), Ordering::Relaxed) != u8::from(on) {
++                tracing::info!("parts joined into one host submission from now (VICTORY_JOIN_PARTS=alt): {}", if on { "ON" } else { "off, as usual" });
++            }
++            on
++        }
++    }
++}
++
++/// The most parts joined into one host submission (`VICTORY_JOIN_MOST`, 4).
++#[cfg(windows)]
++fn join_most() -> usize {
++    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    *N.get_or_init(|| std::env::var("VICTORY_JOIN_MOST").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(4))
++}
++
++/// The most host lists joined into one host submission (`VICTORY_JOIN_LISTS`, 48).
++#[cfg(windows)]
++fn join_lists() -> usize {
++    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    *N.get_or_init(|| std::env::var("VICTORY_JOIN_LISTS").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(48))
++}
++
++/// With [`join_parts`]: parts taken off the queues' lines and not yet
++/// given to the host, in the order they run.
++#[cfg(windows)]
++#[derive(Default)]
++struct Joined {
++    lists: Vec<crate::list::Detached>,
++    order: Vec<usize>,
++    parts: usize,
++    /// Signals met behind those parts: delivered when the parts are sent.
++    signals: Vec<(usize, u64)>,
++    /// The queues with a part here: each has [`Held::Running`] at the
++    /// head of its line.
++    marked: Vec<usize>,
++}
++
++#[cfg(windows)]
++impl Joined {
++    fn is_empty(&self) -> bool {
++        self.parts == 0
++    }
++
++    /// One more part behind those taken: its lists keep their order.
++    fn add(&mut self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
++        let (lists, order) = join(std::mem::take(&mut self.lists), std::mem::take(&mut self.order), lists, order);
++        self.lists = lists;
++        self.order = order;
++        self.parts += 1;
++    }
++
++    fn full(&self) -> bool {
++        self.parts >= join_most() || self.order.len() >= join_lists()
++    }
++
++    /// Whether a bottom-of-pipe write of a part taken meets `wait`.
++    fn meets(&self, wait: &crate::list::ValueWait) -> bool {
++        let (address, bytes) = wait.place();
++        self.order.iter().any(|&i| self.lists[i].host().will_write(address, bytes, |v| wait.holds_for(v)))
++    }
++}
++
++#[cfg(windows)]
++/// The things of one part behind those of another: `order` names places in
++/// `lists`, so the second part's places move up by the first's count.
++fn join<T>(mut lists: Vec<T>, mut order: Vec<usize>, more: Vec<T>, more_order: Vec<usize>) -> (Vec<T>, Vec<usize>) {
++    let base = lists.len();
++    lists.extend(more);
++    order.extend(more_order.into_iter().map(|i| i + base));
++    (lists, order)
++}
++
++/// Parts joined, host submissions they went in, their lists, signals
++/// delivered behind them, and waits passed for a write of a part taken.
++#[cfg(windows)]
++static JOINED: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
++
++/// Gives the host what [`Joined`] holds, as one submission, delivers the
++/// signals met behind it, and takes the marks off the lines. Called with
++/// no line locked.
++#[cfg(windows)]
++fn send_joined(joined: &mut Joined) {
++    if joined.parts > 0 {
++        let (lists, order) = (std::mem::take(&mut joined.lists), std::mem::take(&mut joined.order));
++        JOINED[0].fetch_add(joined.parts as u64, Ordering::Relaxed);
++        let sent = JOINED[1].fetch_add(1, Ordering::Relaxed) + 1;
++        JOINED[2].fetch_add(order.len() as u64, Ordering::Relaxed);
++        JOINED[3].fetch_add(joined.signals.len() as u64, Ordering::Relaxed);
++        if sent % 2048 == 0 {
++            let n: Vec<u64> = JOINED.iter().map(|n| n.swap(0, Ordering::Relaxed)).collect();
++            tracing::info!(
++                "parts joined (VICTORY_JOIN_PARTS=1): {} parts went to the host in {} submissions ({:.1} parts, {:.1} lists each), {} signals delivered behind them, {} waits passed for a write of a part not sent yet",
++                n[0],
++                n[1],
++                n[0] as f64 / n[1].max(1) as f64,
++                n[2] as f64 / n[1].max(1) as f64,
++                n[3],
++                n[4]
++            );
++        }
++        match crate::host::host() {
++            Some(host) => host.execute_late(lists, order),
++            // (Not reached: parts are only taken with a host.)
++            None => crate::list::recycle(lists, &order),
++        }
++        joined.parts = 0;
++    }
++    // Behind what was just sent, in the order they were met.
++    for (fence, value) in joined.signals.drain(..) {
++        if !crate::host::late_signal(fence, value) {
++            crate::fence::set(fence as This, value);
++        }
++    }
++    for q in joined.marked.drain(..) {
++        // SAFETY: a live queue, as in the loop that marked it.
++        let line = unsafe { &(*(q as *const Queue)).held };
++        let mut held = lock(line);
++        if matches!(held.first(), Some(Held::Running)) {
++            held.remove(0);
++        }
++        if held.is_empty() {
++            lock(&WAITING).retain(|&w| w != q);
++        }
++    }
++}
++
+ /// Before a submission of ours that is waited for, with [`behind`]: what
+ /// the queues hold and is free to run runs first, on this thread, so the
+ /// submission keeps its place behind them.
+@@ -526,6 +710,10 @@
+         }
+     }
+     let _leave = Leave(was_here);
++    // Parts taken and not sent yet ([`join_parts`]): none when the lines
++    // are forced, and none is left when this returns.
++    let joining = !all && behind() && crate::host::late() && crate::host::host().is_some() && join_parts();
++    let mut joined = Joined::default();
+     loop {
+         let queues = lock(&WAITING).clone();
+         let mut moved = false;
+@@ -534,17 +722,34 @@
+             let line = unsafe { &(*(q as *const Queue)).held };
+             let mut held = lock(line);
+             loop {
+-                match held.first() {
++                // A queue with a part in `joined` has our mark at the head
++                // of its line: what is looked at is behind the mark.
++                let base = usize::from(joined.marked.contains(&q));
++                match held.get(base) {
+                     None | Some(Held::Running) => break,
+                     Some(&Held::Wait(fence, value))
+                         if !all && crate::fence::completed(fence as This) < value =>
+                     {
+                         break;
+                     }
++                    // With parts taken and not sent: only what is known
++                    // without a wait for the card. A wait that stays is
++                    // looked at again when the parts have been sent.
++                    Some(Held::Value(wait)) if !all && !joined.is_empty() => {
++                        if !wait.met() && !crate::host::late_met_known(wait) {
++                            if !joined.meets(wait) {
++                                break;
++                            }
++                            JOINED[4].fetch_add(1, Ordering::Relaxed);
++                        }
++                    }
+                     Some(Held::Value(wait)) if !all && !value_met(wait) => break,
++                    // The frame is shown behind the parts taken: they are
++                    // sent first.
++                    Some(Held::Present(..)) if !joined.is_empty() => break,
+                     Some(_) => {}
+                 }
+-                match held.remove(0) {
++                match held.remove(base) {
+                     Held::Wait(..) | Held::Running => {}
+                     Held::Value(wait) => {
+                         // Passed at a present without being met: what the
+@@ -582,6 +787,22 @@
+                                 crate::copystat::add(crate::copystat::C::PartsTogether, 1);
+                             }
+                         }
++                        if joining {
++                            // Taken, to go with the parts that follow it.
++                            // The line stays open behind our mark.
++                            if !joined.marked.contains(&q) {
++                                held.insert(0, Held::Running);
++                                joined.marked.push(q);
++                            }
++                            joined.add(lists, order);
++                            if joined.full() {
++                                drop(held);
++                                send_joined(&mut joined);
++                                held = lock(line);
++                            }
++                            moved = true;
++                            continue;
++                        }
+                         if crate::host::late()
+                             && let Some(host) = crate::host::host()
+                         {
+@@ -653,7 +874,10 @@
+                     // Behind what was sent to the card and not waited
+                     // for, if anything was.
+                     Held::Signal(fence, value) => {
+-                        if !crate::host::late_signal(fence, value) {
++                        if !joined.is_empty() {
++                            // Behind parts not sent yet: with them.
++                            joined.signals.push((fence, value));
++                        } else if !crate::host::late_signal(fence, value) {
+                             crate::fence::set(fence as This, value);
+                         }
+                     }
+@@ -665,7 +889,12 @@
+             }
+         }
+         if !moved {
+-            break;
++            if joined.is_empty() {
++                break;
++            }
++            // Nothing more is free to run behind the parts taken: they go
++            // to the host, and what stood at a wait is looked at again.
++            send_joined(&mut joined);
+         }
+     }
+ }
+@@ -1303,6 +1532,21 @@
+ #[cfg(test)]
+ mod tests {
+     use super::*;
++
++    #[cfg(windows)]
++    #[test]
++    fn joined_parts_keep_their_lists_and_their_order() {
++        // a part of three lists run as 2, 0, 1; then one of two run as 1, 0; then one of one
++        let (lists, order) = join(vec!["a0", "a1", "a2"], vec![2, 0, 1], vec!["b0", "b1"], vec![1, 0]);
++        let (lists, order) = join(lists, order, vec!["c0"], vec![0]);
++        assert_eq!(lists, ["a0", "a1", "a2", "b0", "b1", "c0"]);
++        let run: Vec<&str> = order.iter().map(|&i| lists[i]).collect();
++        assert_eq!(run, ["a2", "a0", "a1", "b1", "b0", "c0"], "each part's lists in its own order, the parts one after the other");
++        // a part with a list named twice, and an empty one
++        let (lists, order) = join(vec!["a0"], vec![0, 0], Vec::new(), Vec::new());
++        let (lists, order) = join(lists, order, vec!["b0"], vec![0, 0]);
++        assert_eq!(order.iter().map(|&i| lists[i]).collect::<Vec<_>>(), ["a0", "a0", "b0", "b0"]);
++    }
+     use crate::object::slot;
+ 
+     /// Where a queue's signal is: newer layouts have it two slots later.
+diff -ruN '--exclude=target' S/crates/victory-gpu/src/watch.rs W/crates/victory-gpu/src/watch.rs
+--- S/crates/victory-gpu/src/watch.rs	2026-11-25 19:11:21.000000000 +0200
++++ W/crates/victory-gpu/src/watch.rs	2026-11-25 21:58:28.238958000 +0200
+@@ -523,11 +523,36 @@
+     let g = guards();
+     let first = start / BLOCK;
+     g.protected.contains(&first)
+-        || g.absent.contains(&first)
++        || (g.absent.contains(&first) && !absent_private())
+         || (view_known() && g.viewed.contains(&first))
+         || (view_set() && covered(&g.views, first, first + 1))
+ }
+ 
++/// Whether a block noted absent is asked about again before it is taken
++/// for view memory (myokex c3723f3): the title may commit private memory
++/// there later (`MEM_WRITE_WATCH` or ordinary), which must not be made a
++/// read-only guard. Such a block is never guarded, stays noted, and counts
++/// as written at every asking (nothing watches it).
++/// `VICTORY_ABSENT_PRIVATE=0`: an absent block is a view, as before.
++fn absent_private() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        let on = std::env::var_os("VICTORY_ABSENT_PRIVATE").is_none_or(|v| v != "0");
++        tracing::info!(
++            "write watch: blocks noted absent that turn into private memory {} (VICTORY_ABSENT_PRIVATE={})",
++            if on { "are never guarded and count as written" } else { "are guarded as views, as before" },
++            if on { "1, the default" } else { "0" }
++        );
++        on
++    })
++}
++
++/// With [`absent_private`]: whether `block`, noted absent and committed
++/// now, is memory that is no view.
++fn turned_private(block: usize) -> bool {
++    absent_private() && !is_view(block * BLOCK, (block + 1) * BLOCK)
++}
++
+ struct Guards {
+     /// Blocks we made read-only.
+     protected: BTreeSet<usize>,
+@@ -764,7 +789,10 @@
+             VIEW_STATS[5].fetch_add(1, Relaxed);
+             g.parked_ordinary.remove(&block);
+             g.parked.remove(&block);
+-            g.absent.remove(&block);
++            // (Left absent if private memory now, for `guard_unclean`.)
++            if !turned_private(block) {
++                g.absent.remove(&block);
++            }
+             g.unclean.insert(block);
+         }
+     }
+@@ -789,7 +817,7 @@
+     let known = !*ASK.get_or_init(|| std::env::var_os("VICTORY_GUARD_ASK").is_some_and(|v| v == "1")) && {
+         let g = guards();
+         g.protected.contains(&first)
+-            || g.absent.contains(&first)
++            || (g.absent.contains(&first) && !absent_private())
+             || (view_known() && g.viewed.contains(&first))
+             || (view_set() && covered(&g.views, first, last))
+     };
+@@ -831,7 +859,12 @@
+                 uncommitted_until = uncommitted_end(block);
+             }
+             open = block >= uncommitted_until;
+-            if open {
++            if open && turned_private(block) {
++                // Private memory now (`VICTORY_ABSENT_PRIVATE`): not
++                // guarded, still noted, written.
++                written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
++                open = false;
++            } else if open {
+                 g.absent.remove(&block);
+             }
+         }
+@@ -894,6 +927,13 @@
+                 flush(g, &mut run);
+                 continue;
+             }
++            if turned_private(block) {
++                // Private memory now (`VICTORY_ABSENT_PRIVATE`): not
++                // guarded, still noted, written.
++                written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
++                flush(g, &mut run);
++                continue;
++            }
+             g.absent.remove(&block);
+         }
+         written.extend(block * BLOCK / PAGE..(block + 1) * BLOCK / PAGE);
+@@ -1665,7 +1705,16 @@
+         assert_eq!(unsafe { VirtualAlloc((p + BLOCK) as _, BLOCK, MEM_COMMIT, PAGE_READWRITE) } as usize, p + BLOCK);
+         SUBMISSIONS.fetch_add(park_epoch(), std::sync::atomic::Ordering::Relaxed);
+         assert_eq!(guard(p, p + 2 * BLOCK), Some(pages(1).collect()));
+-        assert_eq!(guard(p, p + 2 * BLOCK), Some(Vec::new()));
++        if absent_private() {
++            // Private memory now, committed with no word from the runtime
++            // (`VICTORY_ABSENT_PRIVATE`): never guarded, written at every
++            // asking.
++            assert!(writable(p + BLOCK));
++            assert_eq!(guard(p, p + 2 * BLOCK), Some(pages(1).collect()));
++            guards().absent.remove(&(p / BLOCK + 1));
++        } else {
++            assert_eq!(guard(p, p + 2 * BLOCK), Some(Vec::new()));
++        }
+         title_memory_remapped(p, 2 * BLOCK);
+         // SAFETY: our reservation, no longer known to the guards.
+         unsafe { VirtualFree(p as _, 0, MEM_RELEASE) };
+@@ -2012,6 +2061,129 @@
+         writing(top, PAGE);
+         title_memory_remapped(top, usize::MAX);
+     }
++
++    /// An uncommitted address noted in `g.absent` that is later allocated as
++    /// `MEM_WRITE_WATCH` or ordinary `MEM_PRIVATE` memory must not be hijacked
++    /// into `PAGE_READONLY` guarded memory.
++    #[test]
++    fn absent_block_reallocated_as_private_memory_is_not_guarded() {
++        use windows_sys::Win32::System::Memory::{
++            MEM_COMMIT, MEM_RELEASE, MEM_RESERVE, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc,
++            VirtualFree,
++        };
++        const MEM_WRITE_WATCH: u32 = 0x20_0000;
++
++        // 1. Reserve an uncommitted 64 KiB block and observe it via `writes`,
++        //    which records the block in `g.absent`.
++        let reserved = unsafe { VirtualAlloc(std::ptr::null(), PAGE, MEM_RESERVE, PAGE_NOACCESS) };
++        assert!(!reserved.is_null());
++        let addr = reserved as usize;
++        assert!(writes(addr, addr + PAGE, true).is_some());
++        assert!(guards().absent.contains(&(addr / BLOCK)));
++        assert_ne!(unsafe { VirtualFree(reserved, 0, MEM_RELEASE) }, 0);
++
++        // 2. Reallocate the exact same virtual address as MEM_WRITE_WATCH private memory.
++        let watched = unsafe {
++            VirtualAlloc(
++                reserved,
++                PAGE,
++                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
++                PAGE_READWRITE,
++            )
++        };
++        assert_eq!(watched, reserved);
++        assert!(writes(addr, addr + PAGE, true).is_some());
++        assert!(
++            writable(addr),
++            "MEM_WRITE_WATCH private memory at a formerly absent address must remain writable"
++        );
++        assert!(!guards().protected.contains(&(addr / BLOCK)));
++        assert_ne!(unsafe { VirtualFree(watched, 0, MEM_RELEASE) }, 0);
++
++        // 3. Re-mark `addr` absent while free, then commit ordinary MEM_PRIVATE memory there.
++        let reserved2 = unsafe { VirtualAlloc(reserved, PAGE, MEM_RESERVE, PAGE_NOACCESS) };
++        assert_eq!(reserved2, reserved);
++        assert!(writes(addr, addr + PAGE, true).is_some());
++        assert!(guards().absent.contains(&(addr / BLOCK)));
++        assert_ne!(unsafe { VirtualFree(reserved2, 0, MEM_RELEASE) }, 0);
++
++        let plain = unsafe { VirtualAlloc(reserved, PAGE, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
++        assert_eq!(plain, reserved);
++        // Ours: with the view set (`VICTORY_VIEW_SET`) the range stays
++        // noted as views until the runtime remaps it, so `writes` answers
++        // (myokex: `None`); what matters is that the block is not guarded.
++        let answer = writes(addr, addr + PAGE, true);
++        assert!(
++            answer.is_none() || view_set(),
++            "ordinary MEM_PRIVATE memory at a formerly absent address must not be treated as a view"
++        );
++        SUBMISSIONS.fetch_add(park_epoch(), std::sync::atomic::Ordering::Relaxed);
++        let _ = writes(addr, addr + PAGE, true);
++        assert!(writable(addr));
++        assert!(!guards().protected.contains(&(addr / BLOCK)));
++        // (Left allocated: what was noted as written there would be told to
++        // the next test that gets the address.)
++        // Clean up the test's absent entry.
++        guards().absent.remove(&(addr / BLOCK));
++        guards().unclean.remove(&(addr / BLOCK));
++    }
++
++    /// The same behind a view: a block of a range that starts with a view
++    /// turns into private memory. It stays writable however often the range
++    /// is asked about, and counts as written each time (nothing watches it).
++    #[test]
++    fn private_memory_behind_a_view_is_never_guarded() {
++        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
++        use windows_sys::Win32::System::Memory::{
++            CreateFileMappingW, FILE_MAP_WRITE, MEM_COMMIT, MEM_RELEASE, MEM_RESERVE,
++            MapViewOfFileEx, PAGE_NOACCESS, PAGE_READWRITE, VirtualAlloc, VirtualFree,
++        };
++        // SAFETY: memory of this test alone: a view of one block and a
++        // reservation right behind it, where a larger one was just released.
++        unsafe {
++            let section = CreateFileMappingW(
++                INVALID_HANDLE_VALUE,
++                std::ptr::null(),
++                PAGE_READWRITE,
++                0,
++                BLOCK as u32,
++                std::ptr::null(),
++            );
++            assert!(!section.is_null());
++            // Another test's thread may take the released addresses first.
++            let mut found = None;
++            for _ in 0..64 {
++                let both = VirtualAlloc(std::ptr::null(), 2 * BLOCK, MEM_RESERVE, PAGE_NOACCESS);
++                assert!(!both.is_null());
++                assert_ne!(VirtualFree(both, 0, MEM_RELEASE), 0);
++                let view = MapViewOfFileEx(section, FILE_MAP_WRITE, 0, 0, BLOCK, both).Value;
++                let behind = both as usize + BLOCK;
++                let reserved = VirtualAlloc(behind as *const _, BLOCK, MEM_RESERVE, PAGE_NOACCESS);
++                if view == both && reserved as usize == behind {
++                    found = Some((both as usize, behind, reserved));
++                    break;
++                }
++            }
++            let (start, behind, reserved) = found.expect("a view with a reservation behind it");
++            assert!(writes(start, start + 2 * BLOCK, true).is_some());
++            assert!(guards().absent.contains(&(behind / BLOCK)));
++            let plain = VirtualAlloc(reserved, BLOCK, MEM_COMMIT, PAGE_READWRITE);
++            assert_eq!(plain, reserved);
++            for round in 0..3 {
++                let (_, written) = writes(start, start + 2 * BLOCK, true).unwrap();
++                assert!(writable(behind), "round {round}: private memory was made read-only");
++                assert!(!guards().protected.contains(&(behind / BLOCK)), "round {round}");
++                assert!(
++                    written.iter().any(|&(page, _)| page * PAGE == behind),
++                    "round {round}: what nothing watches counts as written"
++                );
++            }
++            // The two blocks stay taken: what was noted as written there
++            // would be told to the next test that gets these addresses.
++            guards().absent.remove(&(behind / BLOCK));
++            CloseHandle(section);
++        }
++    }
+ }
+ 
+ #[cfg(test)]
+diff -ruN '--exclude=target' S/crates/victory-hle/src/modules/dstorage.rs W/crates/victory-hle/src/modules/dstorage.rs
+--- S/crates/victory-hle/src/modules/dstorage.rs	2026-11-25 19:11:21.000000000 +0200
++++ W/crates/victory-hle/src/modules/dstorage.rs	2026-11-25 21:53:58.935579800 +0200
+@@ -1086,17 +1086,11 @@
+         return filled;
+     }
+     let offset = (request.page_offset & 0xffff) as usize;
+-    // SAFETY: the title passes a page number per 64 KiB of destination,
+-    // which holds at least `len` bytes from `offset`.
+-    let pages = unsafe {
+-        std::slice::from_raw_parts(
+-            request.destination.cast::<usize>(),
+-            (offset + len).div_ceil(PAGE),
+-        )
+-    };
++    let (array, count) = (request.destination.cast::<usize>().cast_const(), (offset + len).div_ceil(PAGE));
++    let mut pages = filled(array, count);
+     // Consecutive pages of one allocation (the usual case): written in
+     // place through one view.
+-    if let Some(mut window) = super::xmem::page_window(pages, offset, len) {
++    if let Some(mut window) = super::xmem::page_window(&pages, offset, len) {
+         let filled = fill(window.bytes()).map(drop);
+         drop(window);
+         // The title maps pages where the card reads them and has them
+@@ -1104,7 +1098,7 @@
+         // learn of the bytes only from this (upstream c75fdba, fork PR
+         // #571). After a decode that failed part way too: what it wrote
+         // is there.
+-        super::xmem::pages_written(pages, offset, len);
++        super::xmem::pages_written(&pages, offset, len);
+         return filled;
+     }
+     let mut data = vec![0; len];
+@@ -1122,12 +1116,14 @@
+     // Since the start: writes that succeeded on a later try, and writes
+     // given up.
+     static RETRIED: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+-    let mut written = super::xmem::write_physical(pages, offset, &data[..n]);
++    let mut written = super::xmem::write_physical(&pages, offset, &data[..n]);
+     let mut tries = 0u32;
+     while !written && tries < retries {
+         std::thread::sleep(std::time::Duration::from_millis((2u64 << tries.min(6)).min(128)));
+         tries += 1;
+-        written = super::xmem::write_physical(pages, offset, &data[..n]);
++        // The title may have filled the array only now.
++        pages = page_numbers(array, count);
++        written = super::xmem::write_physical(&pages, offset, &data[..n]);
+     }
+     if written {
+         if tries > 0 {
+@@ -1142,12 +1138,12 @@
+             );
+         }
+         // As above, after the write that succeeded.
+-        super::xmem::pages_written(pages, offset, n);
++        super::xmem::pages_written(&pages, offset, n);
+         Ok(())
+     } else {
+         let given_up = RETRIED[1].fetch_add(1, Ordering::Relaxed) + 1;
+         tracing::warn!(
+-            known = super::xmem::pages_known(pages, offset, len),
++            known = super::xmem::pages_known(&pages, offset, len),
+             tries,
+             given_up,
+             on_a_retry = RETRIED[0].load(Ordering::Relaxed),
+@@ -1161,12 +1157,67 @@
+             offset,
+             len,
+             pages = pages.len(),
++            first = format_args!("{:#x}", pages.first().copied().unwrap_or(0)),
++            options = format_args!("{:#x}", request.options),
+             "dstorage: a destination's physical pages could not be written (unknown page or a host failure); its request fails"
+         );
+         Err(E_INVALIDARG)
+     }
+ }
+ 
++/// The page numbers the title's array holds now.
++fn page_numbers(array: *const usize, n: usize) -> Vec<usize> {
++    // SAFETY: the title passes a page number per 64 KiB of destination and
++    // keeps the array until the request completes; it may write it from
++    // another thread meanwhile.
++    (0..n).map(|i| unsafe { array.add(i).read_volatile() }).collect()
++}
++
++/// The page numbers of a destination. The title fills the array after it
++/// enqueued the request (a copy taken then holds zeros, or the numbers of
++/// the array's last use), so it is read when the request runs; a number
++/// that is still zero then is waited for, a tenth of a second at most
++/// (myokex c3723f3). `VICTORY_DSTORAGE_LATE_PAGES=0`: not waited for, as
++/// before.
++fn filled(array: *const usize, n: usize) -> Vec<usize> {
++    static LATE: AtomicU64 = AtomicU64::new(0);
++    let mut pages = page_numbers(array, n);
++    if !pages.contains(&0) || !late_pages() {
++        return pages;
++    }
++    let began = std::time::Instant::now();
++    while pages.contains(&0) && began.elapsed() < std::time::Duration::from_millis(100) {
++        std::thread::sleep(std::time::Duration::from_millis(2));
++        pages = page_numbers(array, n);
++    }
++    let late = LATE.fetch_add(1, Ordering::Relaxed) + 1;
++    if late <= 8 || late.is_power_of_two() {
++        tracing::warn!(
++            requests = late,
++            pages = n,
++            waited_ms = began.elapsed().as_millis() as u64,
++            filled = !pages.contains(&0),
++            "dstorage: a request ran before its page array was filled"
++        );
++    }
++    pages
++}
++
++/// Whether [`filled`] waits for page numbers the title writes after the
++/// request (`VICTORY_DSTORAGE_LATE_PAGES`, on unless `0`).
++fn late_pages() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| {
++        let on = std::env::var_os("VICTORY_DSTORAGE_LATE_PAGES").is_none_or(|v| v != "0");
++        tracing::info!(
++            "dstorage: page arrays filled after the request {} (VICTORY_DSTORAGE_LATE_PAGES={})",
++            if on { "are waited for, 100 ms at most" } else { "are not waited for" },
++            if on { "1, the default" } else { "0" }
++        );
++        on
++    })
++}
++
+ /// Slots by the 2020 order, which the argument shapes at
+ /// the title's call sites match (0x18, 0x20, 0x30 and 0x40 are called).
+ static QUEUE_VTABLE: Methods<12> = Methods([
+@@ -1321,6 +1372,20 @@
+     }
+ 
+     #[test]
++    fn a_page_array_filled_late_is_waited_for() {
++        let array: &'static [std::sync::atomic::AtomicUsize] = Box::leak(Box::new([std::sync::atomic::AtomicUsize::new(7), std::sync::atomic::AtomicUsize::new(0)]));
++        let title = std::thread::spawn(move || {
++            std::thread::sleep(std::time::Duration::from_millis(10));
++            array[1].store(8, Ordering::Release);
++        });
++        assert_eq!(filled(array.as_ptr().cast(), 2), [7, 8]);
++        title.join().unwrap();
++        // One never filled is given up on.
++        array[0].store(0, Ordering::Release);
++        assert_eq!(filled(array.as_ptr().cast(), 2), [0, 8]);
++    }
++
++    #[test]
+     fn request_layout_is_the_titles() {
+         assert_eq!(size_of::<Request>(), 0x48);
+         assert_eq!(std::mem::offset_of!(Request, destination_size), 0x18);
+diff -ruN '--exclude=target' S/crates/victory-loader/src/console_insn.rs W/crates/victory-loader/src/console_insn.rs
+--- S/crates/victory-loader/src/console_insn.rs	2026-11-25 19:11:21.000000000 +0200
++++ W/crates/victory-loader/src/console_insn.rs	2026-11-25 22:00:35.148499100 +0200
+@@ -97,6 +97,99 @@
+     Some(to.min(end))
+ }
+ 
++/// Whether the 15-byte `clzero` loop is taken whole (myokex 3973179;
++/// `VICTORY_CLZERO_LOOP15=0`: line by line, as before).
++fn loop15() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_CLZERO_LOOP15").is_none_or(|v| v != "0"))
++}
++
++/// The register `r` of `ctx` (CONTEXT order: rax, rcx, rdx, rbx, rsp, rbp, rsi, rdi, r8..r15).
++fn register(ctx: &mut CONTEXT, r: u8) -> &mut u64 {
++    match r & 15 {
++        0 => &mut ctx.Rax,
++        1 => &mut ctx.Rcx,
++        2 => &mut ctx.Rdx,
++        3 => &mut ctx.Rbx,
++        4 => &mut ctx.Rsp,
++        5 => &mut ctx.Rbp,
++        6 => &mut ctx.Rsi,
++        7 => &mut ctx.Rdi,
++        8 => &mut ctx.R8,
++        9 => &mut ctx.R9,
++        10 => &mut ctx.R10,
++        11 => &mut ctx.R11,
++        12 => &mut ctx.R12,
++        13 => &mut ctx.R13,
++        14 => &mut ctx.R14,
++        _ => &mut ctx.R15,
++    }
++}
++
++/// Where the lines of the loop `mov rax, ptr; add ptr, 0x40; clzero; cmp ptr, end; jb` end,
++/// from the state the loop has at its `clzero`: the line at `rax` is zeroed now, and one
++/// more at `ptr` for every pass the `cmp` sends back. None if this is not the plain case
++/// the loop makes (the line at `rax` on a 64-byte boundary, `ptr` the next line, under
++/// 2 GiB in all): then every line is taken alone, as the instruction itself does it.
++fn loop15_end(rax: usize, ptr: usize, end: usize) -> Option<usize> {
++    if rax & 63 != 0 || ptr != rax.wrapping_add(64) || ptr < rax {
++        return None;
++    }
++    let more = if ptr < end { (end - ptr).div_ceil(64) } else { 0 };
++    let last = ptr.checked_add(more.checked_mul(64)?)?;
++    (last - rax < 2 << 30).then_some(last)
++}
++
++/// The `clzero` at `rip` in the loop `mov rax, ptr; add ptr, 0x40; clzero; cmp ptr, end; jb`,
++/// with all the lines the loop would still zero: `Some(true)` when they are zeroed and the
++/// registers stand as the loop leaves them at its last `clzero` (the caller steps over the
++/// instruction; the title's own `cmp` and `jb` then leave the loop), `Some(false)` when the
++/// first line is not writable (the real instruction faults there too), and when only a
++/// first part was writable the registers stand at the line after it, where the instruction
++/// runs again. None if it is not that loop: the lone instruction is emulated.
++///
++/// # Safety
++/// `rip` is the faulting instruction of `ctx`, whose bytes were read.
++unsafe fn clzero_loop15(ctx: &mut CONTEXT, rip: usize, ptr_reg: u8, end_reg: u8) -> Option<bool> {
++    // The seven bytes in front of it: in the same page as the instruction, which ran.
++    if rip & 0xFFF < 7 && !readable(rip - 7, 7) {
++        return None;
++    }
++    // SAFETY: readable, as checked or as the instruction's own page.
++    let before = unsafe { std::slice::from_raw_parts((rip - 7) as *const u8, 7) };
++    if !decode::loop15_head(before, ptr_reg) || end_reg == 0 || end_reg == ptr_reg {
++        return None;
++    }
++    let rax = ctx.Rax as usize;
++    let ptr = *register(ctx, ptr_reg) as usize;
++    let end = *register(ctx, end_reg) as usize;
++    let last = loop15_end(rax, ptr, end)?;
++    // Region by region, as the 12-byte loop: a block may lie across several views.
++    let mut at = rax;
++    while at < last {
++        let Some(to) = writable_to(at, last) else { break };
++        // A region ends on a page boundary, so `to` is on a line boundary as `at` is.
++        // SAFETY: committed and writable from `at` to `to`.
++        unsafe { std::ptr::write_bytes(at as *mut u8, 0, to - at) };
++        at = to;
++    }
++    if at == rax {
++        return Some(false);
++    }
++    ZEROED.fetch_add((at - rax) as u64, Relaxed);
++    if at < last {
++        // What follows is not writable: the loop stands at that line's `clzero` now, where
++        // the real one faults too. The instruction runs again (the caller must not step).
++        ctx.Rax = at as u64;
++        *register(ctx, ptr_reg) = (at + 64) as u64;
++        ctx.Rip = (rip as u64).wrapping_sub(3);
++        return Some(true);
++    }
++    ctx.Rax = (last - 64) as u64;
++    *register(ctx, ptr_reg) = last as u64;
++    Some(true)
++}
++
+ /// An illegal instruction at `ctx.Rip`: a console-only one is emulated and stepped over
+ /// (`CONTINUE_EXECUTION`); anything else returns 0 (the crash report and the title's handlers
+ /// see it).
+@@ -151,7 +244,21 @@
+         }
+         ConsoleOnly::Monitorx => {}
+         ConsoleOnly::Mwaitx => std::hint::spin_loop(),
+-        ConsoleOnly::Clzero => {
++        ConsoleOnly::Clzero | ConsoleOnly::ClzeroStep { .. } => {
++            // The loop `mov rax, ptr; add ptr, 0x40; clzero; cmp ptr, end; jb` (the title's
++            // +0x4e8ab4c and three more like it zero 896 to 7,040 bytes each, a line an
++            // exception) is taken whole from the line it stands at.
++            if let ConsoleOnly::ClzeroStep { ptr_reg, end_reg } = what
++                && loop15()
++                && let Some(done) = unsafe { clzero_loop15(ctx, rip, ptr_reg, end_reg) }
++            {
++                if !done {
++                    return 0;
++                }
++                ctx.Rip += len as u64;
++                EMULATED.fetch_add(1, Relaxed);
++                return CONTINUE_EXECUTION;
++            }
+             // with an address-size prefix (0x67) the line is at EAX, zero-extended
+             let a32 = code[..len - 3].contains(&0x67);
+             let line = (if a32 { ctx.Rax & 0xFFFF_FFFF } else { ctx.Rax } as usize) & !63;
+@@ -247,3 +354,102 @@
+     }
+     CONTINUE_EXECUTION
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    /// What the title's loop leaves, run line by line as the processor would: the lines it
++    /// zeroed and the registers (rax, ptr) at the end, from the state at its first `clzero`.
++    fn by_hand(mut rax: usize, mut ptr: usize, end: usize) -> (Vec<usize>, usize, usize) {
++        let mut lines = vec![rax & !63];
++        while ptr < end {
++            rax = ptr;
++            ptr += 0x40;
++            lines.push(rax & !63);
++        }
++        (lines, rax, ptr)
++    }
++
++    #[test]
++    fn the_15_byte_loop_ends_where_the_processor_would_end_it() {
++        for (rax, len) in [(0x1000usize, 7040usize), (0x1000, 3264), (0x1000, 3776), (0x1000, 896), (0x4000, 64), (0x4000, 65), (0x4000, 100), (0x4000, 1), (0x4000, 0), (0x8000, 128)] {
++            let (ptr, end) = (rax + 64, rax + len);
++            let (lines, last_rax, last_ptr) = by_hand(rax, ptr, end);
++            let last = loop15_end(rax, ptr, end).expect("the plain case");
++            assert_eq!(last, last_ptr, "rax {rax:#x} len {len}");
++            assert_eq!(last - 64, last_rax, "rax {rax:#x} len {len}");
++            assert_eq!((last - rax) / 64, lines.len(), "rax {rax:#x} len {len}");
++            assert_eq!(*lines.last().unwrap(), last - 64);
++        }
++        // an end before the pointer: the line at rax alone
++        assert_eq!(loop15_end(0x1000, 0x1040, 0x800), Some(0x1040));
++        // not the plain case: a line not on a boundary, a pointer that is not the next line
++        assert_eq!(loop15_end(0x1008, 0x1048, 0x2000), None);
++        assert_eq!(loop15_end(0x1000, 0x1080, 0x2000), None);
++        assert_eq!(loop15_end(0x1000, 0x1040, 0x1000 + (3 << 30)), None, "over 2 GiB");
++    }
++
++    /// The loop as the title has it at +0x4e8ab4c, for the given registers.
++    fn code(ptr_reg: u8, end_reg: u8) -> Vec<u8> {
++        let (ph, pl, eh, el) = (ptr_reg >> 3, ptr_reg & 7, end_reg >> 3, end_reg & 7);
++        vec![
++            0x48 | ph << 2, 0x89, 0xC0 | pl << 3, // mov rax, ptr
++            0x48 | ph, 0x83, 0xC0 | pl, 0x40, // add ptr, 0x40
++            0x0F, 0x01, 0xFC, // clzero
++            0x48 | eh << 2 | ph, 0x39, 0xC0 | el << 3 | pl, // cmp ptr, end
++            0x72, 0xF1, // jb -15
++            0x90,
++        ]
++    }
++
++    #[test]
++    fn the_15_byte_loop_is_zeroed_whole_and_leaves_the_loop_s_registers() {
++        for (ptr_reg, end_reg, len) in [(10u8, 11u8, 7040usize), (9, 10, 3264), (8, 9, 3776), (2, 8, 896), (10, 11, 64), (10, 11, 100)] {
++            let code = code(ptr_reg, end_reg);
++            // a block of 0xAA with room on both sides, its start on a line boundary
++            let mut block = vec![0xAAu8; 16384];
++            let base = (block.as_mut_ptr() as usize + 4096 + 63) & !63;
++            // SAFETY: plain data.
++            let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
++            ctx.Rip = code.as_ptr() as u64 + 7;
++            ctx.Rax = base as u64;
++            *register(&mut ctx, ptr_reg) = base as u64 + 64;
++            *register(&mut ctx, end_reg) = (base + len) as u64;
++            // SAFETY: the context points at the code above.
++            assert_eq!(unsafe { emulate(&mut ctx) }, CONTINUE_EXECUTION);
++            let (lines, last_rax, last_ptr) = by_hand(base, base + 64, base + len);
++            assert_eq!(ctx.Rip, code.as_ptr() as u64 + 10, "at the loop's own cmp");
++            assert_eq!(ctx.Rax as usize, last_rax);
++            assert_eq!(*register(&mut ctx, ptr_reg) as usize, last_ptr);
++            assert_eq!(*register(&mut ctx, end_reg) as usize, base + len, "the end is left alone");
++            let zeroed = lines.len() * 64;
++            let at = base - block.as_ptr() as usize;
++            assert!(block[at..at + zeroed].iter().all(|&b| b == 0), "{zeroed} bytes zeroed");
++            assert!(block[..at].iter().all(|&b| b == 0xAA), "nothing before the block");
++            assert!(block[at + zeroed..].iter().all(|&b| b == 0xAA), "nothing after its last line");
++        }
++    }
++
++    #[test]
++    fn a_clzero_that_only_looks_like_the_loop_is_one_line() {
++        // the same bytes behind it, another head in front (add ptr, 0x80): one line, one step
++        let mut code = code(10, 11);
++        code[6] = 0x80;
++        let mut block = vec![0xAAu8; 8192];
++        let base = (block.as_mut_ptr() as usize + 2048 + 63) & !63;
++        // SAFETY: plain data.
++        let mut ctx: CONTEXT = unsafe { std::mem::zeroed() };
++        ctx.Rip = code.as_ptr() as u64 + 7;
++        ctx.Rax = base as u64;
++        ctx.R10 = base as u64 + 64;
++        ctx.R11 = base as u64 + 640;
++        // SAFETY: the context points at the code above.
++        assert_eq!(unsafe { emulate(&mut ctx) }, CONTINUE_EXECUTION);
++        assert_eq!(ctx.Rip, code.as_ptr() as u64 + 10);
++        assert_eq!((ctx.Rax, ctx.R10), (base as u64, base as u64 + 64), "registers untouched");
++        let at = base - block.as_ptr() as usize;
++        assert!(block[at..at + 64].iter().all(|&b| b == 0));
++        assert!(block[at + 64..].iter().all(|&b| b == 0xAA), "one line only");
++    }
++}
+diff -ruN '--exclude=target' S/crates/victory-loader/src/console_insn_decode.rs W/crates/victory-loader/src/console_insn_decode.rs
+--- S/crates/victory-loader/src/console_insn_decode.rs	2026-11-25 19:11:21.000000000 +0200
++++ W/crates/victory-loader/src/console_insn_decode.rs	2026-11-25 22:00:04.493678400 +0200
+@@ -13,6 +13,10 @@
+     Clzero,
+     /// `clzero` loop: `clzero; add rax, 0x40; cmp rax, <reg>; jb -12` – zero `[rax..reg)`
+     ClzeroLoop { end_reg: u8 },
++    /// `clzero` in the loop `mov rax, <ptr>; add <ptr>, 0x40; clzero; cmp <ptr>, <end>; jb -15`
++    /// (the seven bytes before it are the caller's to check, [`loop15_head`]): the length is
++    /// the `clzero`'s own
++    ClzeroStep { ptr_reg: u8, end_reg: u8 },
+     /// `rdpru`: ecx = 0 MPERF / 1 APERF → edx:eax (a counter)
+     Rdpru,
+     /// `monitorx` / `mwaitx`: a wait the emulation skips
+@@ -84,6 +88,24 @@
+     (b.len() >= len).then_some(len)
+ }
+ 
++/// Whether `before`, the seven bytes in front of a [`ConsoleOnly::ClzeroStep`], are
++/// `mov rax, <ptr>; add <ptr>, 0x40` for that pointer register (neither rax nor rsp).
++pub fn loop15_head(before: &[u8], ptr_reg: u8) -> bool {
++    let (hi, lo) = (ptr_reg >> 3 & 1, ptr_reg & 7);
++    ptr_reg != 0
++        && ptr_reg != 4
++        && before.len() == 7
++        // mov rax, ptr: REX.W (+R for r8..r15) 89 /r with rm = rax
++        && before[0] == 0x48 | hi << 2
++        && before[1] == 0x89
++        && before[2] == 0xC0 | lo << 3
++        // add ptr, 0x40: REX.W (+B) 83 /0 ib
++        && before[3] == 0x48 | hi
++        && before[4] == 0x83
++        && before[5] == 0xC0 | lo
++        && before[6] == 0x40
++}
++
+ /// The console-only instruction at the start of `code` and its length.
+ pub fn decode(code: &[u8]) -> Option<(ConsoleOnly, usize)> {
+     let mut i = 0;
+@@ -128,6 +150,19 @@
+                 let modrm = code[i + 9];
+                 let reg_idx = ((modrm >> 3) & 7) | if rex_r { 8 } else { 0 };
+                 Some((ConsoleOnly::ClzeroLoop { end_reg: reg_idx }, i + 12))
++            } else if i == 0
++                && code.len() >= 8
++                && code[3] & 0xF8 == 0x48
++                && code[3] & 0x02 == 0
++                && code[4] == 0x39
++                && code[5] >> 6 == 3
++                && code[6..8] == [0x72, 0xF1]
++            {
++                // clzero; cmp <ptr>, <end> (REX.W 39 /r, register form); jb -15
++                let (rex, modrm) = (code[3], code[5]);
++                let end_reg = ((modrm >> 3) & 7) | (rex & 4) << 1;
++                let ptr_reg = (modrm & 7) | (rex & 1) << 3;
++                Some((ConsoleOnly::ClzeroStep { ptr_reg, end_reg }, 3))
+             } else {
+                 Some((ConsoleOnly::Clzero, i + 3))
+             }
+@@ -193,6 +228,22 @@
+         );
+         // the same loop after an address-size prefix: that one CLZERO alone
+         assert_eq!(decode(&[0x67, 0x0F, 0x01, 0xFC, 0x48, 0x83, 0xC0, 0x40, 0x48, 0x39, 0xD0, 0x72, 0xF4]), Some((ConsoleOnly::Clzero, 4)));
++        // the title's other loop, as at its +0x4e8ab4c: mov rax, r10; add r10, 0x40; clzero;
++        // cmp r10, r11; jb -15 (and against r9/r10, r8/r9, rdx/r8)
++        assert_eq!(decode(&[0x0F, 0x01, 0xFC, 0x4D, 0x39, 0xDA, 0x72, 0xF1]), Some((ConsoleOnly::ClzeroStep { ptr_reg: 10, end_reg: 11 }, 3)));
++        assert_eq!(decode(&[0x0F, 0x01, 0xFC, 0x4D, 0x39, 0xD1, 0x72, 0xF1]), Some((ConsoleOnly::ClzeroStep { ptr_reg: 9, end_reg: 10 }, 3)));
++        assert_eq!(decode(&[0x0F, 0x01, 0xFC, 0x4D, 0x39, 0xC8, 0x72, 0xF1]), Some((ConsoleOnly::ClzeroStep { ptr_reg: 8, end_reg: 9 }, 3)));
++        assert_eq!(decode(&[0x0F, 0x01, 0xFC, 0x4C, 0x39, 0xC2, 0x72, 0xF1]), Some((ConsoleOnly::ClzeroStep { ptr_reg: 2, end_reg: 8 }, 3)));
++        assert!(loop15_head(&[0x4C, 0x89, 0xD0, 0x49, 0x83, 0xC2, 0x40], 10));
++        assert!(loop15_head(&[0x4C, 0x89, 0xC8, 0x49, 0x83, 0xC1, 0x40], 9));
++        assert!(loop15_head(&[0x4C, 0x89, 0xC0, 0x49, 0x83, 0xC0, 0x40], 8));
++        assert!(loop15_head(&[0x48, 0x89, 0xD0, 0x48, 0x83, 0xC2, 0x40], 2));
++        assert!(!loop15_head(&[0x4C, 0x89, 0xD0, 0x49, 0x83, 0xC2, 0x40], 9), "another register");
++        assert!(!loop15_head(&[0x4C, 0x89, 0xD0, 0x49, 0x83, 0xC2, 0x80], 10), "another step");
++        // not that loop: another jump back, a memory operand, a 32-bit compare
++        assert_eq!(decode(&[0x0F, 0x01, 0xFC, 0x4D, 0x39, 0xDA, 0x72, 0xF4]), Some((ConsoleOnly::Clzero, 3)));
++        assert_eq!(decode(&[0x0F, 0x01, 0xFC, 0x4D, 0x39, 0x1A, 0x72, 0xF1]), Some((ConsoleOnly::Clzero, 3)));
++        assert_eq!(decode(&[0x0F, 0x01, 0xFC, 0x45, 0x39, 0xDA, 0x72, 0xF1]), Some((ConsoleOnly::Clzero, 3)));
+         assert_eq!(decode(&[0x0F, 0x01, 0xFD]), Some((ConsoleOnly::Rdpru, 3)));
+         assert_eq!(decode(&[0x0F, 0x01, 0xFA]), Some((ConsoleOnly::Monitorx, 3)));
+         assert_eq!(decode(&[0x0F, 0x01, 0xFB]), Some((ConsoleOnly::Mwaitx, 3)));
+diff -ruN '--exclude=target' S/crates/victory-shader/src/emit/lower.rs W/crates/victory-shader/src/emit/lower.rs
+--- S/crates/victory-shader/src/emit/lower.rs	2026-11-25 21:26:13.000000000 +0200
++++ W/crates/victory-shader/src/emit/lower.rs	2026-11-25 21:52:37.895533400 +0200
+@@ -982,6 +982,36 @@
+     })
+ }
+ 
++/// Whether a pixel program runs its depth and stencil tests before the
++/// shader on the console (`DB_SHADER_CONTROL.DEPTH_BEFORE_SHADER`, bit 12:
++/// HLSL `[earlydepthstencil]`), so the host is told too (ShaderFlags
++/// ForceEarlyDepthStencil). Without it the host tests after the shader, and
++/// a program that writes unordered views writes them for pixels the depth
++/// test then rejects: the title's glass prepass wrote its depth and motion
++/// for every pixel of a window pane, the character standing in front of it
++/// too, and a later pass copied those over the character's. Not for a
++/// program that exports depth, stencil or coverage (bits 0-2 and 8, or such
++/// an output), which cannot test before it runs. (myokex c3723f3.)
++/// `VICTORY_EARLY_DEPTH=0`: never declared, as before.
++pub(super) fn early_depth(io: &StageIo, outputs: &[SigElement]) -> bool {
++    const DEPTH_BEFORE_SHADER: u32 = 1 << 12;
++    const EXPORTS: u32 = 0b111 | 1 << 8;
++    let StageIo::Ps { db_shader_control, .. } = io else {
++        return false;
++    };
++    // SV_Depth, SV_DepthLessEqual, SV_DepthGreaterEqual, SV_Coverage,
++    // SV_StencilRef.
++    db_shader_control & DEPTH_BEFORE_SHADER != 0
++        && db_shader_control & EXPORTS == 0
++        && !outputs.iter().any(|o| matches!(o.kind, 14 | 17 | 18 | 19 | 20))
++}
++
++/// `VICTORY_EARLY_DEPTH=0`: [`early_depth`] is never declared.
++fn early_depth_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_EARLY_DEPTH").is_none_or(|v| v != "0"))
++}
++
+ /// The pixel inputs packing two 16-bit rows per dword, as (first row,
+ /// second row) ([`packed_layout`]).
+ fn input_packs(io: &StageIo, inputs: &[SigElement]) -> Vec<(u8, Option<u8>)> {
+@@ -1095,6 +1125,9 @@
+         s.ordered = s.pixel && p.blocks.iter().flat_map(|b| &b.insts).any(sets_pops_packer);
+         s.inputs = x.inputs.clone();
+         s.outputs = x.outputs.clone();
++        if early_depth_on() && early_depth(&x.native.io, &x.outputs) {
++            s.flags |= flags::EARLY_DEPTH;
++        }
+         // (the signatures stay whole while the program is lowered: rows of 16-bit values and
+         // the like are found by the elements around them; what is left out goes at the end)
+         let (drop_in, drop_out) = super::link::left_out(&x.inputs, &x.outputs);
+diff -ruN '--exclude=target' S/crates/victory-shader/src/emit/mod.rs W/crates/victory-shader/src/emit/mod.rs
+--- S/crates/victory-shader/src/emit/mod.rs	2026-11-25 21:26:13.000000000 +0200
++++ W/crates/victory-shader/src/emit/mod.rs	2026-11-25 21:52:50.874909800 +0200
+@@ -1202,6 +1202,79 @@
+         assert_ne!(features & 0x200, 0, "SFI0 {features:#x}: no StencilRef");
+     }
+ 
++    /// A pixel program the console tests depth for before it runs
++    /// (`DB_SHADER_CONTROL` 0x1050: DEPTH_BEFORE_SHADER, early Z, kill, as
++    /// the title's glass prepass has it) declares ForceEarlyDepthStencil:
++    /// the module differs from the same program without the bit only by that
++    /// flag, and the validator, where there is one, accepts it. With a depth
++    /// output the bit is not declared (the host cannot test before a shader
++    /// that writes the depth).
++    #[test]
++    fn a_pixel_program_tested_before_it_runs_declares_early_depth() {
++        // v_mov_b32 v0, 1.0; exp mrt0 v0, v0, v0, v0 done vm; s_endpgm
++        let color = [0x7E00_02F2u32, 0xF800_180F, 0x0000_0000, 0xBF81_0000];
++        // v_mov_b32 v0, 1.0; exp mrtz v0, off, off, off done vm; s_endpgm
++        let depth = [0x7E00_02F2u32, 0xF800_1881, 0x0000_0000, 0xBF81_0000];
++        let el = |name: &str, kind, cols| SigElement {
++            name: name.into(),
++            index: 0,
++            kind,
++            comp: 9,
++            interp: 0,
++            // A render target has a register; depth and stencil do not.
++            row: (kind == 16).then_some(0),
++            col: 0,
++            cols,
++            usage: (1 << cols) - 1,
++            half: false,
++        };
++        let emitted = |words: &[u32], out: SigElement, db: u32| {
++            let native = NativeProgram {
++                stage: HwStage::Ps,
++                wave64: false,
++                vgprs: 1,
++                layout: vec![],
++                used: vec![],
++                io: StageIo::Ps {
++                    inputs: vec![],
++                    input_addr: 0,
++                    db_shader_control: db,
++                    patches: vec![],
++                },
++                code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
++            };
++            let osg1 = container::signature(&[out], false);
++            let bytes = crate::dxbc::build(&[(FourCC::OSG1, &osg1)]);
++            let c = Container::parse(&bytes).unwrap();
++            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
++            let st = structure::structure(&p).unwrap();
++            let res = resource::track(&p, &native.layout, native.stage, Some(&st)).unwrap();
++            let io = io::raise(&p, &native).unwrap();
++            emit(&c, &native, &p, &st, &io, &res).unwrap().dxil
++        };
++        let late = emitted(&color, el("SV_Target", 16, 4), 0x50);
++        let early = emitted(&color, el("SV_Target", 16, 4), 0x1050);
++        assert_ne!(late, early, "the early-depth flag changed nothing");
++        #[cfg(windows)]
++        if let Ok(mut v) = super::validator::Validator::load(
++            super::validator::Validator::default_path().as_deref(),
++        ) {
++            v.validate(&mut early.clone()).unwrap();
++        }
++        let late = emitted(&depth, el("SV_Depth", 17, 1), 0x51);
++        let early = emitted(&depth, el("SV_Depth", 17, 1), 0x1051);
++        assert_eq!(late, early, "early depth declared for a depth export");
++        // The rule alone: the bit, and no export of depth, stencil or coverage.
++        let ps = |db| StageIo::Ps { inputs: vec![], input_addr: 0, db_shader_control: db, patches: vec![] };
++        assert!(lower::early_depth(&ps(0x1450), &[]));
++        assert!(lower::early_depth(&ps(0x1010), &[]));
++        assert!(!lower::early_depth(&ps(0x0450), &[]));
++        assert!(!lower::early_depth(&ps(0x1012), &[]));
++        assert!(!lower::early_depth(&ps(0x1150), &[]));
++        assert!(!lower::early_depth(&ps(0x1050), &[el("SV_StencilRef", 20, 1)]));
++        assert!(!lower::early_depth(&StageIo::None, &[]));
++    }
++
+     /// A wave64 compute program that writes only EXEC's high dword
+     /// (`s_mov_b32 exec_hi, 0`) before a vector instruction. The new mask was
+     /// opaque and keyed by the unchanged low dword, so building its lane bit
+diff -ruN '--exclude=target' S/crates/victory-shader/src/emit/shader.rs W/crates/victory-shader/src/emit/shader.rs
+--- S/crates/victory-shader/src/emit/shader.rs	2026-11-25 21:26:13.000000000 +0200
++++ W/crates/victory-shader/src/emit/shader.rs	2026-11-25 21:52:37.897034900 +0200
+@@ -156,6 +156,8 @@
+ 
+ /// `ShaderFlags` bits (metadata) and their `SFI0` feature bits.
+ pub(crate) mod flags {
++    /// ForceEarlyDepthStencil (`[earlydepthstencil]`; no `SFI0` bit).
++    pub const EARLY_DEPTH: u64 = 1 << 3;
+     pub const DOUBLES: u64 = 1 << 2;
+     pub const RAW_BUFFERS: u64 = 1 << 4;
+     pub const STENCIL_REF: u64 = 1 << 11;

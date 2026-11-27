@@ -22,6 +22,8 @@
 //!    on, pass every thread start and end on to the attached images.
 
 #[cfg(windows)]
+pub mod callhook;
+#[cfg(windows)]
 mod console_insn;
 mod crash;
 pub mod frame_rate;
@@ -52,7 +54,7 @@ pub use crash::save_on_crash;
 pub use prepare::{PrepareError, PreparedImage, prepare};
 pub use resolve::{ImportResolver, Provenance, Resolution};
 #[cfg(all(windows, feature = "diagnostics"))]
-pub use stacks::{dump_stacks, dump_stacks_on_schedule};
+pub use stacks::{dump_stacks, dump_stacks_on_schedule, set_symbolizer};
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use profile::profile_on_schedule;
 #[cfg(windows)]

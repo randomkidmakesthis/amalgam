@@ -1,0 +1,1568 @@
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -24,6 +24,10 @@
+ use crate::object::This;
+ use crate::pipeline::host::HostPipeline;
+ 
++/// The data probe (`VICTORY_PROBE`).
++#[cfg(feature = "diagnostics")]
++pub(crate) mod probe;
++
+ /// A root argument as the title set it.
+ #[derive(Debug, Clone, Default)]
+ enum Root {
+@@ -2317,6 +2321,8 @@
+         }
+         #[cfg(feature = "diagnostics")]
+         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
++        #[cfg(feature = "diagnostics")]
++        let probed = probe::direct(self, list, p, [x, y, z]);
+         let base = group_base(p);
+         match base {
+             Some((param, dword)) if x > crate::indirect::PART => {
+@@ -2346,6 +2352,8 @@
+                 unsafe { list.list.Dispatch(x, y, z) };
+             }
+         }
++        #[cfg(feature = "diagnostics")]
++        probe::after(probed, list);
+         DISPATCHED.fetch_add(1, Ordering::Relaxed);
+     }
+ 
+@@ -3342,6 +3350,10 @@
+         if kind == MESH {
+             self.mesh_scissor(list, true);
+         }
++        #[cfg(feature = "diagnostics")]
++        let probed = (kind == DISPATCH)
++            .then(|| probe::indirect(self, list, p, &args, (arguments, max), parts.is_some()))
++            .flatten();
+         // SAFETY: an open list with everything set; the scratch buffer and
+         // host copies are kept alive by the list, and the signature is cached.
+         unsafe {
+@@ -3367,6 +3379,8 @@
+                 )
+             }
+         };
++        #[cfg(feature = "diagnostics")]
++        probe::after(probed, list);
+         if parts.is_some() {
+             DISPATCH_PARTS[3].fetch_add(1, Ordering::Relaxed);
+         }
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -4175,6 +4175,11 @@
+             }
+         }
+     }
++    #[cfg(feature = "diagnostics")]
++    if crate::draw::probe::on() {
++        let backs: Vec<usize> = list.deferred().backs.iter().map(|b| b.0.as_raw() as usize).collect();
++        crate::draw::probe::landed(&backs);
++    }
+ }
+ 
+ /// After the card ran what declared `back`: what shaders wrote there goes
+diff --git a/crates/victory-gpu/src/draw/probe.rs b/crates/victory-gpu/src/draw/probe.rs
+new file mode 100644
+index 0000000..699288f
+--- /dev/null
++++ b/crates/victory-gpu/src/draw/probe.rs
+@@ -0,0 +1,1495 @@
++//! The data probe (`VICTORY_PROBE`, diagnostics builds; off by default):
++//! for the programs it is given, on the frames it samples, what every
++//! dispatch of them reads and writes, as fingerprints (a hash and a few
++//! float statistics of the first bytes of every buffer view), so that a
++//! chain of compute programs can be followed and the first one whose
++//! inputs or outputs are zero, or the same from frame to frame, found.
++//!
++//! What each fingerprint covers (`VICTORY_PROBE_BYTES`, 1 MiB unless said,
++//! from the view's first byte):
++//! - `card_before`, for every buffer view in a table and every root SRV or
++//!   UAV: the host copy's bytes the shader reads, copied on the card into a
++//!   read-back buffer in the dispatch's own list just before it (after the
++//!   layer brought the copy up to date at submission, and after what earlier
++//!   dispatches of the submission wrote there).
++//! - `card_after`, for views the program writes (UAVs): the same bytes
++//!   copied on the card just after the dispatch (UAV barriers around both).
++//! - `game_after`, for views the program writes: title memory there once
++//!   the list has run and what its shaders wrote has gone back into title
++//!   memory (read in `host.rs` `read_backs`, which runs after the copy back
++//!   of every submission path).
++//! - `game_submit`, for constant buffers (tables and root CBVs; the host
++//!   reads them from upload memory filled from title memory when the list
++//!   is submitted): title memory there when the list is submitted (a step
++//!   of the list's, after its fills). Root constants: the values set.
++//!
++//! The copies on the card only read the host copies; the probe writes no
++//! memory the title or the host's shaders read. They are made without
++//! state transitions of the host copies (as the layer's own lists use
++//! them), with global UAV barriers around them.
++
++use std::collections::{BTreeSet, HashMap};
++use std::io::Write as _;
++use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
++use std::sync::{Arc, Mutex, OnceLock};
++
++use victory_shader::{ResourceType, RootType};
++use windows::Win32::Graphics::Direct3D12::*;
++use windows::core::Interface;
++
++use super::{Root, State};
++use crate::descriptor::View;
++use crate::host::HostList;
++use crate::pipeline::host::{HostPipeline, Stage};
++use crate::shadow::Shadow;
++
++/// Frames that are sampled.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub(crate) enum Frames {
++    /// Every `every`th frame from the first one after the start delay,
++    /// `most` of them.
++    Every { every: u64, most: u32 },
++    /// These frames (as presented so far), whatever the delay.
++    List(Vec<u64>),
++}
++
++struct Config {
++    /// Container hash (16 hex digits, lower case) to program name.
++    programs: HashMap<String, String>,
++    frames: Frames,
++    after_s: f64,
++    out: std::path::PathBuf,
++    /// Bytes fingerprinted per view.
++    cap: u64,
++    /// Bytes copied on the card per sampled frame, at most.
++    budget: u64,
++}
++
++fn config() -> Option<&'static Config> {
++    static CONFIG: OnceLock<Option<Config>> = OnceLock::new();
++    CONFIG.get_or_init(load).as_ref()
++}
++
++/// Set by the tests: what lists land is looked at without a configuration.
++static FORCED: AtomicBool = AtomicBool::new(false);
++
++/// Whether the probe is on (`VICTORY_PROBE` or `VICTORY_PROBE_DIR` set).
++pub(crate) fn on() -> bool {
++    config().is_some() || FORCED.load(Ordering::Relaxed)
++}
++
++fn load() -> Option<Config> {
++    let file = std::env::var_os("VICTORY_PROBE").filter(|v| !v.is_empty());
++    let dir = std::env::var_os("VICTORY_PROBE_DIR").filter(|v| !v.is_empty());
++    if file.is_none() && dir.is_none() {
++        return None;
++    }
++    let mut programs = HashMap::new();
++    if let Some(file) = &file
++        && std::path::Path::new(file).is_file()
++    {
++        match std::fs::read_to_string(file) {
++            Ok(text) => programs.extend(parse_list(&text)),
++            Err(e) => {
++                tracing::warn!(target: "probe", error = %e, file = ?file, "probe: the list of programs could not be read")
++            }
++        }
++    }
++    if let Some(dir) = &dir {
++        let pattern = std::env::var("VICTORY_PROBE_MATCH").unwrap_or_default();
++        match std::fs::read_dir(dir) {
++            Ok(entries) => {
++                let names = entries.filter_map(|e| e.ok()?.file_name().into_string().ok());
++                programs.extend(parse_names(names, &pattern));
++            }
++            Err(e) => {
++                tracing::warn!(target: "probe", error = %e, dir = ?dir, "probe: the dump folder could not be read")
++            }
++        }
++    }
++    let frames = parse_frames(std::env::var("VICTORY_PROBE_FRAMES").ok().as_deref());
++    let after_s = std::env::var("VICTORY_PROBE_AFTER_S")
++        .ok()
++        .and_then(|v| v.trim().parse::<f64>().ok())
++        .unwrap_or(90.0);
++    let out = std::env::var_os("VICTORY_PROBE_OUT")
++        .filter(|v| !v.is_empty())
++        .map(std::path::PathBuf::from)
++        .unwrap_or_else(|| {
++            std::env::temp_dir().join(format!("victory_probe_{}.jsonl", std::process::id()))
++        });
++    let cap = std::env::var("VICTORY_PROBE_BYTES")
++        .ok()
++        .and_then(|v| v.trim().parse::<u64>().ok())
++        .filter(|&n| n > 0)
++        .unwrap_or(1 << 20);
++    let budget = std::env::var("VICTORY_PROBE_BUDGET_MB")
++        .ok()
++        .and_then(|v| v.trim().parse::<u64>().ok())
++        .map_or(512 << 20, |mb| mb << 20);
++    tracing::info!(target: "probe", programs = programs.len(), ?frames, after_s, out = %out.display(), cap, budget, "probe: on");
++    if programs.is_empty() {
++        tracing::warn!(target: "probe", "probe: no programs selected (VICTORY_PROBE file, or VICTORY_PROBE_DIR with VICTORY_PROBE_MATCH)");
++    }
++    Some(Config {
++        programs,
++        frames,
++        after_s,
++        out,
++        cap,
++        budget,
++    })
++}
++
++/// Lines `hash16 name` (the name may be left out; `#` starts a comment).
++pub(crate) fn parse_list(text: &str) -> HashMap<String, String> {
++    let mut out = HashMap::new();
++    for line in text.lines() {
++        let line = line.split('#').next().unwrap_or("").trim();
++        let mut words = line.split_whitespace();
++        let Some(hash) = words.next() else {
++            continue;
++        };
++        let Some(hash) = hash16(hash) else {
++            continue;
++        };
++        let name = words.collect::<Vec<_>>().join(" ");
++        let name = if name.is_empty() { hash.clone() } else { name };
++        out.insert(hash, name);
++    }
++    out
++}
++
++fn hash16(text: &str) -> Option<String> {
++    (text.len() == 16 && text.bytes().all(|b| b.is_ascii_hexdigit()))
++        .then(|| text.to_ascii_lowercase())
++}
++
++/// File names `<name>.<hash16>.cdxil` whose name holds one of the
++/// `|`-separated parts of `pattern` (case ignored; an empty pattern takes
++/// every file).
++pub(crate) fn parse_names(
++    names: impl Iterator<Item = String>,
++    pattern: &str,
++) -> HashMap<String, String> {
++    let parts: Vec<String> = pattern
++        .split('|')
++        .map(|p| p.trim().to_ascii_lowercase())
++        .filter(|p| !p.is_empty())
++        .collect();
++    let mut out = HashMap::new();
++    for file in names {
++        let Some(stem) = file.strip_suffix(".cdxil") else {
++            continue;
++        };
++        let Some((name, hash)) = stem.rsplit_once('.') else {
++            continue;
++        };
++        let Some(hash) = hash16(hash) else {
++            continue;
++        };
++        let lower = name.to_ascii_lowercase();
++        if parts.is_empty() || parts.iter().any(|p| lower.contains(p.as_str())) {
++            out.insert(hash, name.to_owned());
++        }
++    }
++    out
++}
++
++/// `N` (every Nth frame, 40 of them), `N:M` (every Nth, M of them), or
++/// frame numbers separated by commas. Anything else: every 30th, 40.
++pub(crate) fn parse_frames(text: Option<&str>) -> Frames {
++    const DEFAULT: Frames = Frames::Every {
++        every: 30,
++        most: 40,
++    };
++    let Some(text) = text.map(str::trim).filter(|t| !t.is_empty()) else {
++        return DEFAULT;
++    };
++    if text.contains(',') {
++        let list: Option<Vec<u64>> = text
++            .split(',')
++            .map(str::trim)
++            .filter(|t| !t.is_empty())
++            .map(|t| t.parse().ok())
++            .collect();
++        return match list {
++            Some(mut list) if !list.is_empty() => {
++                list.sort_unstable();
++                list.dedup();
++                Frames::List(list)
++            }
++            _ => DEFAULT,
++        };
++    }
++    let (every, most) = match text.split_once(':') {
++        Some((a, b)) => (a.trim().parse().ok(), b.trim().parse().ok()),
++        None => (text.parse().ok(), Some(40)),
++    };
++    match (every, most) {
++        (Some(every), Some(most)) if every > 0 && most > 0 => Frames::Every { every, most },
++        _ => DEFAULT,
++    }
++}
++
++/// The sample number of `frame`, if it is sampled; `first` is the first
++/// frame after the start delay (`Every` only).
++pub(crate) fn ordinal(frames: &Frames, frame: u64, first: Option<u64>) -> Option<u32> {
++    match frames {
++        Frames::Every { every, most } => {
++            let d = frame.checked_sub(first?)?;
++            (d % every == 0 && d / every < u64::from(*most)).then_some((d / every) as u32)
++        }
++        Frames::List(list) => list.binary_search(&frame).ok().map(|i| i as u32),
++    }
++}
++
++/// The frame of sample `k`, and how many samples there are.
++fn frame_of(frames: &Frames, first: Option<u64>, k: u32) -> Option<u64> {
++    match frames {
++        Frames::Every { every, .. } => Some(first? + u64::from(k) * every),
++        Frames::List(list) => list.get(k as usize).copied(),
++    }
++}
++
++fn samples(frames: &Frames) -> u32 {
++    match frames {
++        Frames::Every { most, .. } => *most,
++        Frames::List(list) => list.len() as u32,
++    }
++}
++
++/// Seconds since the process started.
++fn process_seconds() -> f64 {
++    use windows_sys::Win32::Foundation::FILETIME;
++    use windows_sys::Win32::System::SystemInformation::GetSystemTimeAsFileTime;
++    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
++    let zero = FILETIME {
++        dwLowDateTime: 0,
++        dwHighDateTime: 0,
++    };
++    let (mut created, mut exited, mut kernel, mut user, mut now) = (zero, zero, zero, zero, zero);
++    // SAFETY: our own process and valid out pointers.
++    unsafe {
++        GetProcessTimes(
++            GetCurrentProcess(),
++            &mut created,
++            &mut exited,
++            &mut kernel,
++            &mut user,
++        );
++        GetSystemTimeAsFileTime(&mut now);
++    }
++    let ticks = |t: FILETIME| u64::from(t.dwHighDateTime) << 32 | u64::from(t.dwLowDateTime);
++    ticks(now).saturating_sub(ticks(created)) as f64 / 1e7
++}
++
++/// The first frame after the start delay (`u64::MAX`: not yet).
++static FIRST: AtomicU64 = AtomicU64::new(u64::MAX);
++
++fn first() -> Option<u64> {
++    Some(FIRST.load(Ordering::Relaxed)).filter(|&f| f != u64::MAX)
++}
++
++fn sampled(cfg: &Config, frame: u64) -> Option<u32> {
++    if matches!(cfg.frames, Frames::Every { .. }) && first().is_none() {
++        if process_seconds() < cfg.after_s {
++            return None;
++        }
++        let _ = FIRST.compare_exchange(u64::MAX, frame, Ordering::Relaxed, Ordering::Relaxed);
++    }
++    ordinal(&cfg.frames, frame, first())
++}
++
++/// Fingerprint of some bytes: the first 16 hex digits of their BLAKE3 hash,
++/// and the bytes read as 32-bit floats.
++#[derive(Debug, Clone, PartialEq)]
++pub(crate) struct Stats {
++    pub(crate) hash: u64,
++    pub(crate) bytes: usize,
++    /// Dwords that are not 0.
++    pub(crate) nonzero: u64,
++    /// Every byte is 0.
++    pub(crate) zero: bool,
++    /// Of the finite values (none: there are none).
++    pub(crate) min: Option<f32>,
++    pub(crate) max: Option<f32>,
++    pub(crate) mean: Option<f64>,
++    /// NaN and infinite values.
++    pub(crate) nonfinite: u64,
++}
++
++pub(crate) fn stats(bytes: &[u8]) -> Stats {
++    let hash = blake3::hash(bytes);
++    let hash = u64::from_be_bytes(hash.as_bytes()[..8].try_into().unwrap_or([0; 8]));
++    let (mut nonzero, mut nonfinite, mut finite, mut sum) = (0u64, 0u64, 0u64, 0f64);
++    let (mut min, mut max) = (f32::INFINITY, f32::NEG_INFINITY);
++    let words = bytes.chunks_exact(4);
++    let tail = words.remainder();
++    for w in words {
++        let bits = u32::from_le_bytes([w[0], w[1], w[2], w[3]]);
++        if bits != 0 {
++            nonzero += 1;
++        }
++        let v = f32::from_bits(bits);
++        if v.is_finite() {
++            finite += 1;
++            sum += f64::from(v);
++            min = min.min(v);
++            max = max.max(v);
++        } else {
++            nonfinite += 1;
++        }
++    }
++    let zero = nonzero == 0 && tail.iter().all(|&b| b == 0);
++    Stats {
++        hash,
++        bytes: bytes.len(),
++        nonzero,
++        zero,
++        min: (finite > 0).then_some(min),
++        max: (finite > 0).then_some(max),
++        mean: (finite > 0).then(|| sum / finite as f64),
++        nonfinite,
++    }
++}
++
++/// How a sample compares with the one before of the same view.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(crate) enum Class {
++    Zero,
++    /// No sample before to compare with.
++    First,
++    Identical,
++    Changing,
++}
++
++pub(crate) fn classify(previous: Option<u64>, now: &Stats) -> Class {
++    if now.zero {
++        return Class::Zero;
++    }
++    match previous {
++        None => Class::First,
++        Some(h) if h == now.hash => Class::Identical,
++        Some(_) => Class::Changing,
++    }
++}
++
++/// How a dispatch was given its groups.
++pub(crate) enum Groups {
++    Direct([u32; 3]),
++    /// The arguments' host copy and title address, the records.
++    Indirect(Arc<Shadow>, u64, u32),
++}
++
++/// What a view's bytes are fingerprinted from.
++enum Source {
++    /// The host copy shaders read and write, copied on the card.
++    Card(Arc<Shadow>),
++    /// Title memory, when the list is submitted.
++    Title,
++    /// Known now (root constants).
++    Bytes(Vec<u8>),
++    /// Not fingerprinted (textures, nothing bound).
++    Nothing,
++}
++
++pub(crate) struct ViewIn {
++    reg: String,
++    slot: u8,
++    entry: u32,
++    write: bool,
++    kind: &'static str,
++    address: u64,
++    len: u64,
++    source: Source,
++}
++
++/// One sampled dispatch.
++#[derive(Clone)]
++pub(crate) struct Meta {
++    frame: u64,
++    sample: u32,
++    order: u32,
++    hash: String,
++    name: String,
++    indirect: bool,
++    groups: [u32; 3],
++    records: u32,
++    parts: bool,
++}
++
++/// A view as recorded: where its bytes went in the read-back buffer.
++struct ViewRec {
++    reg: String,
++    slot: u8,
++    entry: u32,
++    write: bool,
++    kind: &'static str,
++    address: u64,
++    len: u64,
++    /// Bytes fingerprinted.
++    n: u64,
++    before: Option<u64>,
++    after: Option<u64>,
++    /// Known when recorded (root constants).
++    known: Option<Stats>,
++    title: bool,
++    skipped: bool,
++}
++
++/// What the list's submission step finds.
++#[derive(Default)]
++struct Submit {
++    seq: AtomicU64,
++    title: Mutex<HashMap<usize, Stats>>,
++}
++
++struct Pending {
++    meta: Meta,
++    views: Vec<ViewRec>,
++    buffer: ID3D12Resource,
++    submit: Arc<Submit>,
++}
++
++// SAFETY: D3D12 objects are free-threaded; the rest is plain data.
++unsafe impl Send for Pending {}
++
++/// The dispatch's copies after it ran, for [`after`].
++pub(crate) struct Probed {
++    buffer: ID3D12Resource,
++    posts: Vec<(Arc<Shadow>, u64, u64, u64)>,
++}
++
++static PENDING: Mutex<Option<HashMap<usize, Pending>>> = Mutex::new(None);
++static SUBMITS: AtomicU64 = AtomicU64::new(1);
++
++fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
++    m.lock().unwrap_or_else(|e| e.into_inner())
++}
++
++/// The dispatch's number among those recorded in `frame`.
++fn next_order(frame: u64) -> u32 {
++    static ORDER: Mutex<(u64, u32)> = Mutex::new((u64::MAX, 0));
++    let mut o = lock(&ORDER);
++    if o.0 != frame {
++        *o = (frame, 0);
++    }
++    o.1 += 1;
++    o.1 - 1
++}
++
++/// Bytes copied on the card in `frame` so far, with `n` more if they fit
++/// the budget.
++fn spend(frame: u64, n: u64, budget: u64) -> bool {
++    static SPENT: Mutex<(u64, u64)> = Mutex::new((u64::MAX, 0));
++    let mut s = lock(&SPENT);
++    if s.0 != frame {
++        *s = (frame, 0);
++    }
++    if s.1 + n > budget {
++        return false;
++    }
++    s.1 += n;
++    true
++}
++
++/// [`before`] for `State::dispatch`.
++#[inline]
++pub(crate) fn direct(
++    state: &State,
++    list: &HostList,
++    p: &HostPipeline,
++    groups: [u32; 3],
++) -> Option<Probed> {
++    if !on() {
++        return None;
++    }
++    let parts = groups[0] > crate::indirect::PART && super::group_base(p).is_some();
++    before(state, list, p, Groups::Direct(groups), parts)
++}
++
++/// [`before`] for `State::execute_indirect`: the arguments' host copy, their
++/// title address and the records.
++#[inline]
++pub(crate) fn indirect(
++    state: &State,
++    list: &HostList,
++    p: &HostPipeline,
++    args: &Arc<Shadow>,
++    (at, records): (u64, u32),
++    parts: bool,
++) -> Option<Probed> {
++    if !on() {
++        return None;
++    }
++    before(
++        state,
++        list,
++        p,
++        Groups::Indirect(args.clone(), at, records),
++        parts,
++    )
++}
++
++/// Called just before a dispatch is recorded on the host list (bound, its
++/// tables made): for a selected program on a sampled frame, copies what its
++/// views hold into a read-back buffer. `parts`: it runs in parts.
++fn before(
++    state: &State,
++    list: &HostList,
++    p: &HostPipeline,
++    groups: Groups,
++    parts: bool,
++) -> Option<Probed> {
++    let cfg = config()?;
++    let frame = crate::queue::presented();
++    tick(cfg, frame);
++    let order = next_order(frame);
++    let sample = sampled(cfg, frame)?;
++    let stage = p.stages.first()?;
++    let name = cfg.programs.get(&stage.shader.hash)?;
++    let (indirect, groups3, records) = match &groups {
++        Groups::Direct(g) => (false, *g, 1),
++        Groups::Indirect(_, _, records) => (true, [0; 3], *records),
++    };
++    let meta = Meta {
++        frame,
++        sample,
++        order,
++        hash: stage.shader.hash.clone(),
++        name: name.clone(),
++        indirect,
++        groups: groups3,
++        records,
++        parts,
++    };
++    let views = resolve(state, stage, &groups);
++    begin(list, meta, views, cfg.cap, cfg.budget)
++}
++
++/// The views a compute stage can touch, as `State::bind` binds them.
++fn resolve(state: &State, stage: &Stage, groups: &Groups) -> Vec<ViewIn> {
++    let t = stage.translated();
++    let roots = &state.compute;
++    let mut out = Vec::new();
++    if let Groups::Indirect(args, at, records) = groups {
++        out.push(ViewIn {
++            reg: "args".to_owned(),
++            slot: 0,
++            entry: 0,
++            write: false,
++            kind: "args",
++            address: *at,
++            len: 12 * u64::from((*records).max(1)),
++            source: Source::Card(args.clone()),
++        });
++    }
++    let letter = |k: ResourceType| match k {
++        ResourceType::Srv => Some('t'),
++        ResourceType::Uav => Some('u'),
++        ResourceType::Cbv => Some('b'),
++        _ => None,
++    };
++    for u in t.used.iter().filter(|u| u.root == RootType::Table) {
++        let Some(l) = letter(u.kind) else {
++            continue;
++        };
++        let mut v = ViewIn {
++            reg: format!("{l}{}", u.lower_bound),
++            slot: u.slot,
++            entry: u.table_offset_dwords / 8,
++            write: u.kind == ResourceType::Uav,
++            kind: "none",
++            address: 0,
++            len: 0,
++            source: Source::Nothing,
++        };
++        if let Some(Root::Table(table)) = roots.get(usize::from(u.slot)) {
++            let handle = table + u64::from(u.table_offset_dwords) * 4;
++            match crate::descriptor::view(handle) {
++                Some(View::Constant(address, size)) => {
++                    (v.kind, v.address, v.len, v.source) =
++                        ("cbv", address, u64::from(size), Source::Title);
++                }
++                Some(view) => match crate::descriptor::host::buffer_copy(&view) {
++                    Some((shadow, address, len)) => {
++                        (v.kind, v.address, v.len, v.source) =
++                            ("buffer", address, len, Source::Card(shadow));
++                    }
++                    None => v.kind = "texture",
++                },
++                None => {}
++            }
++        }
++        out.push(v);
++    }
++    // Root views (ours, the memory directory and the like, left out).
++    let ours = [
++        victory_shader::emit::SLOT_MEMORY,
++        victory_shader::emit::SLOT_STRIDES,
++        victory_shader::emit::SLOT_HEAP_MARKS,
++        victory_shader::emit::SLOT_FAULTS,
++    ];
++    for (views, kind) in [
++        (&stage.root_cbvs, ResourceType::Cbv),
++        (&stage.root_srvs, ResourceType::Srv),
++        (&stage.root_uavs, ResourceType::Uav),
++    ] {
++        for &(slot, _) in views.iter().filter(|(slot, _)| !ours.contains(slot)) {
++            let reg = t
++                .used
++                .iter()
++                .find(|u| u.root == RootType::Descriptor && u.slot == slot)
++                .and_then(|u| Some(format!("{}{}", letter(u.kind)?, u.lower_bound)))
++                .unwrap_or_else(|| format!("root{slot}"));
++            let mut v = ViewIn {
++                reg,
++                slot,
++                entry: 0,
++                write: kind == ResourceType::Uav,
++                kind: "root-view",
++                address: 0,
++                len: 0,
++                source: Source::Nothing,
++            };
++            if let Some(&Root::View(address)) = roots.get(usize::from(slot)) {
++                v.address = address;
++                if let Some(shadow) = crate::shadow::find(address, 1) {
++                    if kind == ResourceType::Cbv {
++                        (v.len, v.source) = (shadow.left(address).min(1 << 16), Source::Title);
++                    } else {
++                        (v.len, v.source) = (shadow.left(address), Source::Card(shadow));
++                    }
++                }
++            }
++            out.push(v);
++        }
++    }
++    for (slot, root) in roots.iter().enumerate() {
++        if let Root::Constants(values) = root {
++            out.push(ViewIn {
++                reg: format!("c{slot}"),
++                slot: slot as u8,
++                entry: 0,
++                write: false,
++                kind: "root-constants",
++                address: 0,
++                len: values.len() as u64 * 4,
++                source: Source::Bytes(values.iter().flat_map(|v| v.to_le_bytes()).collect()),
++            });
++        }
++    }
++    // Two views on one register (other spaces): told apart by slot.
++    let mut seen: HashMap<String, u32> = HashMap::new();
++    for v in &out {
++        *seen.entry(v.reg.clone()).or_default() += 1;
++    }
++    for v in &mut out {
++        if seen[&v.reg] > 1 {
++            v.reg = format!("{}@{}.{}", v.reg, v.slot, v.entry);
++        }
++    }
++    out
++}
++
++fn uav_barrier() -> D3D12_RESOURCE_BARRIER {
++    D3D12_RESOURCE_BARRIER {
++        Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
++        Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
++        Anonymous: D3D12_RESOURCE_BARRIER_0 {
++            UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
++                pResource: std::mem::ManuallyDrop::new(None),
++            }),
++        },
++    }
++}
++
++/// Records the copies before the dispatch and notes the dispatch as
++/// pending until its list has run.
++pub(crate) fn begin(
++    list: &HostList,
++    meta: Meta,
++    views: Vec<ViewIn>,
++    cap: u64,
++    budget: u64,
++) -> Option<Probed> {
++    let host = crate::host::host()?;
++    let mut cursor = 0u64;
++    let mut recs = Vec::with_capacity(views.len());
++    let mut copies: Vec<(Arc<Shadow>, u64, u64, u64)> = Vec::new();
++    let mut posts = Vec::new();
++    let mut titles: Vec<(usize, u64, u64)> = Vec::new();
++    for (i, v) in views.into_iter().enumerate() {
++        let mut rec = ViewRec {
++            reg: v.reg,
++            slot: v.slot,
++            entry: v.entry,
++            write: v.write,
++            kind: v.kind,
++            address: v.address,
++            len: v.len,
++            n: 0,
++            before: None,
++            after: None,
++            known: None,
++            title: false,
++            skipped: false,
++        };
++        match v.source {
++            Source::Card(shadow) => {
++                // SAFETY: a live buffer.
++                let width = unsafe { shadow.buffer.GetDesc() }.Width;
++                let at = shadow.offset(v.address);
++                let n = v
++                    .len
++                    .min(cap)
++                    .min(shadow.left(v.address))
++                    .min(width.saturating_sub(at));
++                let bytes = if v.write { 2 * n } else { n };
++                if n > 0 && spend(meta.frame, bytes, budget) {
++                    rec.n = n;
++                    rec.before = Some(cursor);
++                    copies.push((shadow.clone(), at, cursor, n));
++                    cursor += n;
++                    if v.write {
++                        rec.after = Some(cursor);
++                        posts.push((shadow, at, cursor, n));
++                        cursor += n;
++                    }
++                } else if n > 0 {
++                    rec.skipped = true;
++                }
++            }
++            Source::Title => {
++                rec.n = v.len.min(cap);
++                rec.title = rec.n > 0;
++                if rec.title {
++                    titles.push((i, v.address, rec.n));
++                }
++            }
++            Source::Bytes(bytes) => {
++                rec.n = bytes.len() as u64;
++                rec.known = Some(stats(&bytes));
++            }
++            Source::Nothing => {}
++        }
++        recs.push(rec);
++    }
++    let buffer = host.read_back_buffer(cursor.max(256))?;
++    // SAFETY: an open list; live buffers, the ranges inside them.
++    unsafe {
++        if !copies.is_empty() {
++            list.list.ResourceBarrier(&[uav_barrier()]);
++            for (shadow, at, to, n) in &copies {
++                list.list
++                    .CopyBufferRegion(&buffer, *to, &shadow.buffer, *at, *n);
++            }
++            list.list.ResourceBarrier(&[uav_barrier()]);
++        }
++    }
++    let submit = Arc::new(Submit::default());
++    {
++        let submit = submit.clone();
++        list.defer_host(move || {
++            submit
++                .seq
++                .store(SUBMITS.fetch_add(1, Ordering::Relaxed), Ordering::Relaxed);
++            let mut found = lock(&submit.title);
++            for &(i, address, n) in &titles {
++                let mut bytes = vec![0u8; n as usize];
++                if crate::host::read_into(address as *const u8, &mut bytes) {
++                    found.insert(i, stats(&bytes));
++                }
++            }
++        });
++    }
++    lock(&PENDING).get_or_insert_with(HashMap::new).insert(
++        buffer.as_raw() as usize,
++        Pending {
++            meta,
++            views: recs,
++            buffer: buffer.clone(),
++            submit,
++        },
++    );
++    Some(Probed { buffer, posts })
++}
++
++/// Called just after the dispatch is recorded: the written views' bytes
++/// after it, and the read-back that tells when the list has run.
++pub(crate) fn after(probed: Option<Probed>, list: &HostList) {
++    let Some(probed) = probed else {
++        return;
++    };
++    // SAFETY: an open list; live buffers, the ranges inside them.
++    unsafe {
++        if !probed.posts.is_empty() {
++            list.list.ResourceBarrier(&[uav_barrier()]);
++            for (shadow, at, to, n) in &probed.posts {
++                list.list
++                    .CopyBufferRegion(&probed.buffer, *to, &shadow.buffer, *at, *n);
++            }
++            list.list.ResourceBarrier(&[uav_barrier()]);
++        }
++    }
++    // No rows: nothing is copied anywhere; the list holds the buffer until
++    // it is reset, and `landed` is told of it once the list has run.
++    list.defer_read_back(probed.buffer, std::ptr::null_mut(), [0, 0, 0]);
++}
++
++/// A list has run and what its shaders wrote is back in title memory:
++/// `buffers` are its read-back buffers (raw pointers).
++pub(crate) fn landed(buffers: &[usize]) {
++    let mut mine: Vec<Pending> = {
++        let mut pending = lock(&PENDING);
++        let Some(pending) = pending.as_mut() else {
++            return;
++        };
++        buffers.iter().filter_map(|b| pending.remove(b)).collect()
++    };
++    if mine.is_empty() {
++        return;
++    }
++    mine.sort_by_key(|p| (p.submit.seq.load(Ordering::Relaxed), p.meta.order));
++    let mut lines = String::new();
++    for p in mine {
++        process(p, &mut lines);
++    }
++    if let Some(cfg) = config() {
++        static OUT: Mutex<Option<std::io::BufWriter<std::fs::File>>> = Mutex::new(None);
++        static FAILED: AtomicBool = AtomicBool::new(false);
++        let mut out = lock(&OUT);
++        if out.is_none() && !FAILED.load(Ordering::Relaxed) {
++            match std::fs::File::create(&cfg.out) {
++                Ok(f) => *out = Some(std::io::BufWriter::new(f)),
++                Err(e) => {
++                    FAILED.store(true, Ordering::Relaxed);
++                    tracing::warn!(target: "probe", error = %e, out = %cfg.out.display(), "probe: the output could not be made");
++                }
++            }
++        }
++        if let Some(out) = out.as_mut() {
++            let _ = out.write_all(lines.as_bytes());
++            let _ = out.flush();
++        }
++    }
++}
++
++/// The fingerprints of one view of a landed dispatch.
++struct Found {
++    card_before: Option<Stats>,
++    card_after: Option<Stats>,
++    game_submit: Option<Stats>,
++    game_after: Option<Stats>,
++}
++
++fn process(p: Pending, lines: &mut String) {
++    let mut mapped: *mut std::ffi::c_void = std::ptr::null_mut();
++    // SAFETY: our read-back buffer; the list that wrote it has run.
++    let data = unsafe { p.buffer.Map(0, None, Some(&mut mapped)) }
++        .ok()
++        .filter(|_| !mapped.is_null())
++        .map(|_| mapped as *const u8);
++    let slice = |at: Option<u64>, n: u64| -> Option<Stats> {
++        let (data, at) = (data?, at?);
++        // SAFETY: inside the mapped buffer (laid out by `begin`).
++        Some(stats(unsafe {
++            std::slice::from_raw_parts(data.add(at as usize), n as usize)
++        }))
++    };
++    let title = lock(&p.submit.title);
++    let mut found = Vec::with_capacity(p.views.len());
++    let mut groups = p.meta.groups;
++    for (i, v) in p.views.iter().enumerate() {
++        let game_after = (v.write && v.address != 0 && v.n > 0)
++            .then(|| {
++                let mut bytes = vec![0u8; v.n as usize];
++                crate::host::read_into(v.address as *const u8, &mut bytes).then(|| stats(&bytes))
++            })
++            .flatten();
++        if v.kind == "args"
++            && let (Some(data), Some(at)) = (data, v.before)
++            && v.n >= 12
++        {
++            // SAFETY: inside the mapped buffer.
++            let w =
++                |k: usize| unsafe { data.add(at as usize + 4 * k).cast::<u32>().read_unaligned() };
++            groups = [w(0), w(1), w(2)];
++        }
++        found.push(Found {
++            card_before: slice(v.before, v.n),
++            card_after: slice(v.after, v.n),
++            game_submit: v.known.clone().or_else(|| title.get(&i).cloned()),
++            game_after,
++        });
++    }
++    drop(title);
++    if data.is_some() {
++        // SAFETY: mapped above.
++        unsafe { p.buffer.Unmap(0, None) };
++    }
++    let seq = p.submit.seq.load(Ordering::Relaxed);
++    let m = &p.meta;
++    let occurrence = next_occurrence(&m.name, m.sample);
++    for (v, f) in p.views.iter().zip(&found) {
++        use std::fmt::Write as _;
++        let _ = write!(
++            lines,
++            "{{\"frame\":{},\"sample\":{},\"order\":{},\"submit\":{},\"occurrence\":{},\"hash\":\"{}\",\"name\":\"{}\",\"call\":\"{}\",\"groups\":[{},{},{}],\"records\":{},\"parts\":{},\"reg\":\"{}\",\"slot\":{},\"entry\":{},\"rw\":\"{}\",\"kind\":\"{}\",\"addr\":\"{:#x}\",\"len\":{},\"bytes\":{},\"skipped\":{}",
++            m.frame,
++            m.sample,
++            m.order,
++            seq,
++            occurrence,
++            m.hash,
++            escape(&m.name),
++            if m.indirect { "indirect" } else { "direct" },
++            groups[0],
++            groups[1],
++            groups[2],
++            m.records,
++            m.parts,
++            escape(&v.reg),
++            v.slot,
++            v.entry,
++            if v.write { 'w' } else { 'r' },
++            v.kind,
++            v.address,
++            v.len,
++            v.n,
++            v.skipped,
++        );
++        for (key, s) in [
++            ("card_before", &f.card_before),
++            ("card_after", &f.card_after),
++            ("game_submit", &f.game_submit),
++            ("game_after", &f.game_after),
++        ] {
++            let _ = write!(lines, ",\"{key}\":{}", stats_json(s.as_ref()));
++        }
++        lines.push_str("}\n");
++        // The bytes that tell: what the shader read; what it wrote, on
++        // the card (title memory if the card's were not copied).
++        let main = if v.write {
++            f.card_after.as_ref().or(f.game_after.as_ref())
++        } else {
++            f.card_before.as_ref().or(f.game_submit.as_ref())
++        };
++        if let Some(s) = main {
++            note(m, occurrence, v, s, f);
++        }
++    }
++}
++
++fn escape(text: &str) -> String {
++    text.chars()
++        .flat_map(|c| match c {
++            '"' | '\\' => vec!['\\', c],
++            c if (c as u32) < 0x20 => vec!['?'],
++            c => vec![c],
++        })
++        .collect()
++}
++
++fn stats_json(s: Option<&Stats>) -> String {
++    let Some(s) = s else {
++        return "null".to_owned();
++    };
++    let opt = |v: Option<String>| v.unwrap_or_else(|| "null".to_owned());
++    format!(
++        "{{\"hash\":\"{:016x}\",\"bytes\":{},\"zero\":{},\"nonzero\":{},\"min\":{},\"max\":{},\"mean\":{},\"nonfinite\":{}}}",
++        s.hash,
++        s.bytes,
++        s.zero,
++        s.nonzero,
++        opt(s.min.map(|v| format!("{v:e}"))),
++        opt(s.max.map(|v| format!("{v:e}"))),
++        opt(s.mean.map(|v| format!("{v:e}"))),
++        s.nonfinite
++    )
++}
++
++/// The how-manyth dispatch of `name` in sample `sample` this is (in the
++/// order their lists landed, which is the order they ran).
++fn next_occurrence(name: &str, sample: u32) -> u32 {
++    static SEEN: Mutex<Option<HashMap<(String, u32), u32>>> = Mutex::new(None);
++    let mut seen = lock(&SEEN);
++    let seen = seen.get_or_insert_with(HashMap::new);
++    seen.retain(|k, _| k.1 + 2 >= sample);
++    let n = seen.entry((name.to_owned(), sample)).or_insert(0);
++    *n += 1;
++    *n - 1
++}
++
++/// The summary of one program's view (by register).
++#[derive(Default, Debug)]
++pub(crate) struct Line {
++    len: u64,
++    frames: BTreeSet<u32>,
++    zero: u32,
++    identical: u32,
++    changing: u32,
++    first: u32,
++    nonzero: Vec<u64>,
++    /// Written views: the card's bytes the same before and after the
++    /// dispatch; title memory after the list differing from the card's.
++    untouched: u32,
++    differs: u32,
++    order: u32,
++    /// Dispatches of it in one sample, most.
++    per_frame: u32,
++}
++
++type Key = (String, String, bool);
++
++static SUMMARY: Mutex<Option<HashMap<Key, Line>>> = Mutex::new(None);
++
++fn note(m: &Meta, occurrence: u32, v: &ViewRec, s: &Stats, f: &Found) {
++    static PREVIOUS: Mutex<Option<HashMap<(String, String, u32), (u32, u64)>>> = Mutex::new(None);
++    let previous = {
++        let mut prev = lock(&PREVIOUS);
++        let prev = prev.get_or_insert_with(HashMap::new);
++        let key = (m.name.clone(), v.reg.clone(), occurrence);
++        let before = prev
++            .get(&key)
++            .filter(|(sample, _)| *sample < m.sample)
++            .map(|&(_, h)| h);
++        prev.insert(key, (m.sample, s.hash));
++        before
++    };
++    let class = classify(previous, s);
++    let mut summary = lock(&SUMMARY);
++    let line = summary
++        .get_or_insert_with(HashMap::new)
++        .entry((m.name.clone(), v.reg.clone(), v.write))
++        .or_default();
++    if line.frames.is_empty() || m.order < line.order {
++        line.order = m.order;
++    }
++    line.len = line.len.max(v.len);
++    line.frames.insert(m.sample);
++    line.per_frame = line.per_frame.max(occurrence + 1);
++    match class {
++        Class::Zero => line.zero += 1,
++        Class::First => line.first += 1,
++        Class::Identical => line.identical += 1,
++        Class::Changing => line.changing += 1,
++    }
++    line.nonzero.push(s.nonzero);
++    if v.write {
++        if let (Some(b), Some(a)) = (&f.card_before, &f.card_after)
++            && b.hash == a.hash
++        {
++            line.untouched += 1;
++        }
++        if let (Some(a), Some(g)) = (&f.card_after, &f.game_after)
++            && a.hash != g.hash
++        {
++            line.differs += 1;
++        }
++    }
++}
++
++/// The summary line of one program's view.
++pub(crate) fn line_text(name: &str, reg: &str, write: bool, l: &Line) -> String {
++    let mut nonzero = l.nonzero.clone();
++    nonzero.sort_unstable();
++    let median = nonzero.get(nonzero.len() / 2).copied().unwrap_or(0);
++    let mut text = format!(
++        "probe: {name} {reg} {} len={} frames={}: zero in {}, identical to previous sample in {}, changing in {}; nonzero dwords median {median}",
++        if write { 'w' } else { 'r' },
++        l.len,
++        l.frames.len(),
++        l.zero,
++        l.identical,
++        l.changing,
++    );
++    if write {
++        text += &format!(
++            "; unchanged by the dispatch in {}, title memory differs from the card in {}",
++            l.untouched, l.differs
++        );
++    }
++    text += &format!(
++        " ({} samples, {} first, up to {} a frame)",
++        l.nonzero.len(),
++        l.first,
++        l.per_frame
++    );
++    text
++}
++
++/// Logs the summary, in the order the programs first ran in a frame.
++pub(crate) fn summarize(why: &str) {
++    let summary = lock(&SUMMARY);
++    let Some(summary) = summary.as_ref() else {
++        tracing::info!(target: "probe", "probe: {why}: nothing sampled");
++        return;
++    };
++    let mut keys: Vec<&Key> = summary.keys().collect();
++    keys.sort_by(|a, b| {
++        (summary[*a].order, &a.0, &a.1, a.2).cmp(&(summary[*b].order, &b.0, &b.1, b.2))
++    });
++    tracing::info!(target: "probe", "probe: summary ({why}), {} views", keys.len());
++    for k in keys {
++        tracing::info!(target: "probe", "{}", line_text(&k.0, &k.1, k.2, &summary[k]));
++    }
++}
++
++/// Per frame (from `before`): the summary every 20 samples and at the end,
++/// once the sampled frame is ten frames back; pending dispatches whose
++/// list never ran forgotten after 600 frames.
++fn tick(cfg: &Config, frame: u64) {
++    static LAST: AtomicU64 = AtomicU64::new(u64::MAX);
++    static NEXT: AtomicU32 = AtomicU32::new(0);
++    if LAST.swap(frame, Ordering::Relaxed) == frame {
++        return;
++    }
++    {
++        let mut pending = lock(&PENDING);
++        if let Some(pending) = pending.as_mut() {
++            let old: Vec<usize> = pending
++                .iter()
++                .filter(|(_, p)| p.meta.frame + 600 < frame)
++                .map(|(&k, _)| k)
++                .collect();
++            for k in &old {
++                // Kept, not released: a list that runs after all still
++                // holds its own reference.
++                if let Some(p) = pending.remove(k) {
++                    std::mem::forget(p);
++                }
++            }
++            if !old.is_empty() {
++                tracing::info!(target: "probe", n = old.len(), "probe: sampled dispatches whose lists never ran, forgotten");
++            }
++        }
++    }
++    let total = samples(&cfg.frames);
++    let next = NEXT.load(Ordering::Relaxed);
++    if next >= total {
++        return;
++    }
++    let mark = (next + 20).min(total);
++    if let Some(at) = frame_of(&cfg.frames, first(), mark - 1)
++        && frame >= at + 10
++        && NEXT
++            .compare_exchange(next, mark, Ordering::Relaxed, Ordering::Relaxed)
++            .is_ok()
++    {
++        summarize(if mark == total {
++            "sampling done"
++        } else {
++            "so far"
++        });
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn probe_list_lines_give_hashes_and_names() {
++        let text = "# programs\n5E5D98E4FF3A7CF9 compute_graph_opsCS_AddBroadcastAlignedOperation_28dc6b23_Wrapped\n\n\
++                    13c8daa0bad76f2a  CS_AddOperation  # a comment\n\
++                    nothex0000000000 bad\n0123 short\n21e30428bed8410d\n";
++        let got = parse_list(text);
++        assert_eq!(got.len(), 3);
++        assert_eq!(
++            got["5e5d98e4ff3a7cf9"],
++            "compute_graph_opsCS_AddBroadcastAlignedOperation_28dc6b23_Wrapped"
++        );
++        assert_eq!(got["13c8daa0bad76f2a"], "CS_AddOperation");
++        assert_eq!(got["21e30428bed8410d"], "21e30428bed8410d");
++    }
++
++    #[test]
++    fn probe_dump_names_are_matched_by_any_part() {
++        let names = [
++            "compute_graph_opsCS_AddOperation_dc3242d6_Wrapped.13c8daa0bad76f2a.cdxil",
++            "ped_skinning_csCS_PedStandardSkinning_0_1_Wrapped.0123456789abcdef.cdxil",
++            "MSNC_VS_CascadeShadows_PedTransformSkinD_ffc29b06_Wrapped.81f82ce9c77fe909.cdxil",
++            "ped_standard_head_csCS_ComputeStickyLips.0123.cdxil",
++            "compute_graph_opsCS_ZeroOperation.fedcba9876543210.txt",
++        ]
++        .map(str::to_owned);
++        let got = parse_names(
++            names.clone().into_iter(),
++            "Compute_Graph_Ops|ped_skinning_cs|ped_standard_head",
++        );
++        assert_eq!(got.len(), 2);
++        assert_eq!(
++            got["13c8daa0bad76f2a"],
++            "compute_graph_opsCS_AddOperation_dc3242d6_Wrapped"
++        );
++        assert_eq!(
++            got["0123456789abcdef"],
++            "ped_skinning_csCS_PedStandardSkinning_0_1_Wrapped"
++        );
++        // No pattern: every container.
++        assert_eq!(parse_names(names.into_iter(), "").len(), 3);
++    }
++
++    #[test]
++    fn probe_frames_every_nth_from_the_first_at_most_m() {
++        let f = parse_frames(None);
++        assert_eq!(
++            f,
++            Frames::Every {
++                every: 30,
++                most: 40
++            }
++        );
++        assert_eq!(
++            parse_frames(Some("10")),
++            Frames::Every {
++                every: 10,
++                most: 40
++            }
++        );
++        assert_eq!(
++            parse_frames(Some(" 5:3 ")),
++            Frames::Every { every: 5, most: 3 }
++        );
++        assert_eq!(parse_frames(Some("0:3")), f);
++        assert_eq!(parse_frames(Some("junk")), f);
++        assert_eq!(
++            parse_frames(Some("900, 901,930,")),
++            Frames::List(vec![900, 901, 930])
++        );
++        assert_eq!(ordinal(&f, 100, None), None);
++        assert_eq!(ordinal(&f, 99, Some(100)), None);
++        assert_eq!(ordinal(&f, 100, Some(100)), Some(0));
++        assert_eq!(ordinal(&f, 130, Some(100)), Some(1));
++        assert_eq!(ordinal(&f, 131, Some(100)), None);
++        assert_eq!(ordinal(&f, 100 + 30 * 39, Some(100)), Some(39));
++        assert_eq!(ordinal(&f, 100 + 30 * 40, Some(100)), None);
++        assert_eq!(frame_of(&f, Some(100), 39), Some(100 + 30 * 39));
++        let l = Frames::List(vec![900, 901, 930]);
++        assert_eq!(ordinal(&l, 901, None), Some(1));
++        assert_eq!(ordinal(&l, 902, None), None);
++        assert_eq!((samples(&l), samples(&f)), (3, 40));
++    }
++
++    fn floats(v: &[f32]) -> Vec<u8> {
++        v.iter().flat_map(|f| f.to_le_bytes()).collect()
++    }
++
++    #[test]
++    fn probe_float_statistics() {
++        let s = stats(&floats(&[
++            0.0,
++            1.0,
++            -2.0,
++            f32::NAN,
++            f32::INFINITY,
++            0.0,
++            4.0,
++        ]));
++        assert_eq!(s.nonzero, 5);
++        assert_eq!(s.nonfinite, 2);
++        assert_eq!((s.min, s.max), (Some(-2.0), Some(4.0)));
++        assert_eq!(s.mean, Some(3.0 / 5.0));
++        assert!(!s.zero);
++        assert_eq!(s.bytes, 28);
++        let z = stats(&[0u8; 64]);
++        assert!(z.zero);
++        assert_eq!(
++            (z.nonzero, z.min, z.max, z.mean),
++            (0, Some(0.0), Some(0.0), Some(0.0))
++        );
++        // A byte past the last dword counts for zero, not for the floats.
++        let mut tail = vec![0u8; 9];
++        tail[8] = 1;
++        let t = stats(&tail);
++        assert!(!t.zero && t.nonzero == 0);
++        // Negative zero is a non-zero dword.
++        assert_eq!(stats(&floats(&[-0.0])).nonzero, 1);
++        let e = stats(&[]);
++        assert!(e.zero && e.min.is_none() && e.mean.is_none());
++        // The hash: the first 16 hex digits of BLAKE3.
++        let bytes = floats(&[1.0, 2.0]);
++        assert_eq!(
++            format!("{:016x}", stats(&bytes).hash),
++            blake3::hash(&bytes).to_hex()[..16]
++        );
++    }
++
++    #[test]
++    fn probe_zero_identical_changing() {
++        let a = stats(&floats(&[1.0, 2.0]));
++        let b = stats(&floats(&[1.0, 3.0]));
++        let z = stats(&floats(&[0.0, 0.0]));
++        assert_eq!(classify(None, &a), Class::First);
++        assert_eq!(classify(Some(a.hash), &a), Class::Identical);
++        assert_eq!(classify(Some(a.hash), &b), Class::Changing);
++        // Zero first, whatever came before.
++        assert_eq!(classify(Some(z.hash), &z), Class::Zero);
++        assert_eq!(classify(None, &z), Class::Zero);
++        let l = Line {
++            len: 64,
++            frames: [0, 1, 2].into_iter().collect(),
++            zero: 1,
++            identical: 1,
++            changing: 0,
++            first: 1,
++            nonzero: vec![16, 0, 16],
++            untouched: 1,
++            differs: 0,
++            order: 3,
++            per_frame: 1,
++        };
++        assert_eq!(
++            line_text("CS_MatMulOperation", "u0", true, &l),
++            "probe: CS_MatMulOperation u0 w len=64 frames=3: zero in 1, identical to previous sample in 1, changing in 0; \
++             nonzero dwords median 16; unchanged by the dispatch in 1, title memory differs from the card in 0 \
++             (3 samples, 1 first, up to 1 a frame)"
++        );
++    }
++
++    /// `memory[i] = value` for the first `count` dwords.
++    const FILL: &str = r#"
++#define RS "RootConstants(num32BitConstants=2, b0), UAV(u0)"
++cbuffer What : register(b0) { uint value; uint count; };
++RWByteAddressBuffer memory : register(u0);
++[RootSignature(RS)]
++[numthreads(64, 1, 1)]
++void main(uint3 id : SV_DispatchThreadID) {
++    if (id.x < count) {
++        memory.Store(id.x * 4u, value);
++    }
++}
++"#;
++
++    /// On the software adapter (`VICTORY_D3D12_WARP=1`, diagnostics): a
++    /// program writes a pattern into a host copy; the probe's copies on the
++    /// card see it before and after, title memory has it once the list has
++    /// run, and three rounds come out changing, then identical.
++    #[test]
++    fn warp_probe_sees_a_dispatchs_writes_change_then_stay() {
++        use windows_sys::Win32::System::Memory::{
++            MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc,
++        };
++        const MEM_WRITE_WATCH: u32 = 0x0020_0000;
++        let Some(host) = crate::host::host() else {
++            return;
++        };
++        // The host device is the software adapter exactly then (`host.rs`).
++        if std::env::var_os("VICTORY_D3D12_WARP").is_none() {
++            eprintln!(
++                "probe tests: skipped, the host device is not the software adapter (VICTORY_D3D12_WARP=1, diagnostics)"
++            );
++            return;
++        }
++        const LEN: usize = 1 << 20;
++        const COUNT: u32 = 256;
++        // SAFETY: a plain allocation of our own.
++        let title = unsafe {
++            VirtualAlloc(
++                std::ptr::null(),
++                LEN,
++                MEM_RESERVE | MEM_COMMIT | MEM_WRITE_WATCH,
++                PAGE_READWRITE,
++            )
++        } as *mut u8;
++        assert!(!title.is_null());
++        crate::shadow::register(0x9_0b0e, title as u64, LEN as u64);
++        let shadow = crate::shadow::find(title as u64, LEN as u64).expect("a host copy");
++        let code =
++            crate::host::compile(FILL, windows::core::s!("main"), windows::core::s!("cs_5_1"))
++                .expect("the test's shader");
++        // SAFETY: the shader's own root signature; plain creation.
++        let (root, pso): (ID3D12RootSignature, ID3D12PipelineState) = unsafe {
++            let device = host.device();
++            let root: ID3D12RootSignature = device
++                .CreateRootSignature(0, &code)
++                .expect("a root signature");
++            let pso = device
++                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
++                    pRootSignature: std::mem::transmute_copy(&root),
++                    CS: D3D12_SHADER_BYTECODE {
++                        pShaderBytecode: code.as_ptr().cast(),
++                        BytecodeLength: code.len(),
++                    },
++                    ..Default::default()
++                })
++                .expect("a pipeline");
++            (root, pso)
++        };
++        FORCED.store(true, Ordering::Relaxed);
++        let name = "warp_probe_fill";
++        let address = title as u64 + 0x1000;
++        let bytes = u64::from(COUNT) * 4;
++        for (k, value) in [7u32, 9, 9].into_iter().enumerate() {
++            let list = host.new_list().expect("a host list");
++            shadow.refresh(&list, address, bytes);
++            shadow.gpu_writes(&list, address, bytes);
++            let meta = Meta {
++                frame: 1_000_000 + k as u64,
++                sample: k as u32,
++                order: 0,
++                hash: "0000000000000000".to_owned(),
++                name: name.to_owned(),
++                indirect: false,
++                groups: [COUNT / 64, 1, 1],
++                records: 1,
++                parts: false,
++            };
++            let view = ViewIn {
++                reg: "u0".to_owned(),
++                slot: 1,
++                entry: 0,
++                write: true,
++                kind: "root-view",
++                address,
++                len: bytes,
++                source: Source::Card(shadow.clone()),
++            };
++            let probed = begin(&list, meta, vec![view], 1 << 20, u64::MAX);
++            assert!(probed.is_some());
++            // SAFETY: an open list; the copy's buffer; the shader's own
++            // root signature.
++            unsafe {
++                list.list.SetComputeRootSignature(&root);
++                list.list.SetPipelineState(&pso);
++                list.list
++                    .SetComputeRoot32BitConstants(0, 2, [value, COUNT].as_ptr().cast(), 0);
++                list.list
++                    .SetComputeRootUnorderedAccessView(1, shadow.gpu(address));
++                list.list.Dispatch(COUNT / 64, 1, 1);
++            }
++            after(probed, &list);
++            list.close();
++            host.execute(&[&list]);
++            crate::host::settle_for_fence();
++            // Title memory has what the program wrote.
++            // SAFETY: inside the allocation.
++            assert_eq!(
++                unsafe {
++                    (address as *const u32)
++                        .add(COUNT as usize - 1)
++                        .read_volatile()
++                },
++                value
++            );
++        }
++        let summary = lock(&SUMMARY);
++        let line = &summary.as_ref().expect("a summary")[&(name.to_owned(), "u0".to_owned(), true)];
++        eprintln!(
++            "{} (host copy in the card's memory: {})",
++            line_text(name, "u0", true, line),
++            shadow.carded()
++        );
++        assert_eq!(
++            (line.first, line.changing, line.identical, line.zero),
++            (1, 1, 1, 0)
++        );
++        assert_eq!(line.nonzero, vec![u64::from(COUNT); 3]);
++        // The third round wrote what was there: unchanged by it. Title
++        // memory always had the card's bytes.
++        assert_eq!((line.untouched, line.differs), (1, 0));
++        FORCED.store(false, Ordering::Relaxed);
++    }
++}

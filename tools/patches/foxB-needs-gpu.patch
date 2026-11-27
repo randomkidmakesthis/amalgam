@@ -1,0 +1,715 @@
+# foxB-needs-gpu.patch: host half of VICTORY_HALF_VIEWS, for coder C (victory-gpu).
+# Written by coder B, 2026-11-26. NOT directly appliable to victory-fox: the hunks below are
+# victory-dev's own (`git -C victory-dev diff HEAD`), verbatim, as the exact reference.
+# The translator side is in par/foxB branch portB (commit "Picture fixes of ours on cool_fox").
+#
+# Contract (translator -> host), as in victory-dev:
+#  - victory_shader::emit::HostShader gains `pub half_views: Vec<(u8, u32)>`: (root parameter
+#    slot of a RootType::Table, dword offset of the descriptor in that table). The shader
+#    reads/writes these views through an UNSIGNED-INTEGER typed handle (bufferLoad.i32 /
+#    bufferStore.i32, component type 0x405).
+#  - The host must show the shader, at those table places, a 16-bit FLOAT or SINT buffer view
+#    as the UINT format of the same layout (R16_FLOAT/SINT -> R16_UINT, R16G16_* -> R16G16_UINT,
+#    R16G16B16A16_* -> R16G16B16A16_UINT): `descriptor::host::half_view` below, used where the
+#    draw/dispatch copies table views to host slots (victory-dev draw.rs hunks @@ -2520 and
+#    @@ -2635: before `host.make_at(index, &view)` for a table place listed in half_views,
+#    use `half_view(&view).unwrap_or(view)`), and the pipeline key must include half_views
+#    (draw.rs @@ -1009: `h.extend_from_slice(&t.host.half_views)`), plus the one-line log
+#    `note_half_views` (draw.rs @@ -3186) and the meter line in host.rs.
+#  - UINT views at those places need nothing (run 92: the game's views there were already
+#    UINT: "the host made 0 unsigned twins"); the twin matters for FLOAT/SINT views only.
+#    Without this host part a FLOAT view at a halves place is read through a uint handle
+#    (format/type mismatch, undefined): if C cannot land it, run with VICTORY_HALF_VIEWS=0
+#    and cool_fox's view kinds (SLOT_TABLE_STRIDES=252) take those accesses.
+#  - Shader cache entry format (crates/victory-gpu/src/shader_cache.rs, B's file) already
+#    carries half_views in portB; cache key bumped ("victory shader cache key foxB 1").
+#  - cool_fox's own host half of view kinds (write_stride, SLOT_TABLE_STRIDES=252,
+#    view_stride_and_kind) stays as it is; nothing in portB changes slot numbers.
+#  - New translator exports C may log once a run: victory_shader::emit::{HALVES_PLACES,
+#    D16_VIEW_KIND_ACCESSES, D16_BITS_ACCESSES, WAVE_PAIRED_BEFORE_WIDE} (AtomicU64 counters),
+#    and victory_shader::emit::d16_view_kinds() (VICTORY_D16_VIEW_KINDS, default on) if the
+#    host wants to skip writing kind bits when it is off.
+#  - Mesh linking (26600c6, emit::link_mesh / mesh_fits) is now in the translator; its host
+#    half (pipeline/host.rs, VICTORY_MESH_LINK) is soldsawn 26600c6's pipeline/host.rs hunk:
+#    `git -C C:/GTAVI/Tools/victory-dev show 26600c6 -- crates/victory-gpu/src/pipeline/host.rs` (C's call).
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index 0bb6e28..c23a8f7 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -2993,6 +3875,104 @@ fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
+ /// since the start: the slot kept showing the old view.
+ pub(crate) static KEPT_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ 
++/// (Neptune 25fbf69, 61f2206) Since the last log line: slots that went on showing their
++/// texture when their view was made stale ([`HostHeap::stale_kept`]), those made null at
++/// the cap ([`stale_expire_ms`]), and those replaced by their new view.
++pub(crate) static STALE_KEPT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
++
++/// (Neptune 25fbf69) Slots the title wrote with a texture view that is due at once, since
++/// the pass over textures picked by index last caught up (`draw.rs` `catch_up_budget`).
++pub(crate) static FRESH_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++/// (fxceless #927 via trustno1 77e13a9) The unsigned integer format with the layout of a
++/// 16-bit float or signed integer format (one, two or four channels), if `format` is one.
++pub(crate) fn half_format(format: u32) -> Option<u32> {
++    match format {
++        // R16G16B16A16_FLOAT and _SINT: R16G16B16A16_UINT.
++        10 | 14 => Some(12),
++        // R16G16_FLOAT and _SINT: R16G16_UINT.
++        34 | 38 => Some(36),
++        // R16_FLOAT and _SINT: R16_UINT.
++        54 | 59 => Some(57),
++        _ => None,
++    }
++}
++
++/// (fxceless #927) `view` as a shader is shown it where it moves a buffer's 16-bit channels
++/// as unsigned integers (`victory_shader::emit::HostShader::half_views`): a buffer view in a
++/// 16-bit float or signed format, in the unsigned format of the same layout, through which
++/// every 16-bit pattern is read and stored as it is. `None` for every other view: the
++/// title's own serves.
++pub(crate) fn half_view(view: &View) -> Option<View> {
++    // Buffer views: dimension 1 in the title's description of either kind.
++    const BUFFER: u32 = 1;
++    match view {
++        View::Shader(resource, Some(desc)) if desc[1] == BUFFER => {
++            let mut desc = *desc;
++            desc[0] = half_format(desc[0])?;
++            Some(View::Shader(*resource, Some(desc)))
++        }
++        View::Unordered(resource, counter, Some(desc)) if desc[1] == BUFFER => {
++            let mut desc = *desc;
++            desc[0] = half_format(desc[0])?;
++            Some(View::Unordered(*resource, *counter, Some(desc)))
++        }
++        View::Placed(unordered, resource, desc) if resource[0] == BUFFER && desc[1] == BUFFER => {
++            let mut desc = *desc;
++            desc[0] = half_format(desc[0])?;
++            Some(View::Placed(*unordered, *resource, desc))
++        }
++        _ => None,
++    }
++}
++
++/// (fxceless #927) The format of `view`, a buffer view through which a shader moves 16-bit
++/// channels as unsigned integers, if those integers are not what the console gives (wider,
++/// normalised or signed 8-bit channels, which the console converts). `None` for the formats
++/// the integers serve exactly, and for anything not a buffer view.
++pub(crate) fn half_inexact(view: &View) -> Option<u32> {
++    const BUFFER: u32 = 1;
++    // R16G16B16A16, R16G16 and R16 (float, unsigned, signed), then R10G10B10A2, R8G8B8A8,
++    // R8G8 and R8 unsigned.
++    const EXACT: [u32; 13] = [10, 12, 14, 34, 36, 38, 54, 57, 59, 25, 30, 50, 62];
++    let format = match view {
++        View::Shader(_, Some(desc)) | View::Unordered(_, _, Some(desc)) if desc[1] == BUFFER => desc[0],
++        View::Placed(_, resource, desc) if resource[0] == BUFFER && desc[1] == BUFFER => desc[0],
++        _ => return None,
++    };
++    (!EXACT.contains(&format)).then_some(format)
++}
++
++/// The log line of [`STALE_KEPT`] (from the 5-second meter in `host.rs`).
++pub(crate) fn stale_kept_line() {
++    let [kept, nulled, again] = STALE_KEPT.each_ref().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed));
++    tracing::info!(
++        "slots whose view was made stale, in the last period: {kept} went on showing their texture \
++         (VICTORY_STALE_KEEP_MS=0: null at once), {again} were replaced by their new view, {nulled} hit the cap \
++         (VICTORY_STALE_KEEP_MAX_MS) and were made null"
++    );
++}
++
++/// (Neptune) Whether a slot made stale goes on showing its texture
++/// (`VICTORY_STALE_KEEP_MS`, 10,000; 0: null at once, as before).
++fn stale_keep_ms() -> u64 {
++    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    *MS.get_or_init(|| std::env::var("VICTORY_STALE_KEEP_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(10_000))
++}
++
++/// (Neptune 61f2206) How long a kept slot may wait for its new view before it is made
++/// null (`VICTORY_STALE_KEEP_MAX_MS`, 120,000; bounds the VRAM the old textures hold).
++/// `VICTORY_STALE_EXPIRE_NULL=1`: null after `VICTORY_STALE_KEEP_MS`.
++fn stale_expire_ms() -> u64 {
++    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    *MS.get_or_init(|| {
++        if std::env::var_os("VICTORY_STALE_EXPIRE_NULL").is_some_and(|v| v == "1") {
++            return stale_keep_ms();
++        }
++        std::env::var("VICTORY_STALE_KEEP_MAX_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(120_000)
++    })
++}
++
+ /// Whether a slot written with another view of the placed texture it
+ /// shows keeps showing the old one until the new is made;
+ /// `VICTORY_KEEP_VIEWS=0` makes it null at once, as before.
+@@ -3200,6 +4202,303 @@ fn null_view(at: D3D12_CPU_DESCRIPTOR_HANDLE) {
+ mod tests {
+     use super::*;
+ 
++    use windows::Win32::System::Threading::{CreateEventW, INFINITE, WaitForSingleObject};
++    use windows::core::Interface;
++
++    #[test]
++    fn copied_sampler_uses_the_record_that_was_fingerprinted() {
++        let heap = HostHeap::new(true, 8).expect("D3D12 test sampler heap");
++        let mut a = [0u32; 4];
++        let mut b = [0u32; 4];
++        let mut live = [0u32; 4];
++        let clamp = [21, 3, 3, 3, 0, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff, 0];
++        let mut wrap = clamp;
++        wrap[1] = 1;
++        super::super::create_sampler(std::ptr::null(), &clamp, a.as_mut_ptr() as u64);
++        super::super::create_sampler(std::ptr::null(), &wrap, b.as_mut_ptr() as u64);
++        let key = |r: [u32; 4]| u64::from(r[2]) << 32 | u64::from(r[1]);
++        let bytes = |r: [u32; 4]| {
++            let mut out = [0u8; 16];
++            for (dst, word) in out.chunks_exact_mut(4).zip(r) {
++                dst.copy_from_slice(&word.to_le_bytes());
++            }
++            out
++        };
++        assert_ne!(key(a), key(b));
++        let handle = live.as_mut_ptr() as u64;
++        let installed = || heap.made_key(1);
++        // The sampler record interning is identical to the title's API
++        // writes. Both byte records and the later guest location are valid.
++        // Ours (`VICTORY_MIRROR_EXACT`, `mirror_copied_exact`): a slot
++        // written again since its page was read (bytes a, slot b) shows
++        // the newer record and its fingerprint is forgotten, where myokex
++        // makes a (its sync runs alone); the fingerprint never names a
++        // record other than the one the slot shows.
++        live.copy_from_slice(&b);
++        assert!(heap.mirror_copied(1, handle, &bytes(a)));
++        assert_eq!(installed(), key(b));
++        live.copy_from_slice(&a);
++        assert!(heap.mirror_copied(1, handle, &bytes(a)), "a copied in again is not taken for the record last seen");
++        let first = installed();
++        assert!(!heap.mirror_copied(1, handle, &bytes(a)));
++        assert_eq!((first, installed()), (key(a), key(a)));
++        live.copy_from_slice(&b);
++        assert!(heap.mirror_copied(1, handle, &bytes(b)));
++        assert_eq!(installed(), key(b));
++        assert!(!heap.made(2), "unrelated slot was modified");
++    }
++    #[test]
++    fn copied_sampler_controls_fenced_shader_output() {
++        const SOURCE: &str = include_str!("sampler-output.hlsl");
++        let host = host().expect("D3D12 test host");
++        let device = &host.device;
++        let samplers = HostHeap::new(true, 3).expect("D3D12 test sampler heap");
++        let mut clamp_record = [0u32; 4];
++        let mut wrap_record = [0u32; 4];
++        let mut live = [0u32; 4];
++        // D3D12 point samplers with identical fields except AddressU.
++        let clamp = [0, 3, 3, 3, 0, 1, 1, 0, 0, 0, 0, 0, 0x7f7f_ffff];
++        let mut wrap = clamp;
++        wrap[1] = 1;
++        super::super::create_sampler(std::ptr::null(), &clamp, clamp_record.as_mut_ptr() as u64);
++        super::super::create_sampler(std::ptr::null(), &wrap, wrap_record.as_mut_ptr() as u64);
++        let bytes = |record: [u32; 4]| {
++            let mut out = [0u8; 16];
++            for (dst, word) in out.chunks_exact_mut(4).zip(record) {
++                dst.copy_from_slice(&word.to_le_bytes());
++            }
++            out
++        };
++        // Slot 0 is the copied-record path under test. Its captured bytes
++        // name clamp while the still-valid live record has already become wrap.
++        // Ours: the slot shows the live record, wrap (see
++        // `copied_sampler_uses_the_record_that_was_fingerprinted`).
++        live.copy_from_slice(&wrap_record);
++        assert!(samplers.mirror_copied(0, live.as_mut_ptr() as u64, &bytes(clamp_record)));
++        assert!(samplers.mirror(1, clamp_record.as_ptr() as u64, false).is_some());
++        assert!(samplers.mirror(2, wrap_record.as_ptr() as u64, false).is_some());
++
++        let texture = |state| {
++            let heap = D3D12_HEAP_PROPERTIES {
++                Type: D3D12_HEAP_TYPE_DEFAULT,
++                ..Default::default()
++            };
++            let desc = D3D12_RESOURCE_DESC {
++                Dimension: D3D12_RESOURCE_DIMENSION_TEXTURE2D,
++                Width: 2,
++                Height: 1,
++                DepthOrArraySize: 1,
++                MipLevels: 1,
++                Format: DXGI_FORMAT_R8_UNORM,
++                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++                ..Default::default()
++            };
++            let mut resource = None;
++            unsafe {
++                device
++                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut resource)
++                    .unwrap();
++            }
++            resource.unwrap()
++        };
++        let buffer = |size: u64, kind: D3D12_HEAP_TYPE, flags: D3D12_RESOURCE_FLAGS, state: D3D12_RESOURCE_STATES| -> ID3D12Resource {
++            let heap = D3D12_HEAP_PROPERTIES {
++                Type: kind,
++                ..Default::default()
++            };
++            let desc = D3D12_RESOURCE_DESC {
++                Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
++                Width: size,
++                Height: 1,
++                DepthOrArraySize: 1,
++                MipLevels: 1,
++                SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
++                Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
++                Flags: flags,
++                ..Default::default()
++            };
++            let mut resource = None;
++            unsafe {
++                device
++                    .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, state, None, &mut resource)
++                    .unwrap();
++            }
++            resource.unwrap()
++        };
++        let target = texture(D3D12_RESOURCE_STATE_COPY_DEST);
++        let decoy = texture(D3D12_RESOURCE_STATE_COPY_DEST);
++        let upload = buffer(
++            1024,
++            D3D12_HEAP_TYPE_UPLOAD,
++            D3D12_RESOURCE_FLAG_NONE,
++            D3D12_RESOURCE_STATE_GENERIC_READ,
++        );
++        let output = buffer(
++            256,
++            D3D12_HEAP_TYPE_DEFAULT,
++            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
++            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++        );
++        let readback = buffer(
++            256,
++            D3D12_HEAP_TYPE_READBACK,
++            D3D12_RESOURCE_FLAG_NONE,
++            D3D12_RESOURCE_STATE_COPY_DEST,
++        );
++        let empty = D3D12_RANGE { Begin: 0, End: 0 };
++        let mut mapped = std::ptr::null_mut();
++        unsafe {
++            upload.Map(0, Some(&empty), Some(&mut mapped)).unwrap();
++            mapped.cast::<u8>().write(17);
++            mapped.cast::<u8>().add(1).write(231);
++            mapped.cast::<u8>().add(512).write(61);
++            mapped.cast::<u8>().add(513).write(199);
++            upload.Unmap(0, None);
++        }
++
++        let view_desc = D3D12_DESCRIPTOR_HEAP_DESC {
++            Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
++            NumDescriptors: 2,
++            Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
++            ..Default::default()
++        };
++        let views: ID3D12DescriptorHeap = unsafe { device.CreateDescriptorHeap(&view_desc).unwrap() };
++        let start = unsafe { views.GetCPUDescriptorHandleForHeapStart() };
++        let step = unsafe { device.GetDescriptorHandleIncrementSize(view_desc.Type) } as usize;
++        let srv = D3D12_SHADER_RESOURCE_VIEW_DESC {
++            Format: DXGI_FORMAT_R8_UNORM,
++            ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
++            Shader4ComponentMapping: D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING,
++            Anonymous: D3D12_SHADER_RESOURCE_VIEW_DESC_0 {
++                Texture2D: D3D12_TEX2D_SRV {
++                    MipLevels: 1,
++                    ..Default::default()
++                },
++            },
++        };
++        unsafe {
++            device.CreateShaderResourceView(&target, Some(&srv), start);
++            device.CreateShaderResourceView(&decoy, Some(&srv), D3D12_CPU_DESCRIPTOR_HANDLE { ptr: start.ptr + step });
++        }
++
++        let code = crate::host::compile(
++            SOURCE,
++            windows::core::s!("main"),
++            windows::core::s!("cs_5_1"),
++        )
++        .expect("sampler output shader");
++        let root: ID3D12RootSignature = unsafe { device.CreateRootSignature(0, &code).unwrap() };
++        let pso: ID3D12PipelineState = unsafe {
++            device
++                .CreateComputePipelineState(&D3D12_COMPUTE_PIPELINE_STATE_DESC {
++                    pRootSignature: std::mem::transmute_copy(&root),
++                    CS: D3D12_SHADER_BYTECODE {
++                        pShaderBytecode: code.as_ptr().cast(),
++                        BytecodeLength: code.len(),
++                    },
++                    ..Default::default()
++                })
++                .unwrap()
++        };
++        let allocator: ID3D12CommandAllocator =
++            unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap() };
++        let list: ID3D12GraphicsCommandList =
++            unsafe { device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, &pso).unwrap() };
++        let subresource = |resource: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
++            pResource: unsafe { std::mem::transmute_copy(resource) },
++            Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
++            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 { SubresourceIndex: 0 },
++        };
++        let placed = |offset| D3D12_TEXTURE_COPY_LOCATION {
++            pResource: unsafe { std::mem::transmute_copy(&upload) },
++            Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
++            Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
++                PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
++                    Offset: offset,
++                    Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
++                        Format: DXGI_FORMAT_R8_UNORM,
++                        Width: 2,
++                        Height: 1,
++                        Depth: 1,
++                        RowPitch: 256,
++                    },
++                },
++            },
++        };
++        unsafe {
++            list.CopyTextureRegion(&subresource(&target), 0, 0, 0, &placed(0), None);
++            list.CopyTextureRegion(&subresource(&decoy), 0, 0, 0, &placed(512), None);
++            list.ResourceBarrier(&[
++                crate::host::transition(
++                    &target,
++                    D3D12_RESOURCE_STATE_COPY_DEST,
++                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++                ),
++                crate::host::transition(
++                    &decoy,
++                    D3D12_RESOURCE_STATE_COPY_DEST,
++                    D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE,
++                ),
++            ]);
++            list.SetDescriptorHeaps(&[Some(views.clone()), Some(samplers.heap.clone())]);
++            list.SetComputeRootSignature(&root);
++            list.SetComputeRootDescriptorTable(0, views.GetGPUDescriptorHandleForHeapStart());
++            list.SetComputeRootDescriptorTable(1, samplers.gpu_handle(0));
++            list.SetComputeRootUnorderedAccessView(2, output.GetGPUVirtualAddress());
++            list.Dispatch(1, 1, 1);
++            list.ResourceBarrier(&[crate::host::transition(
++                &output,
++                D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
++                D3D12_RESOURCE_STATE_COPY_SOURCE,
++            )]);
++            list.CopyBufferRegion(&readback, 0, &output, 0, 12);
++            list.Close().unwrap();
++            let command: ID3D12CommandList = list.cast().unwrap();
++            host.queue().ExecuteCommandLists(&[Some(command)]);
++        }
++        let fence: ID3D12Fence = unsafe { device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap() };
++        let event = unsafe { CreateEventW(None, false, false, None).unwrap() };
++        unsafe {
++            host.queue().Signal(&fence, 1).unwrap();
++            fence.SetEventOnCompletion(1, event).unwrap();
++            WaitForSingleObject(event, INFINITE);
++            windows::Win32::Foundation::CloseHandle(event).unwrap();
++            device.GetDeviceRemovedReason().unwrap();
++            assert_eq!(fence.GetCompletedValue(), 1);
++            readback
++                .Map(0, Some(&D3D12_RANGE { Begin: 0, End: 12 }), Some(&mut mapped))
++                .unwrap();
++            let actual = std::slice::from_raw_parts(mapped.cast::<u32>(), 3);
++            eprintln!("SAMPLER-OUTPUT changed/clamp/decoy={actual:?}");
++            assert_eq!(actual, [17, 231, 61]);
++            readback.Unmap(0, Some(&empty));
++        }
++    }
++
++    /// (fxceless #927) The unsigned twin of a 16-bit float or signed format has its layout,
++    /// and only buffer views in such a format are shown as another view.
++    #[test]
++    fn only_16_bit_float_and_signed_buffer_views_get_an_unsigned_twin() {
++        for (format, unsigned) in [(10, 12), (14, 12), (34, 36), (38, 36), (54, 57), (59, 57)] {
++            assert_eq!(half_format(format), Some(unsigned));
++        }
++        for other in [0, 12, 36, 57, 11, 13, 35, 37, 56, 58, 42, 17, 30, 61] {
++            assert_eq!(half_format(other), None, "format {other}");
++        }
++        const BUFFER: u32 = 1;
++        let words = |format: u32, dimension: u32| [format, dimension, 5768, 0, 0, 0, 64, 0, 0, 0];
++        assert_eq!(
++            half_view(&View::Unordered(7, 0, Some(words(10, BUFFER)))),
++            Some(View::Unordered(7, 0, Some(words(12, BUFFER))))
++        );
++        assert_eq!(half_view(&View::Shader(7, Some(words(54, BUFFER)))), Some(View::Shader(7, Some(words(57, BUFFER)))));
++        assert_eq!(half_view(&View::Unordered(7, 0, Some(words(12, BUFFER)))), None);
++        assert_eq!(half_view(&View::Unordered(7, 0, Some(words(10, 4)))), None);
++        assert_eq!(half_view(&View::Shader(7, None)), None);
++        assert_eq!(half_inexact(&View::Shader(7, Some(words(41, BUFFER)))), Some(41));
++        assert_eq!(half_inexact(&View::Shader(7, Some(words(12, BUFFER)))), None);
++    }
++
+     /// A null texture UAV keeps the title's dimension (3D for the world's
+     /// wind field), and is 2D when the title names none.
+     #[test]
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 91fc888..6641b05 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -1009,13 +2022,38 @@ impl State {
+             list.keep(&p.pso);
+             list.keep(&p.root);
+         }
++        crate::readback::consumers::clear_writer();
++        // (fxceless 5d659e0) `VICTORY_TABLE_STAGES`: what this draw's stages read of each table.
++        STAGE_SPANS.with_borrow_mut(|(spans, staged)| {
++            *spans = if table_stages() { stage_spans(p) } else { Vec::new() };
++            staged.clear();
++        });
+         for stage in &p.stages {
+             let t = stage.translated();
+             STORES.set(t.stores);
++            if t.stores {
++                crate::readback::consumers::set_writer(&stage.shader.hash);
++                // (Prefault job) The declarations meter's writer.
++                crate::declstat::set_writer(&stage.shader.hash);
++            }
++            if crate::shadow::any_flagged() {
++                STAGE_HASH.set(u64::from_str_radix(&stage.shader.hash, 16).unwrap_or(0));
++            }
++            // (fxceless #927) The table places this stage moves 16-bit halves through.
++            HALF_PLACES.with_borrow_mut(|h| {
++                h.clear();
++                h.extend_from_slice(&t.host.half_views);
++            });
++            if !t.host.half_views.is_empty() {
++                note_half_views(&p.name, &stage.shader.hash, &t.host.half_views);
++            }
+             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+             STORES.set(true);
+             if made.iter().any(|m| m.1 == u32::MAX) {
+                 once!("a draw whose descriptor table found no free slots is dropped");
++                // (fxceless 5d659e0) Which draws those are, in the frame line's list of drops.
++                #[cfg(feature = "diagnostics")]
++                crate::pipeline::note_why(format!("no free dynamic slots for a table of {}", p.name));
+                 return false;
+             }
+             // What the shader stores through root views and raw addresses is
+@@ -2520,6 +3856,27 @@ impl State {
+                 fresh.push(u.slot);
+             }
+         }
++        // (fxceless #927) A table with a 16-bit float or signed buffer view at a place the
++        // shader moves halves through is made afresh too, with that view in the unsigned
++        // format of the same layout (`descriptor::host::half_view`); the title's own slot
++        // keeps the title's format for the shaders that read it as floats.
++        let half: Vec<(u8, u32)> = HALF_PLACES.with_borrow(|h| h.clone());
++        for &(slot, at) in &half {
++            let Some(&Root::Table(table)) = self.roots_ref(compute).get(usize::from(slot)) else {
++                continue;
++            };
++            let Some(view) = crate::descriptor::view(table + u64::from(at) * 4) else {
++                continue;
++            };
++            if crate::descriptor::host::half_view(&view).is_some() {
++                fresh.push(slot);
++            } else if let Some(format) = crate::descriptor::host::half_inexact(&view) {
++                once!(
++                    format,
++                    "a shader moves a buffer's 16-bit channels as integers through a view whose values the console converts: they are read and written unconverted"
++                );
++            }
++        }
+         fresh.sort_unstable();
+         fresh.dedup();
+         for u in used.iter().filter(tables) {
+@@ -2635,12 +4129,24 @@ impl State {
+                         host.constant_at(index, gpu, size);
+                     }
+                     Some(view) => {
+-                        host.make_at(index, &view);
++                        // (fxceless #927) The unsigned twin where the shader moves halves.
++                        let twin = if half.contains(&(slot, k * 8)) {
++                            crate::descriptor::host::half_view(&view)
++                        } else {
++                            None
++                        };
++                        match twin {
++                            Some(twin) => {
++                                HALF_VIEWS_SHOWN.fetch_add(1, Ordering::Relaxed);
++                                host.make_at(index, &twin);
++                            }
++                            None => host.make_at(index, &view),
++                        }
+                         let kind = used.map(|u| u.kind).or_else(|| {
+                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
+                         });
+                         if let Some(kind) = kind {
+-                            readable(list, kind, &view);
++                            readable(list, kind, &view, table + u64::from(k) * 32);
+                         }
+                         // The title's slot is a table's: out of the queue
+                         // of textures picked by index if the draw read it
+@@ -3186,19 +5078,136 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
+     }
+ }
+ 
+-fn readable(list: &HostList, kind: ResourceType, view: &View) {
++thread_local! {
++    /// (fxceless 5d659e0) While a draw's stages make their tables ([`table_stages`]): what
++    /// the stages read of each table ([`stage_spans`]), and the tables its earlier stages
++    /// made afresh (address, slots).
++    static STAGE_SPANS: std::cell::RefCell<(Vec<(u8, u32, u32)>, Vec<(u64, u32)>)> =
++        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
++}
++
++/// (fxceless 5d659e0) Whether the stages of one draw share a table they both need made
++/// afresh (`VICTORY_TABLE_STAGES=1`; off by default as its author's: each stage makes its
++/// own). A mesh stage and a pixel stage that read one root table to different depths made
++/// it twice in dynamic slots of their own (the count is in the key of `fresh_tables`); with
++/// this both ask for the larger count and the second finds the first one's table: fewer
++/// slots of the dynamic ring, fewer tables refused for a full ring (fxceless run 300:
++/// 1.79 -> 0.48 % refused; frame time +7.4 ms there, so off by default).
++fn table_stages() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_STAGES").is_some_and(|v| v == "1"))
++}
++
++/// For [`table_stages`]: per root table the stages of `p` read, the slots it has up to the
++/// last entry read by a stage that also reads a constant view in it (0: no stage does), and
++/// up to the last entry any stage reads: (root parameter, with constants, all).
++fn stage_spans(p: &HostPipeline) -> Vec<(u8, u32, u32)> {
++    let mut spans: Vec<(u8, u32, u32)> = Vec::new();
++    for stage in &p.stages {
++        let t = stage.translated();
++        let mut constant = [false; 256];
++        for u in t.used.iter().filter(|u| u.root == RootType::Table && u.kind == ResourceType::Cbv) {
++            constant[usize::from(u.slot)] = true;
++        }
++        for u in t.used.iter().filter(|u| u.root == RootType::Table) {
++            let n = u.table_offset_dwords / 8 + 1;
++            let with = if constant[usize::from(u.slot)] { n } else { 0 };
++            match spans.iter_mut().find(|s| s.0 == u.slot) {
++                Some(s) => {
++                    s.1 = s.1.max(with);
++                    s.2 = s.2.max(n);
++                }
++                None => spans.push((u.slot, with, n)),
++            }
++        }
++    }
++    spans
++}
++
++thread_local! {
++    /// (fxceless #927) While a stage's tables are made: the table places it moves 16-bit
++    /// halves through (`HostShader::half_views`).
++    static HALF_PLACES: std::cell::RefCell<Vec<(u8, u32)>> = const { std::cell::RefCell::new(Vec::new()) };
++}
++
++/// (fxceless #927) Since the start: host slots of tables made with the unsigned twin of a
++/// 16-bit float or signed buffer view (`descriptor::host::half_view`).
++pub(crate) static HALF_VIEWS_SHOWN: AtomicU64 = AtomicU64::new(0);
++
++/// (fxceless #927) Logs, once per shader (at most 256), that a stage moves 16-bit halves as
++/// unsigned integers through table places: the face programs (`compute_graph_ops`,
++/// `ped_standard_head_cs`, `ped_skinning_cs`) should show here.
++fn note_half_views(pipeline: &str, shader: &str, places: &[(u8, u32)]) {
++    static SEEN: std::sync::Mutex<Option<std::collections::HashSet<String>>> = std::sync::Mutex::new(None);
++    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
++    let seen = seen.get_or_insert_with(Default::default);
++    if seen.len() >= 256 || !seen.insert(shader.to_owned()) {
++        return;
++    }
++    tracing::info!(
++        pipeline,
++        shader,
++        places = ?places,
++        "a shader moves 16-bit halves as unsigned integers through these table places (root parameter, dword): \
++         16-bit float views there are shown as their unsigned twin (VICTORY_HALF_VIEWS=0: off, needs a re-warmed shader cache)"
++    );
++}
++
++/// (Neptune) Whether a table made afresh is remembered as ready within its host list
++/// (`VICTORY_READY_TABLES=0`: its views are made ready again for every draw, as before).
++fn ready_tables_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_READY_TABLES").is_none_or(|v| v != "0"))
++}
++
++/// (Neptune) Whether a list's tables made afresh are told apart by their contents alone
++/// (`VICTORY_TABLES_BY_CONTENT=0`: by their address too, as before).
++fn tables_by_content() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLES_BY_CONTENT").is_none_or(|v| v != "0"))
++}
++
++/// (Neptune) Since they were last taken: tables made afresh that a draw found ready,
++/// found made but made ready again, made, the slots made for them, at a new address
++/// that took another's slots; and why the second kind were not ready (no note,
++/// another host list, a change in the list, the tested depth target).
++pub(crate) static TABLES: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
++
++/// `record`: the title descriptor the view is in (0: not known), for the
++/// diagnostics of views refused or given their own bytes.
++fn readable(list: &HostList, kind: ResourceType, view: &View, record: u64) {
+     const UNORDERED_ACCESS: u32 = 0x8;
+     let placed = crate::descriptor::host::placed_texture(view);
++    // (F11) The texture views draws bind, meter only.
++    #[cfg(feature = "diagnostics")]
++    if kind == ResourceType::Srv {
++        crate::texdetail::bound(view, placed.as_ref(), record);
++    }
+     let view = placed.as_ref().unwrap_or(view);
++    if kind == ResourceType::Uav
++        && crate::readback::terrain::on()
++        && let Some((address, len)) = crate::descriptor::host::buffer_range(view)
++    {
++        let copy = crate::descriptor::host::buffer_copy(view).is_some();
++        crate::readback::terrain::uav(address, len, copy, STORES.get() || !write_skip());
++    }
+     // Buffer views read title memory: their range is copied at submission;
+     // what shaders write through unordered access goes back to it after.
+     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
++        if let Some(own) = crate::shadow::flagged(address, len) {
++            crate::shadow::flagged_use(STAGE_HASH.get(), record, kind == ResourceType::Uav, own, address, len, false);
++        }
+         shadow.refresh(list, address, len);
+         if kind == ResourceType::Uav {
+             // A shader that cannot store to buffers leaves the range as
+             // the title has it: nothing to find afterwards.
+             if STORES.get() || !write_skip() {
+-                shadow.gpu_writes(list, address, len);
++                let ctx = crate::declstat::Ctx {
++                    way: crate::declstat::TABLE_UAV,
++                    hash: 0,
++                    view: crate::descriptor::host::view_fields(view),
++                };
++                crate::declstat::with(ctx, || shadow.gpu_writes(list, address, len));
+             } else {
+                 #[cfg(feature = "diagnostics")]
+                 {
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 3c7b340..034442f 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -7738,8 +10789,24 @@ impl Meter {
+         if self.logged.elapsed() >= std::time::Duration::from_secs(5) {
+             self.logged = std::time::Instant::now();
+             tracing::info!(
+-                "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made)",
+-                crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed)
++                "placed texture views: {} writes of another view of the texture a slot showed (it kept the old view until the new was made); \
++                 {} writes of a view of another texture (it kept showing the old texture until then, VICTORY_KEEP_OTHER_VIEWS=0: null at once)",
++                crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed),
++                crate::descriptor::host::KEPT_OTHER_VIEWS.load(Ordering::Relaxed)
++            );
++            crate::descriptor::host::stale_kept_line();
++            crate::draw::catch_up_line();
++            tracing::info!(
++                "since the start: {} copies of a card-written texture into its aliased view after the list had uploaded that view \
++                 from title memory (fxceless 19a45d1; skipped before); {} pipelines made again for the render target formats bound \
++                 at their draw (VICTORY_TARGET_VARIANTS=0: off)",
++                crate::texture::ALIAS_AFTER_UPLOAD.load(Ordering::Relaxed),
++                crate::pipeline::variants_made()
++            );
++            tracing::info!(
++                "since the start: {} table slots made with the unsigned twin of a 16-bit float buffer view, for shaders that move halves \
++                 as integers (the face programs; VICTORY_HALF_VIEWS=0: off)",
++                crate::draw::HALF_VIEWS_SHOWN.load(Ordering::Relaxed)
+             );
+             tracing::info!(
+                 "copies left out since the start because both sides were one host texture: {}",

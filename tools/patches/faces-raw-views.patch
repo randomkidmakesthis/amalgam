@@ -1,0 +1,760 @@
+diff --git a/crates/victory-gpu/src/descriptor/host.rs b/crates/victory-gpu/src/descriptor/host.rs
+index 0bb6e28..6d97367 100644
+--- a/crates/victory-gpu/src/descriptor/host.rs
++++ b/crates/victory-gpu/src/descriptor/host.rs
+@@ -2263,9 +2263,9 @@ pub(crate) fn buffer_copy(view: &View) -> Option<(std::sync::Arc<crate::shadow::
+     // of the copy they find, so that the copy brought up to date is the
+     // one the slot shows.
+     if let Some((base, width)) = buffer_extent(view)
+-        && let Some((first, count, element, stride, unknown)) = buffer_fields(view)
++        && let Some((first, count, element, stride, unknown, raw, unordered)) = buffer_fields(view)
+         && let Some(whole) = crate::shadow::find(base, width)
+-        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown)
++        && let Some((start, bytes)) = own_bytes(whole.offset(base), base, first, count, element, stride, unknown, raw, unordered)
+         && let Some(own) = crate::shadow::exact(start, bytes)
+     {
+         return Some((own, start, bytes));
+@@ -2351,9 +2351,44 @@ fn own_copy_on() -> bool {
+ /// The host counts a view's first element from its buffer's start, so such
+ /// a view has no host view there; it is made on a copy of its own bytes
+ /// (`crate::shadow::exact`), where it starts at element 0. `None`: the
+-/// view is made on its buffer's copy, as every other.
+-fn own_bytes(offset: u64, base: u64, first: u64, count: u32, element: u64, stride: u32, unknown: bool) -> Option<(u64, u64)> {
+-    own_bytes_if(own_copy_on(), offset, base, first, count, element, stride, unknown)
++/// view is made on its buffer's copy, as every other. A raw view (`raw`)
++/// on its copy's dwords but not on 16 bytes of it gets its own bytes too
++/// ([`raw_own_bytes_if`]; an unordered access view if `unordered`).
++#[allow(clippy::too_many_arguments)]
++fn own_bytes(
++    offset: u64,
++    base: u64,
++    first: u64,
++    count: u32,
++    element: u64,
++    stride: u32,
++    unknown: bool,
++    raw: bool,
++    unordered: bool,
++) -> Option<(u64, u64)> {
++    own_bytes_if(own_copy_on(), offset, base, first, count, element, stride, unknown).or_else(|| {
++        let on = own_copy_on()
++            && crate::shadow::own_copy_raw_on()
++            && (!unordered || crate::shadow::own_copy_raw_uav_on());
++        raw_own_bytes_if(on && raw, offset, base, first, count)
++    })
++}
++
++/// Of a raw view of `count` dwords from dword `first` of the buffer at
++/// `base`, which lies `offset` bytes into its host copy: its own bytes
++/// (start, bytes), as [`own_bytes_if`] gives them, when they do not start
++/// on 16 bytes of that copy. The host takes a raw view only from a
++/// multiple of `D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT` (16) bytes into its
++/// buffer ([`buffer_view_ok`]: its first dword a multiple of 4), the
++/// console from any dword. Such a view is on whole elements (dwords) of
++/// the copy, so `own_bytes_if` left it there, where it was refused and
++/// read zeros ("first=2 count=16 raw=true", every run).
++fn raw_own_bytes_if(on: bool, offset: u64, base: u64, first: u64, count: u32) -> Option<(u64, u64)> {
++    let at = first.checked_mul(4)?;
++    if !on || count == 0 || offset.checked_add(at)?.is_multiple_of(u64::from(D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT)) {
++        return None;
++    }
++    Some((base.checked_add(at)?, u64::from(count) * 4))
+ }
+ 
+ #[allow(clippy::too_many_arguments)]
+@@ -2378,9 +2413,11 @@ fn own_bytes_if(
+ }
+ 
+ /// Of a buffer view: its first element, its elements, the bytes of one (a
+-/// raw view's: 4), its structure's stride, and whether it has no format.
++/// raw view's: 4), its structure's stride, whether it has no format,
++/// whether it is a raw view, and whether it is an unordered access view.
+ /// As [`buffer_srv`] and [`buffer_uav`] read them from the same words.
+-fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool)> {
++#[allow(clippy::type_complexity)]
++fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool, bool, bool)> {
+     const BUFFER: u32 = 1;
+     let (words, unordered): (&[u32; 10], bool) = match view {
+         View::Shader(_, Some(d)) if d[1] == BUFFER => (d, false),
+@@ -2399,15 +2436,23 @@ fn buffer_fields(view: &View) -> Option<(u64, u32, u64, u32, bool)> {
+         } else {
+             crate::resource::element(d.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+         };
+-        Some((b.FirstElement, b.NumElements, element, b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN))
++        let raw = raw_view(d.Format, b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0);
++        Some((b.FirstElement, b.NumElements, element, b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN, raw, true))
+     } else {
+         let d = srv_desc(words);
+         // SAFETY: a buffer view's union member.
+         let b = unsafe { d.Anonymous.Buffer };
+-        Some((b.FirstElement, b.NumElements, element_size(&d), b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN))
++        let raw = raw_view(d.Format, b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0);
++        Some((b.FirstElement, b.NumElements, element_size(&d), b.StructureByteStride, d.Format == DXGI_FORMAT_UNKNOWN, raw, false))
+     }
+ }
+ 
++/// Whether a buffer view with this format, stride and raw flag is a raw
++/// view the host takes as one (R32 typeless, no stride: [`buffer_view_ok`]).
++fn raw_view(format: DXGI_FORMAT, stride: u32, flag: bool) -> bool {
++    flag && stride == 0 && format == DXGI_FORMAT_R32_TYPELESS
++}
++
+ /// A structured buffer view (`first`, `count` elements of `stride` bytes,
+ /// `offset` bytes into its host copy) as a raw view of the same bytes:
+ /// its first dword and its dwords. Translated shaders read untyped buffers
+@@ -2476,18 +2521,25 @@ fn buffer_srv(
+     let offset = shadow.offset(address);
+     // Off the elements of that copy: on a copy of its own bytes, from its
+     // element 0 (`own_bytes`).
+-    let (shadow, offset) = {
++    // `range`: the title bytes the view reads, for the diagnostics.
++    let (shadow, offset, range) = {
+         // SAFETY: a buffer view's union member.
+         let b = unsafe { desc.Anonymous.Buffer };
+         let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
+-        match own_bytes(offset, address, b.FirstElement, b.NumElements, element_size(&desc), b.StructureByteStride, unknown)
++        let raw = raw_view(desc.Format, b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_SRV_FLAG_RAW.0 != 0);
++        let element = element_size(&desc);
++        let range = (address.wrapping_add(b.FirstElement.wrapping_mul(element)), u64::from(b.NumElements) * element);
++        match own_bytes(offset, address, b.FirstElement, b.NumElements, element, b.StructureByteStride, unknown, raw, false)
+             .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
+         {
+             Some(own) => {
++                if raw {
++                    crate::shadow::raw_own_served(&own, false, range.0, range.1);
++                }
+                 desc.Anonymous.Buffer.FirstElement = 0;
+-                (own, 0)
++                (own, 0, range)
+             }
+-            None => (shadow, offset),
++            None => (shadow, offset, range),
+         }
+     };
+     // A structured view as a raw view of the same bytes (see `raw_window`).
+@@ -2525,6 +2577,7 @@ fn buffer_srv(
+     let width = unsafe { shadow.buffer.GetDesc() }.Width;
+     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        crate::shadow::flag_view(range.0, range.1, false);
+         once!(
+             format = desc.Format.0,
+             first,
+@@ -2563,7 +2616,8 @@ fn buffer_uav(
+     let shadow = crate::shadow::find(address, len)?;
+     // Off the elements of that copy: on a copy of its own bytes, from its
+     // element 0 (`own_bytes`).
+-    let (shadow, own) = {
++    // `range`: the title bytes the view reads, for the diagnostics.
++    let (shadow, own, range) = {
+         // SAFETY: a buffer view's union member.
+         let b = unsafe { desc.Anonymous.Buffer };
+         let element = if b.StructureByteStride > 0 {
+@@ -2574,14 +2628,19 @@ fn buffer_uav(
+             crate::resource::element(desc.Format.0 as u32).map_or(0, |(bytes, _)| bytes)
+         };
+         let unknown = desc.Format == DXGI_FORMAT_UNKNOWN;
+-        match own_bytes(shadow.offset(address), address, b.FirstElement, b.NumElements, element, b.StructureByteStride, unknown)
++        let raw = raw_view(desc.Format, b.StructureByteStride, b.Flags.0 & D3D12_BUFFER_UAV_FLAG_RAW.0 != 0);
++        let range = (address.wrapping_add(b.FirstElement.wrapping_mul(element)), u64::from(b.NumElements) * element);
++        match own_bytes(shadow.offset(address), address, b.FirstElement, b.NumElements, element, b.StructureByteStride, unknown, raw, true)
+             .and_then(|(start, bytes)| crate::shadow::exact(start, bytes))
+         {
+             Some(own) => {
++                if raw {
++                    crate::shadow::raw_own_served(&own, true, range.0, range.1);
++                }
+                 desc.Anonymous.Buffer.FirstElement = 0;
+-                (own, true)
++                (own, true, range)
+             }
+-            None => (shadow, false),
++            None => (shadow, false, range),
+         }
+     };
+     // SAFETY: a live buffer.
+@@ -2628,6 +2687,7 @@ fn buffer_uav(
+     let width = unsafe { shadow.buffer.GetDesc() }.Width;
+     if !buffer_view_ok(desc.Format, first, count, stride, raw, width) {
+         REFUSED_VIEWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        crate::shadow::flag_view(range.0, range.1, false);
+         once!(
+             format = desc.Format.0,
+             first,
+@@ -3850,6 +3910,78 @@ mod own_copy_tests {
+         assert_eq!(own_bytes_if(true, 8, base, 2, 4, 0, 0, false), None);
+         assert_eq!(own_bytes_if(false, 8, base, 2, 4, 32, 32, true), None);
+     }
++
++    /// A raw view on its copy's dwords but not on 16 bytes of it (the
++    /// runs' "format=39 first=2 count=16 raw=true width=4194304", and
++    /// count=32) gets its own bytes from its first dword; one on 16 bytes
++    /// stays on its buffer's copy, and with the switch off it is left to be
++    /// refused, as before.
++    #[test]
++    fn a_raw_view_off_sixteen_bytes_gets_its_own_bytes() {
++        use super::{DXGI_FORMAT_R32_TYPELESS, buffer_view_ok, raw_own_bytes_if};
++        let base = 0xd_9000_0000u64;
++        const WIDTH: u64 = 4 << 20;
++        // As before: on dwords, so not "off its copy's elements".
++        assert_eq!(own_bytes_if(true, 0, base, 2, 16, 4, 0, false), None);
++        // Refused on the buffer's copy, as the runs logged it.
++        assert!(!buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 2, 16, 0, true, WIDTH));
++        for count in [16u32, 32] {
++            let own = raw_own_bytes_if(true, 0, base, 2, count);
++            assert_eq!(own, Some((base + 8, u64::from(count) * 4)));
++            // On its own copy it starts at dword 0, which the host takes
++            // (the copy is the view's bytes rounded up to 256).
++            let (_, bytes) = own.unwrap_or_default();
++            assert!(buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 0, count, 0, true, bytes.next_multiple_of(256)));
++            // The switch off: nothing, and the view is refused as before.
++            assert_eq!(raw_own_bytes_if(false, 0, base, 2, count), None);
++        }
++        // On 16 bytes of the copy: the buffer's copy, as before.
++        assert_eq!(raw_own_bytes_if(true, 0, base, 4, 16), None);
++        assert!(buffer_view_ok(DXGI_FORMAT_R32_TYPELESS, 4, 16, 0, true, WIDTH));
++        // The buffer itself 8 bytes into its copy: dword 2 is then on 16.
++        assert_eq!(raw_own_bytes_if(true, 8, base, 2, 16), None);
++        // ... and dword 4 is not.
++        assert_eq!(raw_own_bytes_if(true, 8, base, 4, 16), Some((base + 16, 64)));
++        // No dwords: nothing to view.
++        assert_eq!(raw_own_bytes_if(true, 0, base, 2, 0), None);
++    }
++
++    /// For a raw view of memory at dword 2 (an unordered access view and a
++    /// shader view): the fields `buffer_copy` asks `own_bytes` with say raw,
++    /// and the own bytes are exactly the bytes the view reads. That is the
++    /// range the draw brings up to date and, for unordered access, declares
++    /// written (`draw.rs` `readable`): what a shader writes through the
++    /// view's own copy goes back to the view's bytes and no others.
++    #[test]
++    fn a_raw_views_own_bytes_are_the_bytes_it_reads() {
++        use super::{View, buffer_fields, buffer_range, raw_own_bytes_if};
++        let base = 0xd_9000_0000u64;
++        let mut resource = [0u32; 14];
++        resource[0] = 1;
++        resource[4] = 4 << 20;
++        let (lo, hi) = (base as u32, (base >> 32) as u32);
++        // Format, buffer, first element (2 words), elements, stride, counter (2), flags: raw.
++        let uav = [39, 1, 2, 0, 16, 0, 0, 0, 1, 0, lo, hi, 0, 0, 0, 0];
++        // Format, buffer, mapping, -, first element (2 words), elements, stride, flags: raw.
++        let srv = [39, 1, 0x1688, 0, 2, 0, 16, 0, 1, 0, lo, hi, 0, 0, 0, 0];
++        for (unordered, words) in [(true, uav), (false, srv)] {
++            let view = View::Placed(unordered, resource, words);
++            assert_eq!(buffer_fields(&view), Some((2, 16, 4, 0, false, true, unordered)));
++            assert_eq!(raw_own_bytes_if(true, 0, base, 2, 16), buffer_range(&view));
++        }
++    }
++
++    /// Only an R32 typeless view with the raw flag and no stride counts as
++    /// raw: a typed view of 4-byte elements has no 16-byte rule, and a
++    /// structured one is made raw only where `raw_window` can.
++    #[test]
++    fn only_typeless_flagged_views_are_raw() {
++        use super::{DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R32_TYPELESS, DXGI_FORMAT_UNKNOWN, raw_view};
++        assert!(raw_view(DXGI_FORMAT_R32_TYPELESS, 0, true));
++        assert!(!raw_view(DXGI_FORMAT_R32_TYPELESS, 0, false));
++        assert!(!raw_view(DXGI_FORMAT_R32_FLOAT, 0, true));
++        assert!(!raw_view(DXGI_FORMAT_UNKNOWN, 16, true));
++    }
+ }
+ 
+ /// Largest constant buffer view D3D12 takes (4096 16-byte elements). A
+diff --git a/crates/victory-gpu/src/draw.rs b/crates/victory-gpu/src/draw.rs
+index 91fc888..5c4e6cc 100644
+--- a/crates/victory-gpu/src/draw.rs
++++ b/crates/victory-gpu/src/draw.rs
+@@ -66,6 +66,11 @@ thread_local! {
+     /// While a stage's tables are walked (`State::tables`): whether that
+     /// stage's shader can store to buffers (`Translated::stores`).
+     static STORES: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
++    /// While a stage's tables are walked (`State::bind`): its container's
++    /// hash as the "first bind" lines give it, as a number, once some
++    /// buffer view has been refused or given its own bytes as a raw view
++    /// (`crate::shadow::flag_view`); 0 otherwise.
++    static STAGE_HASH: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+     /// While `State::early_textures` runs the texture pass: the
+     /// milliseconds and the bytes that run may take, in place of the
+     /// pass's own per frame.
+@@ -986,6 +991,7 @@ impl State {
+             0
+         };
+         TESTED_DEPTH.set((tested, false));
++        STAGE_HASH.set(0);
+         let root = p.root.as_raw() as usize;
+         if self.host_roots[usize::from(compute)] != root {
+             // SAFETY: an open list and a live root signature.
+@@ -1012,6 +1018,9 @@ impl State {
+         for stage in &p.stages {
+             let t = stage.translated();
+             STORES.set(t.stores);
++            if crate::shadow::any_flagged() {
++                STAGE_HASH.set(u64::from_str_radix(&stage.shader.hash, 16).unwrap_or(0));
++            }
+             let made = self.tables(list, &t.used, &t.host.root_indexed_views, compute);
+             STORES.set(true);
+             if made.iter().any(|m| m.1 == u32::MAX) {
+@@ -1394,6 +1403,9 @@ impl State {
+         if !list.first_use(ONCE) {
+             return Some(gpu);
+         }
++        // Raw unordered access views given their own bytes: written back
++        // after every list that may write them (`crate::shadow::raw_own_writes`).
++        crate::shadow::raw_own_writes(list);
+         // The list may outlive the title's heap object, which owns the table.
+         if let Some(buffer) = host.strides_buffer() {
+             list.keep(buffer);
+@@ -1464,6 +1476,10 @@ impl State {
+             let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(&view) else {
+                 continue;
+             };
++            if let Some(own) = crate::shadow::flagged(address, len) {
++                let unordered = matches!(view, View::Unordered(..) | View::Placed(true, ..));
++                crate::shadow::flagged_use(STAGE_HASH.get(), handle, unordered, own, address, len, true);
++            }
+             #[cfg(feature = "diagnostics")]
+             if host.shows(index, &shadow.buffer) == Some(false) {
+                 HEAP_VIEWS_ELSEWHERE.fetch_add(1, Ordering::Relaxed);
+@@ -1944,7 +1960,7 @@ impl State {
+             // submission that samples it.
+             let tabled = crate::texture::is_staged(resource);
+             if let Some(view) = &view {
+-                readable(list, sampled.kind, view);
++                readable(list, sampled.kind, view, 0);
+             }
+             // A texture view the host refuses removes the device: name it.
+             static GONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+@@ -2466,7 +2482,7 @@ impl State {
+             return;
+         };
+         if let Some(view) = host.mirror(index, handle, true) {
+-            readable(list, u.kind, &view);
++            readable(list, u.kind, &view, handle);
+             // Up to date by this draw: not the texture pass's to make.
+             if crate::descriptor::host::is_texture_view(&view) {
+                 host.texture_slot_tabled(index, true);
+@@ -2591,7 +2607,7 @@ impl State {
+                 for u in entries.iter().filter(|u| u.kind != ResourceType::Cbv) {
+                     let handle = table + u64::from(u.table_offset_dwords) * 4;
+                     if let Some(view) = crate::descriptor::view(handle) {
+-                        readable(list, u.kind, &view);
++                        readable(list, u.kind, &view, handle);
+                     }
+                 }
+                 for k in selected {
+@@ -2602,7 +2618,7 @@ impl State {
+                     if let Some(view) = crate::descriptor::view(handle)
+                         && let Some(kind) = view_kind(&view)
+                     {
+-                        readable(list, kind, &view);
++                        readable(list, kind, &view, handle);
+                     }
+                 }
+                 made.push((slot, first * 32));
+@@ -2640,7 +2656,7 @@ impl State {
+                             selected.binary_search(&k).ok().and_then(|_| view_kind(&view))
+                         });
+                         if let Some(kind) = kind {
+-                            readable(list, kind, &view);
++                            readable(list, kind, &view, table + u64::from(k) * 32);
+                         }
+                         // The title's slot is a table's: out of the queue
+                         // of textures picked by index if the draw read it
+@@ -3186,13 +3202,18 @@ fn depth_state(texture: &ID3D12Resource, desc: Option<&D3D12_DEPTH_STENCIL_VIEW_
+     }
+ }
+ 
+-fn readable(list: &HostList, kind: ResourceType, view: &View) {
++/// `record`: the title descriptor the view is in (0: not known), for the
++/// diagnostics of views refused or given their own bytes.
++fn readable(list: &HostList, kind: ResourceType, view: &View, record: u64) {
+     const UNORDERED_ACCESS: u32 = 0x8;
+     let placed = crate::descriptor::host::placed_texture(view);
+     let view = placed.as_ref().unwrap_or(view);
+     // Buffer views read title memory: their range is copied at submission;
+     // what shaders write through unordered access goes back to it after.
+     if let Some((shadow, address, len)) = crate::descriptor::host::buffer_copy(view) {
++        if let Some(own) = crate::shadow::flagged(address, len) {
++            crate::shadow::flagged_use(STAGE_HASH.get(), record, kind == ResourceType::Uav, own, address, len, false);
++        }
+         shadow.refresh(list, address, len);
+         if kind == ResourceType::Uav {
+             // A shader that cannot store to buffers leaves the range as
+diff --git a/crates/victory-gpu/src/host.rs b/crates/victory-gpu/src/host.rs
+index 3c7b340..5727879 100644
+--- a/crates/victory-gpu/src/host.rs
++++ b/crates/victory-gpu/src/host.rs
+@@ -1320,6 +1320,11 @@ pub(crate) fn dred_on() -> bool {
+ /// budget buffers, a run late).
+ static MESH_GROUPS: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+ 
++/// Indirect compute records since the last frame line (from the same
++/// words, a run late): cut to 65,535 groups in a dimension, and left empty
++/// for asking more than 2^20 groups in all (`crate::indirect`).
++static COMPUTE_CUT: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
++
+ /// Whether a list's indirect-work budget lives in the card's own memory
+ /// (`VICTORY_INDIRECT_CARD_BUDGET=0` keeps it in memory the CPU maps, as
+ /// before). The clamp charges it with atomics, at least two in a row for
+@@ -6669,14 +6674,17 @@ impl HostList {
+             // SAFETY: the list's own mapped words, written before it runs.
+             // The words after the budget hold what the clamp noted about the
+             // list's last run (mesh dispatches: the largest group count
+-            // asked for, the groups asked in all; with the card's copy, as
++            // asked for, the groups asked in all; compute records: those
++            // cut in a dimension, those left empty; with the card's copy, as
+             // the list's end copied them here): taken, then zeroed.
+             deferred.copies.push(Step::Host(Box::new(move || unsafe {
+                 let words = at as *mut u32;
+                 let (largest, all) = (words.add(1).read_volatile(), words.add(2).read_volatile());
+                 MESH_GROUPS[0].fetch_max(u64::from(largest), Ordering::Relaxed);
+                 MESH_GROUPS[1].fetch_add(u64::from(all), Ordering::Relaxed);
+-                for k in 0..3 {
++                COMPUTE_CUT[0].fetch_add(u64::from(words.add(3).read_volatile()), Ordering::Relaxed);
++                COMPUTE_CUT[1].fetch_add(u64::from(words.add(4).read_volatile()), Ordering::Relaxed);
++                for k in 0..5 {
+                     words.add(k).write_volatile(0);
+                 }
+             })));
+@@ -6710,7 +6718,7 @@ impl HostList {
+         };
+         // SAFETY: a live buffer.
+         let at = unsafe { card.GetGPUVirtualAddress() };
+-        let zeros = [0u64, 4, 8].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
++        let zeros = [0u64, 4, 8, 12, 16].map(|offset| D3D12_WRITEBUFFERIMMEDIATE_PARAMETER {
+             Dest: at + offset,
+             Value: 0,
+         });
+@@ -6751,7 +6759,7 @@ impl HostList {
+                 D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                 D3D12_RESOURCE_STATE_COPY_SOURCE,
+             )]);
+-            self.list.CopyBufferRegion(mapped, 4, card, 4, 8);
++            self.list.CopyBufferRegion(mapped, 4, card, 4, 16);
+             self.list.ResourceBarrier(&[transition(
+                 card,
+                 D3D12_RESOURCE_STATE_COPY_SOURCE,
+@@ -7648,13 +7656,15 @@ impl Meter {
+         let indirect = crate::list::take_indirect() as f64 / frames;
+         let mesh_largest = MESH_GROUPS[0].swap(0, Ordering::Relaxed);
+         let mesh_groups = MESH_GROUPS[1].swap(0, Ordering::Relaxed) as f64 / frames;
++        let [compute_cut, compute_emptied] = [0, 1].map(|i| COMPUTE_CUT[i].swap(0, Ordering::Relaxed) as f64 / frames);
+         tracing::info!(
+-            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame"
++            "indirect mesh dispatches: the largest group count asked for {mesh_largest} (run: at most 65535), {mesh_groups:.0} groups asked per frame; \
++             indirect compute records cut to 65,535 groups in a dimension {compute_cut:.1} per frame, left empty for asking more than 2^20 groups {compute_emptied:.1} per frame"
+         );
+         // (Run 200 counted indirect compute records asking for 77,000 to
+         // 98,000 groups in x, 0.2 to 0.8 a frame, cut to the 65,535 one
+         // dispatch runs; the counter went when the clamp's budget moved to
+-        // the card's memory.)
++        // the card's memory, and is back in the budget's words at 12 and 16.)
+         {
+             let [texture_us, slots] = [0, 1].map(|i| crate::draw::HEAP_PASS_PARTS[i].swap(0, Ordering::Relaxed));
+             tracing::info!(
+diff --git a/crates/victory-gpu/src/indirect.rs b/crates/victory-gpu/src/indirect.rs
+index d3c1647..8d512e6 100644
+--- a/crates/victory-gpu/src/indirect.rs
++++ b/crates/victory-gpu/src/indirect.rs
+@@ -74,6 +74,11 @@ static const uint GROUPS = 1u << 20;
+ // which no barrier orders: see the note where the records charge.
+ groupshared uint largest_asked;
+ groupshared uint all_asked;
++// Compute records cut to 65,535 groups in a dimension, and records left
++// empty for asking more than GROUPS in all (in the budget buffer's words
++// at 12 and 16, below).
++groupshared uint compute_cut;
++groupshared uint compute_emptied;
+ [RootSignature(RS)]
+ [numthreads(64, 1, 1)]
+ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+@@ -94,9 +99,13 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+     uint asked = 0;
+     uint2 draw_counts = uint2(0, 0);
+     uint3 groups = uint3(0, 0, 0);
++    uint cut = 0;
++    uint emptied = 0;
+     if (gi == 0) {
+         largest_asked = 0;
+         all_asked = 0;
++        compute_cut = 0;
++        compute_emptied = 0;
+     }
+     if (active && kind <= 1) {
+         // Draws: vertex or index count, then instances.
+@@ -124,10 +133,13 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+         }
+         draw_counts = uint2(count, instances);
+     } else if (active && kind == 2) {
+-        uint3 g = min(src_args.Load3(src_at), uint3(65535u, 65535u, 65535u));
++        uint3 want = src_args.Load3(src_at);
++        uint3 g = min(want, uint3(65535u, 65535u, 65535u));
++        cut = any(want > g) ? 1u : 0u;
+         // x * y fits 32 bits; the whole count may not.
+         if (g.z != 0 && g.x * g.y > GROUPS / g.z) {
+             g = uint3(0, 0, 0);
++            emptied = 1;
+         }
+         cost = g.x * g.y * g.z * 64u;
+         groups = g;
+@@ -154,6 +166,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+         InterlockedMax(largest_asked, asked, was);
+         InterlockedAdd(all_asked, min(asked, 1u << 24), was);
+     }
++    if (active && kind == 2 && (cut | emptied) != 0) {
++        uint was;
++        InterlockedAdd(compute_cut, cut, was);
++        InterlockedAdd(compute_emptied, emptied, was);
++    }
+     // Every record charges the budget on its own, in lane order within the
+     // group. The caller runs one group per 64 records with a barrier between
+     // them, so the chunks also charge in lane order: without that, the
+@@ -183,6 +200,11 @@ void main(uint3 id : SV_DispatchThreadID, uint gi : SV_GroupIndex) {
+         budget.InterlockedMax(4, largest_asked, was);
+         budget.InterlockedAdd(8, all_asked, was);
+     }
++    if (gi == 0 && kind == 2 && (compute_cut | compute_emptied) != 0) {
++        uint was;
++        budget.InterlockedAdd(12, compute_cut, was);
++        budget.InterlockedAdd(16, compute_emptied, was);
++    }
+     if (!active) {
+         return;
+     }
+@@ -1343,6 +1365,15 @@ void main() {
+             expected_groups * 64,
+             "budget must reflect only active records below countBuffer"
+         );
++        // The frame line's counts (the budget's words at 12 and 16): record 2
++        // of call #1 was cut in x, none was left empty for its total, and
++        // the garbage tail past the count is not counted.
++        // SAFETY: GPU execution finished; the mapped budget words.
++        let (cut, emptied) = unsafe {
++            let words = budget_ptr as *const u32;
++            (words.add(3).read_volatile(), words.add(4).read_volatile())
++        };
++        assert_eq!((cut, emptied), (1, 0), "compute records cut, and left empty");
+         assert_eq!(
+             after_src, initial_src,
+             "src_args must never be mutated in-place"
+diff --git a/crates/victory-gpu/src/shadow.rs b/crates/victory-gpu/src/shadow.rs
+index b6a607f..6292c97 100644
+--- a/crates/victory-gpu/src/shadow.rs
++++ b/crates/victory-gpu/src/shadow.rs
+@@ -77,6 +77,11 @@ pub(crate) struct Shadow {
+     /// and the bytes from the buffer's first byte to `start` (the heap
+     /// begins on a 64 KiB line; a title buffer need not).
+     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
++    /// For a copy of a raw view's own bytes ([`raw_own_served`]): 1 if a
++    /// shader view was made on it, 2 if an unordered access view was (the
++    /// bits together if both); 0 for every other copy. What is copied back
++    /// from such a copy is counted for [`exact_line`].
++    raw_own: AtomicU8,
+ }
+ 
+ /// What a copy in the card's memory ([`cards`]) has beside the buffer
+@@ -2355,6 +2360,7 @@ impl Shadow {
+             card: None,
+             window: false,
+             place: None,
++            raw_own: AtomicU8::new(0),
+         }
+     }
+ 
+@@ -2581,9 +2587,19 @@ impl Shadow {
+             #[cfg(feature = "diagnostics")]
+             crate::copystat::add(crate::copystat::C::BackSyncUs, syncing.elapsed().as_micros() as u64);
+         }
++        self.raw_own_back(written);
+         written
+     }
+ 
++    /// `written` bytes went from this copy back into title memory: counted
++    /// for [`exact_line`] if it is a copy of a raw unordered access view's
++    /// own bytes.
++    fn raw_own_back(&self, written: usize) {
++        if written > 0 && self.raw_own.load(Ordering::Relaxed) & 2 != 0 {
++            RAW_OWN_STATS[2].fetch_add(written as u64, Ordering::Relaxed);
++        }
++    }
++
+     /// Offsets `[from, to)` of the copy are compared with the snapshot: for
+     /// the frame line's counts.
+     fn compared(&self, from: usize, to: usize) {
+@@ -2661,6 +2677,7 @@ impl Shadow {
+             return 0;
+         }
+         crate::host::shaders_write(start + at, &title[..]);
++        self.raw_own_back(n);
+         if self.put_back_own(start + at, &title[..]) {
+             return n;
+         }
+@@ -3895,18 +3912,165 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
+ /// Nothing while there are none.
+ pub(crate) fn exact_line(frames: f64) {
+     let [asked, made] = [0, 1].map(|i| EXACT_STATS[i].swap(0, Ordering::Relaxed));
+-    if asked == 0 {
++    let [srvs, uavs, back] = [0, 1, 2].map(|i| RAW_OWN_STATS[i].swap(0, Ordering::Relaxed));
++    if asked == 0 && back == 0 {
+         return;
+     }
+     let kept = EXACT.lock().unwrap_or_else(|e| e.into_inner()).1.len();
+     tracing::info!(
+         "buffer views off their copy's elements (they were refused and read zeros; VICTORY_VIEW_OWN_COPY=0 refuses them again): \
+-         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept",
++         {:.1} asked for per frame, {:.1} copies of their own bytes made per frame, {kept} kept; \
++         raw views not on 16 bytes served so (VICTORY_VIEW_OWN_COPY_RAW=0 refuses them again, VICTORY_VIEW_OWN_COPY_RAW_UAV=0 \
++         their unordered access views): {:.1} shader views and {:.1} unordered access views made per frame, \
++         {:.0} bytes their shaders wrote copied back per frame",
+         asked as f64 / frames,
+-        made as f64 / frames
++        made as f64 / frames,
++        srvs as f64 / frames,
++        uavs as f64 / frames,
++        back as f64 / frames
+     );
+ }
+ 
++/// Whether a raw buffer view whose bytes do not start on 16 bytes of its
++/// buffer's copy gets a copy of its own bytes, as views off their copy's
++/// elements do (`descriptor/host.rs` `own_bytes`). The host's raw views
++/// start on `D3D12_RAW_UAV_SRV_BYTE_ALIGNMENT` (16) bytes and the
++/// console's on any dword, so such a view was refused and read zeros
++/// ("buffer view the host would refuse left null format=39 first=2"). On
++/// by default; `VICTORY_VIEW_OWN_COPY_RAW=0` refuses them again.
++pub(crate) fn own_copy_raw_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_OWN_COPY_RAW").is_none_or(|v| v != "0"))
++}
++
++/// [`own_copy_raw_on`] for unordered access views too (on by default;
++/// `VICTORY_VIEW_OWN_COPY_RAW_UAV=0`: those are refused as before, while
++/// shader views keep their own bytes). What shaders write through one goes
++/// back into title memory after the submission, as from any copy whose
++/// range a list declares written (`Shadow::gpu_writes`): through a table
++/// at the draw (`draw.rs` `readable`), and, for views picked by index,
++/// declared in every list ([`raw_own_writes`]).
++/// shortcut: within one submission the buffer's own copy and the view's
++/// copy do not see each other's writes; each sees the other's from the
++/// next submission on, once they have gone through title memory.
++pub(crate) fn own_copy_raw_uav_on() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_VIEW_OWN_COPY_RAW_UAV").is_none_or(|v| v != "0"))
++}
++
++/// Since the last frame line: shader views and unordered access views
++/// made on copies of raw views' own bytes ([`raw_own_served`]), and the
++/// bytes copied back from such copies.
++static RAW_OWN_STATS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
++
++/// A raw view of title memory `[address, address + len)` (an unordered
++/// access view if `unordered`) was made on `own`, a copy of its own bytes
++/// ([`exact`]), because its bytes are not on 16 of its buffer's copy.
++pub(crate) fn raw_own_served(own: &Shadow, unordered: bool, address: u64, len: u64) {
++    own.raw_own.fetch_or(if unordered { 2 } else { 1 }, Ordering::Relaxed);
++    RAW_OWN_STATS[usize::from(unordered)].fetch_add(1, Ordering::Relaxed);
++    flag_view(address, len, true);
++}
++
++/// For a list that runs a program picking buffer views by index: every
++/// copy of a raw unordered access view's own bytes that a slot shows is
++/// brought up to date and declared written by the list, so that what the
++/// program writes through it goes back into title memory. Picked views
++/// are otherwise only read (`draw.rs` `heap_buffers`), and the writes would
++/// stay in this copy, which no other view reads. A list that does not
++/// write them compares a few hundred bytes for nothing.
++pub(crate) fn raw_own_writes(list: &HostList) {
++    if !own_copy_raw_uav_on() {
++        return;
++    }
++    let held: Vec<Arc<Shadow>> = EXACT
++        .lock()
++        .unwrap_or_else(|e| e.into_inner())
++        .1
++        .values()
++        .filter(|(shadow, _)| shadow.raw_own.load(Ordering::Relaxed) & 2 != 0)
++        .filter(|(shadow, _)| crate::host::references(&shadow.buffer) > 1)
++        .map(|(shadow, _)| shadow.clone())
++        .collect();
++    for shadow in held {
++        shadow.refresh(list, shadow.start, shadow.len);
++        shadow.gpu_writes(list, shadow.start, shadow.len);
++    }
++}
++
++/// Title ranges (address, bytes) of buffer views the host refused
++/// (`false`) or that were given their own bytes as raw views not on 16
++/// bytes (`true`), for [`flagged_use`]; at most [`FLAGGED_MOST`]. And a
++/// filter of 4,096 bits over the same keys, so that the draws that read
++/// other views do not take the lock.
++#[allow(clippy::type_complexity)]
++static FLAGGED: Mutex<Option<std::collections::HashMap<(u64, u64), bool>>> = Mutex::new(None);
++static FLAGGED_BITS: [AtomicU64; 64] = [const { AtomicU64::new(0) }; 64];
++const FLAGGED_MOST: usize = 4096;
++
++fn flagged_bit(address: u64, len: u64) -> (usize, u64) {
++    let h = (address ^ len.rotate_left(40)).wrapping_mul(0x9e37_79b9_7f4a_7c15) >> 52;
++    ((h >> 6) as usize, 1 << (h & 63))
++}
++
++/// Notes a buffer view of `[address, address + len)` as refused (`own`
++/// false) or given its own bytes as a raw view (`own` true).
++pub(crate) fn flag_view(address: u64, len: u64, own: bool) {
++    let mut map = FLAGGED.lock().unwrap_or_else(|e| e.into_inner());
++    let map = map.get_or_insert_with(Default::default);
++    if map.len() >= FLAGGED_MOST && !map.contains_key(&(address, len)) {
++        return;
++    }
++    map.insert((address, len), own);
++    let (word, bit) = flagged_bit(address, len);
++    FLAGGED_BITS[word].fetch_or(bit, Ordering::Relaxed);
++}
++
++/// Whether some buffer view has been noted by [`flag_view`].
++pub(crate) fn any_flagged() -> bool {
++    FLAGGED_BITS.iter().any(|w| w.load(Ordering::Relaxed) != 0)
++}
++
++/// What [`flag_view`] noted of a view of `[address, address + len)`.
++pub(crate) fn flagged(address: u64, len: u64) -> Option<bool> {
++    let (word, bit) = flagged_bit(address, len);
++    if FLAGGED_BITS[word].load(Ordering::Relaxed) & bit == 0 {
++        return None;
++    }
++    FLAGGED.lock().unwrap_or_else(|e| e.into_inner()).as_ref()?.get(&(address, len)).copied()
++}
++
++/// A program (`hash`: its container's, as the "first bind" lines give it;
++/// 0 if not known) is bound while the view in title descriptor `record`
++/// (picked by index if `picked`: then the program may not read it at all)
++/// of `[address, address + len)`, noted by [`flag_view`], is made ready for
++/// it. Logged once per program and descriptor, for the first 256 of them:
++/// a run's log then names, with the "first bind" lines, the programs that
++/// read zeros through a refused view or read and write a raw view's own
++/// bytes.
++#[allow(clippy::too_many_arguments)]
++pub(crate) fn flagged_use(hash: u64, record: u64, unordered: bool, own: bool, address: u64, len: u64, picked: bool) {
++    const MOST: usize = 256;
++    static SEEN: Mutex<Option<std::collections::HashSet<(u64, u64)>>> = Mutex::new(None);
++    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
++    let seen = seen.get_or_insert_with(Default::default);
++    if seen.len() > MOST || !seen.insert((hash, record)) {
++        return;
++    }
++    if seen.len() > MOST {
++        tracing::info!("buffer views refused or given their own bytes: {MOST} programs and slots named, no more");
++        return;
++    }
++    let hash = format_args!("{hash:016x}");
++    let record = format_args!("{record:#x}");
++    let address = format_args!("{address:#x}");
++    if own {
++        tracing::info!(%hash, %record, unordered, picked, %address, len, "a program uses a raw buffer view not on 16 bytes, given its own bytes");
++    } else {
++        tracing::warn!(%hash, %record, unordered, picked, %address, len, "a program uses a buffer view the host refused (it reads zeros)");
++    }
++}
++
+ #[cfg(test)]
+ mod window_tests {
+     use super::{WINDOW, cover, grid, holder, longest_tail, tail_of, window_of};

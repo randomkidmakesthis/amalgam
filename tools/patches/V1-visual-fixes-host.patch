@@ -1,0 +1,1039 @@
+diff -ruN '--exclude=target' V1base/crates/victory-gpu/src/descriptor/host.rs V1/crates/victory-gpu/src/descriptor/host.rs
+--- V1base/crates/victory-gpu/src/descriptor/host.rs	2026-11-26 07:30:26.000000000 +0200
++++ V1/crates/victory-gpu/src/descriptor/host.rs	2026-11-26 08:28:13.716505700 +0200
+@@ -94,6 +94,12 @@
+     /// (Neptune) Per block of [`TABLED_BLOCK`] title slots, the frame (plus one; 0: never) in
+     /// which a draw last made a table with a slot in it ([`HostHeap::left_to_draws`]).
+     tabled_blocks: Vec<std::sync::atomic::AtomicU32>,
++    /// (Neptune 25fbf69 + 61f2206) Per title slot: when its view was made stale while it
++    /// showed a texture (tenths of a second, plus one; 0: it was not, or it was made again,
++    /// or made null since), and those slots in the order they were, with that time and the
++    /// view's key ([`HostHeap::stale_kept`]).
++    stale_at: Vec<std::sync::atomic::AtomicU32>,
++    stale_line: Mutex<std::collections::VecDeque<(u32, u32, u64)>>,
+     /// The title memory each placed texture view of this heap describes,
+     /// by slot and by address ([`Spans`]): which slots a newer view of
+     /// other memory there makes stale, and which to look at again when the
+@@ -1116,6 +1122,10 @@
+             tabled_blocks: (0..if sampler { 0 } else { count / TABLED_BLOCK + 1 })
+                 .map(|_| std::sync::atomic::AtomicU32::new(0))
+                 .collect(),
++            stale_at: (0..if sampler { 0 } else { count })
++                .map(|_| std::sync::atomic::AtomicU32::new(0))
++                .collect(),
++            stale_line: Mutex::default(),
+             placed: {
+                 let spans = std::sync::Arc::<Mutex<Spans>>::default();
+                 if !sampler {
+@@ -1319,6 +1329,7 @@
+         now: u64,
+         max_age: u64,
+     ) -> (Vec<(u32, u64)>, [u64; 5], usize, [u64; 2]) {
++        self.stale_expire();
+         let mut textures = self.textures.lock().unwrap_or_else(|e| e.into_inner());
+         textures.stamp(frame, now);
+         let (due, ahead) = if max == 0 { (Vec::new(), 0) } else { textures.due_aged(frame, max, now, max_age) };
+@@ -1626,11 +1637,94 @@
+         {
+             return false;
+         }
+-        self.unmake(&making, index);
++        // (Neptune) The title unmaps and maps a texture's pages while it moves them: the
++        // slot goes on showing its host copy for a while ([`HostHeap::stale_kept`]).
++        if !self.stale_kept(&making, index) {
++            self.unmake(&making, index);
++        }
+         STALE[4].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+         true
+     }
+ 
++    /// (Neptune 25fbf69 `stale_kept`, avatarmanz d1c412c `VICTORY_KEEP_SHOWN`) Slot
++    /// `index`, whose placed texture view was made stale (a newer view of other memory
++    /// there, or its memory unmapped): if it shows a texture whose host copy it holds, it
++    /// goes on showing that, counted as not made, until a new view of the slot is made
++    /// (`keep` with a resource) or it is nulled: a zeroed record or one of a released
++    /// resource still nulls it at once ([`HostHeap::mirror_locked`]), and one that waits
++    /// past [`stale_expire_ms`] is nulled by [`HostHeap::stale_expire`]. True then. Made
++    /// null at once, the slot read black from the stale write to the upload of its new
++    /// texture (Neptune: 19,724 slots, up to 3 s). Under `making`.
++    fn stale_kept(&self, _making: &std::sync::MutexGuard<'_, ()>, index: u32) -> bool {
++        use std::sync::atomic::Ordering::Relaxed;
++        if stale_keep_ms() == 0 {
++            return false;
++        }
++        let (Some(at), Some(made)) = (self.stale_at.get(index as usize), self.made.get(index as usize)) else {
++            return false;
++        };
++        let key = made.load(Relaxed);
++        if key == 0 || !view_at(key as u32, (key >> 32) as u32).as_ref().is_some_and(shows_texture) || !self.holds(index) {
++            return false;
++        }
++        made.store(0, Relaxed);
++        if mirror_exact() {
++            self.forget_copied(index);
++        }
++        let tick = (crate::host::now_ms() / 100) as u32 + 1;
++        at.store(tick, Relaxed);
++        self.stale_line.lock().unwrap_or_else(|e| e.into_inner()).push_back((index, tick, key));
++        STALE_KEPT[0].fetch_add(1, Relaxed);
++        true
++    }
++
++    /// Whether slot `index` shows a texture past its stale view ([`HostHeap::stale_kept`]).
++    fn stale_marked(&self, index: u32) -> bool {
++        self.stale_at
++            .get(index as usize)
++            .is_some_and(|at| at.load(std::sync::atomic::Ordering::Relaxed) != 0)
++    }
++
++    /// (Neptune 61f2206) The slots kept past their view ([`HostHeap::stale_kept`]) that
++    /// waited [`stale_expire_ms`] and were not made again: null now, as they would have
++    /// been at once, and their host copies let go.
++    pub(crate) fn stale_expire(&self) {
++        use std::sync::atomic::Ordering::Relaxed;
++        if self.sampler {
++            return;
++        }
++        let now = (crate::host::now_ms() / 100) as u32 + 1;
++        let wait = (stale_expire_ms() / 100) as u32;
++        let due: Vec<(u32, u32, u64)> = {
++            let mut line = self.stale_line.lock().unwrap_or_else(|e| e.into_inner());
++            let n = line.iter().take_while(|&&(_, tick, _)| now.saturating_sub(tick) >= wait).count();
++            line.drain(..n).collect()
++        };
++        if due.is_empty() {
++            return;
++        }
++        let _making = self.making.lock().unwrap_or_else(|e| e.into_inner());
++        for (index, tick, key) in due {
++            let Some(at) = self.stale_at.get(index as usize) else {
++                continue;
++            };
++            // Marked again later, made again or made null since: not this entry's.
++            if at.load(Relaxed) != tick {
++                continue;
++            }
++            at.store(0, Relaxed);
++            if self.made.get(index as usize).is_some_and(|made| made.load(Relaxed) != 0) {
++                continue;
++            }
++            match view_at(key as u32, (key >> 32) as u32) {
++                Some(view) => null_for(&view, self.cpu(index)),
++                None => null_view(self.cpu(index)),
++            }
++            self.keep(index, None);
++            STALE_KEPT[1].fetch_add(1, Relaxed);
++        }
++    }
++
+     /// Makes host slot `index` null again, as it is before its view is
+     /// made: a null view of the kind it held. Under `making` (the guard
+     /// says so); the key is cleared before the view is made null, so a
+@@ -1806,6 +1900,9 @@
+                 TABLED_WRITES[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                 frame + TABLED_GRACE
+             } else {
++                if !seen {
++                    FRESH_WRITES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++                }
+                 0
+             };
+             textures.written(index, frame, due, seen);
+@@ -1971,6 +2068,14 @@
+     }
+ 
+     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
++        // (Neptune) Made again, or made null: no longer one kept past its view
++        // ([`HostHeap::stale_kept`]).
++        if let Some(at) = self.stale_at.get(index as usize)
++            && at.swap(0, std::sync::atomic::Ordering::Relaxed) != 0
++            && resource.is_some()
++        {
++            STALE_KEPT[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++        }
+         let old = {
+             let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
+             kept.get_mut(index as usize).and_then(|slot| std::mem::replace(slot, resource))
+@@ -2368,7 +2473,7 @@
+                 MIRRORED[0].fetch_add(1, Relaxed);
+                 return Some(view);
+             }
+-            None if made == 0 && !for_draw => {
++            None if made == 0 && !for_draw && !self.stale_marked(index) => {
+                 MIRRORED[0].fetch_add(1, Relaxed);
+                 return None;
+             }
+@@ -2410,7 +2515,8 @@
+         let Some(view) = view else {
+             // Not a view of ours (never written, or of a resource the
+             // title released): nothing to read.
+-            if made.load(Relaxed) != 0 {
++            // (A slot kept past its stale view is nulled too: `stale_kept`.)
++            if made.load(Relaxed) != 0 || self.stale_marked(index) {
+                 made.store(0, Relaxed);
+                 self.make_null(index);
+                 let _ = self.note_buffer(index, None, false);
+@@ -2426,7 +2532,7 @@
+             // are stale: their host slots read nothing from here on, and
+             // let go of the host copies they held.
+             for stale in self.note_buffer(index, Some(&view), for_draw) {
+-                if stale != index {
++                if stale != index && !self.stale_kept(making, stale) {
+                     self.unmake(making, stale);
+                 }
+             }
+@@ -2464,7 +2570,7 @@
+             let other = !same
+                 && keep_other_views()
+                 && shows_texture(&view)
+-                && shown.as_ref().is_some_and(shows_texture)
++                && (self.stale_marked(index) || shown.as_ref().is_some_and(shows_texture))
+                 && self.holds(index);
+             if later && keep_views() && (same || other) {
+                 if same { &KEPT_VIEWS } else { &KEPT_OTHER_VIEWS }.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+@@ -3597,6 +3703,45 @@
+ /// since the start: the slot kept showing the old view.
+ pub(crate) static KEPT_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+ 
++/// (Neptune 25fbf69, 61f2206) Since the last log line: slots that went on showing their
++/// texture when their view was made stale ([`HostHeap::stale_kept`]), those made null at
++/// the cap ([`stale_expire_ms`]), and those replaced by their new view.
++pub(crate) static STALE_KEPT: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
++
++/// (Neptune 25fbf69) Slots the title wrote with a texture view that is due at once, since
++/// the pass over textures picked by index last caught up (`draw.rs` `catch_up_budget`).
++pub(crate) static FRESH_WRITES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
++/// The log line of [`STALE_KEPT`] (from the 5-second meter in `host.rs`).
++pub(crate) fn stale_kept_line() {
++    let [kept, nulled, again] = STALE_KEPT.each_ref().map(|c| c.swap(0, std::sync::atomic::Ordering::Relaxed));
++    tracing::info!(
++        "slots whose view was made stale, in the last period: {kept} went on showing their texture \
++         (VICTORY_STALE_KEEP_MS=0: null at once), {again} were replaced by their new view, {nulled} hit the cap \
++         (VICTORY_STALE_KEEP_MAX_MS) and were made null"
++    );
++}
++
++/// (Neptune) Whether a slot made stale goes on showing its texture
++/// (`VICTORY_STALE_KEEP_MS`, 10,000; 0: null at once, as before).
++fn stale_keep_ms() -> u64 {
++    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    *MS.get_or_init(|| std::env::var("VICTORY_STALE_KEEP_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(10_000))
++}
++
++/// (Neptune 61f2206) How long a kept slot may wait for its new view before it is made
++/// null (`VICTORY_STALE_KEEP_MAX_MS`, 120,000; bounds the VRAM the old textures hold).
++/// `VICTORY_STALE_EXPIRE_NULL=1`: null after `VICTORY_STALE_KEEP_MS`.
++fn stale_expire_ms() -> u64 {
++    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    *MS.get_or_init(|| {
++        if std::env::var_os("VICTORY_STALE_EXPIRE_NULL").is_some_and(|v| v == "1") {
++            return stale_keep_ms();
++        }
++        std::env::var("VICTORY_STALE_KEEP_MAX_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(120_000)
++    })
++}
++
+ /// Whether a slot written with another view of the placed texture it
+ /// shows keeps showing the old one until the new is made;
+ /// `VICTORY_KEEP_VIEWS=0` makes it null at once, as before.
+diff -ruN '--exclude=target' V1base/crates/victory-gpu/src/draw.rs V1/crates/victory-gpu/src/draw.rs
+--- V1base/crates/victory-gpu/src/draw.rs	2026-11-26 07:44:21.000000000 +0200
++++ V1/crates/victory-gpu/src/draw.rs	2026-11-26 08:37:28.280854300 +0200
+@@ -436,6 +436,66 @@
+ const BAKE_PIXEL_SHADERS: [&str; 4] =
+     ["c0a7fe77b1862e10", "0d1575a396dfe513", "b7cfd8dda91ebb6b", "280967ad158cee0b"];
+ 
++/// (Neptune 25fbf69) The least milliseconds between two passes over textures picked by
++/// index within a frame, when the title has written slots since the last one
++/// (`VICTORY_TEXTURE_CATCH_UP_MS`, 2; 0: no pass to catch up, as before). 47 % of such
++/// textures were there one frame after their slot was written, 37 % in the same frame
++/// (Neptune run ve143): the frame's pass had run before the title wrote them.
++fn catch_up_ms() -> u64 {
++    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
++    *MS.get_or_init(|| std::env::var("VICTORY_TEXTURE_CATCH_UP_MS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(2))
++}
++
++/// (Neptune) Since the last log line: passes made to catch up ([`catch_up_ms`]) and the
++/// microseconds they took.
++pub(crate) static EARLY_CATCH_UPS: AtomicU64 = AtomicU64::new(0);
++pub(crate) static EARLY_CATCH_UP_MICROS: AtomicU64 = AtomicU64::new(0);
++
++/// The log line of the passes that caught up (from the 5-second meter in `host.rs`).
++pub(crate) fn catch_up_line() {
++    let n = EARLY_CATCH_UPS.swap(0, Ordering::Relaxed);
++    let us = EARLY_CATCH_UP_MICROS.swap(0, Ordering::Relaxed);
++    tracing::info!(
++        "textures picked by index: {n} passes made within frames to catch up with slots the title wrote, {:.1} ms in them \
++         (VICTORY_TEXTURE_CATCH_UP_MS={}; 0: off)",
++        us as f64 / 1000.0,
++        catch_up_ms()
++    );
++}
++
++/// When a pass over textures picked by index last began (ms), and whether one catches up.
++static TEXTURE_PASS_MS: AtomicU64 = AtomicU64::new(0);
++static CATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
++
++thread_local! {
++    /// While a pass catches up ([`catch_up_turn`]): it leaves out the frame's bookkeeping.
++    static PASS_LIGHT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
++}
++
++/// The turn of the one thread catching up; given back when dropped.
++struct CatchUp;
++
++impl Drop for CatchUp {
++    fn drop(&mut self) {
++        CATCHING.store(false, Ordering::Release);
++    }
++}
++
++/// A turn to catch up, if [`catch_up_ms`] passed since the last pass of any kind and the
++/// title wrote slots due at once since ([`crate::descriptor::host::FRESH_WRITES`]).
++fn catch_up_turn() -> Option<CatchUp> {
++    let ms = catch_up_ms();
++    if ms == 0 || crate::descriptor::host::FRESH_WRITES.load(Ordering::Relaxed) == 0 {
++        return None;
++    }
++    let now = crate::host::now_ms();
++    if now.saturating_sub(TEXTURE_PASS_MS.load(Ordering::Relaxed)) < ms {
++        return None;
++    }
++    CATCHING.compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed).ok()?;
++    Some(CatchUp)
++}
++
+ /// Since the start: early runs of the texture pass, and those of them
+ /// made for a bake draw.
+ pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
+@@ -680,6 +740,9 @@
+     target_handles: Vec<u64>,
+     depth_handle: u64,
+     targets_set: bool,
++    /// (fxceless a35c557) The formats of the views [`State::set_targets`] bound on the
++    /// host list: a draw's pipeline is one for them (`crate::pipeline::host_pipeline_for`).
++    target_formats: crate::pipeline::host::TargetFormats,
+     viewports: Vec<D3D12_VIEWPORT>,
+     scissors: Vec<RECT>,
+     blend: Option<[f32; 4]>,
+@@ -1200,6 +1263,8 @@
+         self.depth_handle = depth;
+         self.targets_set = true;
+         self.targets.clear();
++        // (fxceless a35c557) The formats of the host views, for the draws' pipelines.
++        let mut formats = [0; 9];
+         let mut rtvs = Vec::new();
+         for &h in handles {
+             let Some(record) = crate::descriptor::rtv_record(h) else {
+@@ -1220,6 +1285,9 @@
+                     .desc()
+                     .filter(|d| d.Format.0 != 0 && d.ViewDimension.0 != 0);
+                 if let Some(desc) = null {
++                    if rtvs.len() < 8 {
++                        formats[rtvs.len()] = desc.Format.0 as u32;
++                    }
+                     rtvs.push(host.rtv(None, Some(&desc)));
+                 }
+                 continue;
+@@ -1227,6 +1295,9 @@
+             self.targets.push(record.resource as usize);
+             #[cfg(feature = "diagnostics")]
+             crate::capture::note_target(record.resource);
++            if rtvs.len() < 8 {
++                formats[rtvs.len()] = bound_format(texture, record.desc().map(|d| d.Format));
++            }
+             rtvs.push(host.rtv(Some(texture), record.desc().as_ref()));
+         }
+         self.depth = 0;
+@@ -1235,6 +1306,7 @@
+             let texture = crate::resource::host_resource(record.resource)?;
+             self.depth = record.resource as usize;
+             self.depth_state = depth_state(texture, record.depth_desc().as_ref());
++            formats[8] = bound_format(texture, record.depth_desc().map(|d| d.Format));
+             if crate::resource::depth_and_unordered(record.resource) {
+                 crate::resource::DEPTH_UNORDERED[1].fetch_add(1, Ordering::Relaxed);
+             }
+@@ -1242,6 +1314,7 @@
+             crate::capture::note_target(record.resource);
+             Some(host.dsv(texture, record.depth_desc().as_ref()))
+         });
++        self.target_formats = formats;
+         // SAFETY: an open list; the views were just made.
+         unsafe {
+             list.list.OMSetRenderTargets(
+@@ -1484,7 +1557,7 @@
+         if crate::pipeline::is_skipped(self.pipeline as This) {
+             return false;
+         }
+-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
++        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.target_formats) else {
+             return false;
+         };
+         if p.compute || p.mesh != mesh {
+@@ -1648,6 +1721,11 @@
+             list.keep(&p.root);
+         }
+         crate::readback::consumers::clear_writer();
++        // (fxceless 5d659e0) `VICTORY_TABLE_STAGES`: what this draw's stages read of each table.
++        STAGE_SPANS.with_borrow_mut(|(spans, staged)| {
++            *spans = if table_stages() { stage_spans(p) } else { Vec::new() };
++            staged.clear();
++        });
+         for stage in &p.stages {
+             let t = stage.translated();
+             STORES.set(t.stores);
+@@ -1663,6 +1741,9 @@
+             STORES.set(true);
+             if made.iter().any(|m| m.1 == u32::MAX) {
+                 once!("a draw whose descriptor table found no free slots is dropped");
++                // (fxceless 5d659e0) Which draws those are, in the frame line's list of drops.
++                #[cfg(feature = "diagnostics")]
++                crate::pipeline::note_why(format!("no free dynamic slots for a table of {}", p.name));
+                 return false;
+             }
+             // What the shader stores through root views and raw addresses is
+@@ -2421,6 +2502,8 @@
+             (left, 2 << 30)
+         } else if first && early_ms > 0 {
+             (early_ms, 64 << 20)
++        } else if let Some(turn) = catch_up_turn() {
++            return self.catch_up(list, turn);
+         } else {
+             return;
+         };
+@@ -2458,6 +2541,35 @@
+         }
+     }
+ 
++    /// (Neptune 25fbf69) A pass over textures picked by index within a frame, for slots the
++    /// title wrote since the last pass ([`catch_up_turn`]): only the uploads that are due, at
++    /// most 512 slots, none of the frame's own pass's bookkeeping. Charged to the clock's
++    /// credit (`VICTORY_TEXTURE_BUDGET_MS_PER_S`) like any pass; with that off, 6 ms and
++    /// 48 MB on top of the frame's spending, as Neptune.
++    fn catch_up(&self, list: &HostList, _turn: CatchUp) {
++        let Some(heap) = self
++            .heaps
++            .iter()
++            .filter(|&&h| h != 0)
++            .map(|&h| crate::descriptor::heap(h as This))
++            .find(|h| !h.samplers())
++        else {
++            return;
++        };
++        let Some(host) = heap.host() else {
++            return;
++        };
++        EARLY_CATCH_UPS.fetch_add(1, Ordering::Relaxed);
++        let began = std::time::Instant::now();
++        let budget = (texture_budget_ms_per_s() == 0).then_some((6, 48 << 20));
++        PASS_BUDGET.set(budget);
++        PASS_LIGHT.set(true);
++        self.heap_textures(list, heap, host);
++        PASS_LIGHT.set(false);
++        PASS_BUDGET.set(None);
++        EARLY_CATCH_UP_MICROS.fetch_add(began.elapsed().as_micros() as u64, Ordering::Relaxed);
++    }
++
+     /// The queue's side of the card accounting line
+     /// (`crate::resource::card_accounting`, which says what the line
+     /// holds): the slots that are due, by what their texture has on the
+@@ -2557,6 +2669,11 @@
+         if !*ON.get_or_init(|| std::env::var_os("VICTORY_HEAP_TEXTURES").is_none_or(|v| v != "0")) {
+             return;
+         }
++        // (Neptune) A pass that catches up within a frame (`State::catch_up`) leaves out the
++        // frame's own bookkeeping; every pass restarts the wait for the next one.
++        let light = PASS_LIGHT.get();
++        TEXTURE_PASS_MS.store(crate::host::now_ms(), Ordering::Relaxed);
++        crate::descriptor::host::FRESH_WRITES.store(0, Ordering::Relaxed);
+         /// Bytes of texture memory staged per frame.
+         // `VICTORY_TEXTURE_STAGE_MB` raises it: a backlog of tens of thousands of
+         // textures (a scene's first minutes) then drains in fewer frames.
+@@ -2577,7 +2694,7 @@
+         // makes room again: so the slots are still looked at (the pass
+         // returned here, and a slot whose texture had been streamed out
+         // kept its host copy for as long as the card was full).
+-        let mut room = crate::resource::room();
++        let mut room = if light { crate::resource::room_lately() } else { crate::resource::room() };
+         // Bytes uploaded by this pass since the card was last asked
+         // whether it has room: asked again every 32 MiB (a pass may upload
+         // 192 MB and more, and one asking a pass let the queue run some
+@@ -2590,22 +2707,31 @@
+         let mut refused = 0;
+         // Room again: the slots held back while the card was full are due
+         // now (`full_card_pass`).
+-        if room {
++        if room && !light {
+             host.texture_slots_room(frame);
+         }
+         // Slots whose texture's memory the runtime mapped, unmapped or
+         // wrote since the last pass are due again.
+-        host.texture_slots_remapped(frame);
++        if !light {
++            host.texture_slots_remapped(frame);
++        }
+         // Levels on demand: the slots of textures whose first level with
+         // memory changed since the last pass are made again from it.
+-        host.texture_views_remade();
++        if !light {
++            host.texture_views_remade();
++        }
+         // And with room, the textures whose upload left a held level
+         // without the card's memory are uploaded again.
+-        if room {
++        if room && !light {
+             host.texture_slots_waiting(frame);
+         }
+-        let (due, census, aged, ages) =
+-            host.texture_slots_due_aged(frame, 4096, crate::host::now_ms(), texture_max_age_ms());
++        let (due, census, aged, ages) = host.texture_slots_due_aged(
++            frame,
++            if light { 512 } else { 4096 },
++            crate::host::now_ms(),
++            texture_max_age_ms(),
++        );
++        if !light {
+         HEAP_TEXTURES_WAITING.store(census[0], Ordering::Relaxed);
+         for (count, now) in HEAP_TEXTURES_QUEUE.iter().zip(census) {
+             count.store(now, Ordering::Relaxed);
+@@ -2617,6 +2743,7 @@
+         // (`VICTORY_CARD_ACCOUNTING=1`; a line when the card first has no
+         // room, and every five seconds after it).
+         Self::card_accounting(heap, host, frame, room);
++        }
+         // The frames in about four seconds, between 16 and 256: how long a
+         // slot with nothing to upload waits at most for its next look. In
+         // frames alone it was 120: four minutes at the opening cutscene's
+@@ -2624,9 +2751,18 @@
+         // (About a second before the runtime told of the memory it maps:
+         // the looks are now only for what that does not tell.)
+         static PASSED: AtomicU64 = AtomicU64::new(0);
+-        let now = crate::host::now_ms();
+-        let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
+-        let most = (4000 / took).clamp(16, 256);
++        // (Neptune) A pass that catches up keeps the frame's: by the time since it, four
++        // seconds came to 256 frames.
++        static MOST: AtomicU64 = AtomicU64::new(40);
++        let most = if light {
++            MOST.load(Ordering::Relaxed)
++        } else {
++            let now = crate::host::now_ms();
++            let took = now.saturating_sub(PASSED.swap(now, Ordering::Relaxed)).max(1);
++            let most = (4000 / took).clamp(16, 256);
++            MOST.store(most, Ordering::Relaxed);
++            most
++        };
+         // What a table entry of a texture a shader samples says.
+         let sampled = UsedResource {
+             kind: ResourceType::Srv,
+@@ -3537,6 +3673,17 @@
+                 .max()
+                 .unwrap_or(0)
+                 + 1;
++            // (fxceless 5d659e0, `VICTORY_TABLE_STAGES`) As many slots as the stage of this
++            // draw that reads furthest into the table needs ([`stage_spans`]; empty with the
++            // switch off), so the stages share one table.
++            let (n, staged) = STAGE_SPANS.with_borrow(|(spans, staged)| match spans.iter().find(|s| s.0 == slot) {
++                Some(&(_, with_constants, all)) => {
++                    let past = heap.index(table).is_some_and(|at| u64::from(at) + u64::from(all) > u64::from(host.count()));
++                    let n = n.max(if past { all } else { with_constants });
++                    (n, staged.contains(&(table, n)))
++                }
++                None => (n, false),
++            });
+             let last = table.checked_add(u64::from(n - 1) * 32);
+             if n > crate::descriptor::host::DYNAMIC
+                 || last.and_then(|handle| heap.index(handle)).is_none()
+@@ -3565,7 +3712,9 @@
+             };
+             let here = (table, n, key.2);
+             if let Some(&first) = self.fresh_tables.get(&key) {
+-                if tables_by_content() && self.seen_tables.insert(here) {
++                // (Or found in the table an earlier stage of this draw made, `staged`: this
++                // stage's title slots are noted as its own making would have noted them.)
++                if (tables_by_content() && self.seen_tables.insert(here)) || staged {
+                     // Another table's host slots; this one's own title slots are noted as
+                     // its making would have noted them.
+                     TABLES[4].fetch_add(1, Ordering::Relaxed);
+@@ -3666,6 +3815,11 @@
+             };
+             self.fresh_tables.insert(key, first);
+             self.seen_tables.insert(here);
++            STAGE_SPANS.with_borrow_mut(|(spans, staged)| {
++                if !spans.is_empty() {
++                    staged.push((table, n));
++                }
++            });
+             TABLES[2].fetch_add(1, Ordering::Relaxed);
+             TABLES[3].fetch_add(u64::from(n), Ordering::Relaxed);
+             self.dynamic
+@@ -4612,6 +4766,17 @@
+     }
+ }
+ 
++/// (fxceless a35c557) The format of a host view of `texture` whose description names
++/// `described` (none without a description): that one, or the texture's own, which is what
++/// the host gives a view without a format.
++fn bound_format(texture: &ID3D12Resource, described: Option<DXGI_FORMAT>) -> u32 {
++    match described {
++        Some(format) if format.0 != 0 => format.0 as u32,
++        // SAFETY: a live texture.
++        _ => unsafe { texture.GetDesc() }.Format.0 as u32,
++    }
++}
++
+ /// The host state a depth view needs of its texture: the read state if the
+ /// view writes no plane the format has (the title's read-only flags), else
+ /// the write state.
+@@ -4640,6 +4805,52 @@
+     }
+ }
+ 
++thread_local! {
++    /// (fxceless 5d659e0) While a draw's stages make their tables ([`table_stages`]): what
++    /// the stages read of each table ([`stage_spans`]), and the tables its earlier stages
++    /// made afresh (address, slots).
++    static STAGE_SPANS: std::cell::RefCell<(Vec<(u8, u32, u32)>, Vec<(u64, u32)>)> =
++        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
++}
++
++/// (fxceless 5d659e0) Whether the stages of one draw share a table they both need made
++/// afresh (`VICTORY_TABLE_STAGES=1`; off by default as its author's: each stage makes its
++/// own). A mesh stage and a pixel stage that read one root table to different depths made
++/// it twice in dynamic slots of their own (the count is in the key of `fresh_tables`); with
++/// this both ask for the larger count and the second finds the first one's table: fewer
++/// slots of the dynamic ring, fewer tables refused for a full ring (fxceless run 300:
++/// 1.79 -> 0.48 % refused; frame time +7.4 ms there, so off by default).
++fn table_stages() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_TABLE_STAGES").is_some_and(|v| v == "1"))
++}
++
++/// For [`table_stages`]: per root table the stages of `p` read, the slots it has up to the
++/// last entry read by a stage that also reads a constant view in it (0: no stage does), and
++/// up to the last entry any stage reads: (root parameter, with constants, all).
++fn stage_spans(p: &HostPipeline) -> Vec<(u8, u32, u32)> {
++    let mut spans: Vec<(u8, u32, u32)> = Vec::new();
++    for stage in &p.stages {
++        let t = stage.translated();
++        let mut constant = [false; 256];
++        for u in t.used.iter().filter(|u| u.root == RootType::Table && u.kind == ResourceType::Cbv) {
++            constant[usize::from(u.slot)] = true;
++        }
++        for u in t.used.iter().filter(|u| u.root == RootType::Table) {
++            let n = u.table_offset_dwords / 8 + 1;
++            let with = if constant[usize::from(u.slot)] { n } else { 0 };
++            match spans.iter_mut().find(|s| s.0 == u.slot) {
++                Some(s) => {
++                    s.1 = s.1.max(with);
++                    s.2 = s.2.max(n);
++                }
++                None => spans.push((u.slot, with, n)),
++            }
++        }
++    }
++    spans
++}
++
+ /// (Neptune) Whether a table made afresh is remembered as ready within its host list
+ /// (`VICTORY_READY_TABLES=0`: its views are made ready again for every draw, as before).
+ fn ready_tables_on() -> bool {
+diff -ruN '--exclude=target' V1base/crates/victory-gpu/src/host.rs V1/crates/victory-gpu/src/host.rs
+--- V1base/crates/victory-gpu/src/host.rs	2026-11-26 07:33:36.000000000 +0200
++++ V1/crates/victory-gpu/src/host.rs	2026-11-26 08:34:33.069624200 +0200
+@@ -2528,6 +2528,9 @@
+     refreshed: std::collections::HashSet<(usize, usize, usize)>,
+     /// Textures whose contents the list brings up to date.
+     textures: std::collections::HashSet<usize>,
++    /// (fxceless 19a45d1) The last card-written source copied into each aliased host
++    /// texture in this list (`crate::texture::alias`).
++    texture_aliases: std::collections::HashMap<usize, usize>,
+     /// Bottom-of-pipe writes, done once the list has run: address, what,
+     /// bytes.
+     writes: Vec<(usize, crate::queue::Written, usize)>,
+@@ -9295,6 +9298,14 @@
+         self.deferred().textures.insert(key)
+     }
+ 
++    /// (fxceless 19a45d1) Whether `source` is not the last card-written texture copied
++    /// into the aliased host texture `view` in this list (and notes it as that now).
++    pub(crate) fn alias_source_changed(&self, view: &ID3D12Resource, source: &ID3D12Resource) -> bool {
++        let view = view.as_raw() as usize;
++        let source = source.as_raw() as usize;
++        self.deferred().texture_aliases.insert(view, source) != Some(source)
++    }
++
+     /// Runs `work` when the list is submitted, in order with its copies.
+     /// `work` may write title memory (refreshes after it copy again).
+     pub(crate) fn defer(&self, work: impl Fn() + Send + 'static) {
+@@ -10370,6 +10381,15 @@
+                 crate::descriptor::host::KEPT_VIEWS.load(Ordering::Relaxed),
+                 crate::descriptor::host::KEPT_OTHER_VIEWS.load(Ordering::Relaxed)
+             );
++            crate::descriptor::host::stale_kept_line();
++            crate::draw::catch_up_line();
++            tracing::info!(
++                "since the start: {} copies of a card-written texture into its aliased view after the list had uploaded that view \
++                 from title memory (fxceless 19a45d1; skipped before); {} pipelines made again for the render target formats bound \
++                 at their draw (VICTORY_TARGET_VARIANTS=0: off)",
++                crate::texture::ALIAS_AFTER_UPLOAD.load(Ordering::Relaxed),
++                crate::pipeline::variants_made()
++            );
+             tracing::info!(
+                 "copies left out since the start because both sides were one host texture: {}",
+                 crate::list::SELF_COPIES.load(Ordering::Relaxed)
+diff -ruN '--exclude=target' V1base/crates/victory-gpu/src/pipeline/host.rs V1/crates/victory-gpu/src/pipeline/host.rs
+--- V1base/crates/victory-gpu/src/pipeline/host.rs	2026-11-26 07:36:12.000000000 +0200
++++ V1/crates/victory-gpu/src/pipeline/host.rs	2026-11-26 08:32:37.864107100 +0200
+@@ -120,6 +120,84 @@
+     }
+ }
+ 
++/// (fxceless a35c557) The formats of what a draw draws into, as the host has them: the
++/// eight render targets (0 where there is none), then depth (0 for none).
++pub(crate) type TargetFormats = [u32; 9];
++
++/// (fxceless a35c557) Whether a draw into views of the formats `bound` cannot go to the
++/// host with a pipeline that declares `declared`: a render target slot for which the
++/// pipeline declares a format AND a view of another format is bound (fxceless run 289, a
++/// full-screen zoom and blur: R10G10B10A2_UNORM declared, R11G11B10_FLOAT bound; on the
++/// host an invalid draw). Only that case: an empty slot, a view in a slot the pipeline
++/// declares nothing for, and the depth view do not count.
++pub(crate) fn formats_differ(declared: &TargetFormats, bound: &TargetFormats) -> bool {
++    declared[..8].iter().zip(&bound[..8]).any(|(&d, &b)| d != 0 && b != 0 && b != d)
++}
++
++/// The formats a pipeline for a draw into `bound` declares ([`formats_differ`]): the
++/// title's own, but for the render target slots it declares a format for and a view of
++/// another format is bound to, which take the view's. Count and depth stay the title's.
++pub(crate) fn formats_for(declared: &TargetFormats, bound: &TargetFormats) -> TargetFormats {
++    let mut formats = *declared;
++    for i in 0..8 {
++        if declared[i] != 0 && bound[i] != 0 {
++            formats[i] = bound[i];
++        }
++    }
++    formats
++}
++
++impl GraphicsState {
++    /// (fxceless a35c557) The formats the state declares ([`TargetFormats`]): nothing past
++    /// its count of render targets.
++    pub(crate) fn formats(&self) -> TargetFormats {
++        let mut formats = [0; 9];
++        let n = (self.targets.NumRenderTargets as usize).min(8);
++        for (to, from) in formats.iter_mut().zip(&self.targets.RTFormats[..n]) {
++            *to = from.0 as u32;
++        }
++        formats[8] = self.depth_format.0 as u32;
++        formats
++    }
++
++    /// (fxceless a35c557) The same state for a draw into views of the formats `bound`
++    /// (what [`formats_for`] gives): those render target formats, everything else the
++    /// title's. Blending for integer targets is decided again when the pipeline is made
++    /// ([`GraphicsState::host_blend`]). Its [`GraphicsState::describe`] differs (the
++    /// formats are part of it), so its host pipeline has a name of its own in the library.
++    pub(crate) fn with_formats(&self, bound: &TargetFormats) -> GraphicsState {
++        let names = self.names.clone();
++        let inputs: Vec<D3D12_INPUT_ELEMENT_DESC> = self
++            .inputs
++            .iter()
++            .zip(&names)
++            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
++                SemanticName: PCSTR(name.as_ptr().cast()),
++                ..*e
++            })
++            .collect();
++        let mut targets = self.targets;
++        let n = (targets.NumRenderTargets as usize).min(8);
++        for (to, &from) in targets.RTFormats[..n].iter_mut().zip(bound) {
++            *to = DXGI_FORMAT(from as i32);
++        }
++        GraphicsState {
++            blend: self.blend,
++            sample_mask: self.sample_mask,
++            rasterizer: self.rasterizer,
++            depth: self.depth,
++            depth_bounds: self.depth_bounds,
++            inputs,
++            names,
++            strip_cut: self.strip_cut,
++            topology: self.topology,
++            targets,
++            depth_format: self.depth_format,
++            samples: self.samples,
++        }
++    }
++}
++
+ impl GraphicsState {
+     /// The blend state the host can make for these render targets. D3D12
+     /// refuses a pipeline that blends into a target of an integer format
+@@ -1107,6 +1185,30 @@
+ 
+     use super::*;
+ 
++    /// (fxceless a35c557) A draw needs another host pipeline only for a bound view whose
++    /// format its pipeline does not name for that slot.
++    #[test]
++    fn bound_formats_are_compared_slot_by_slot() {
++        let mut g = GraphicsState::default();
++        g.targets.NumRenderTargets = 2;
++        g.targets.RTFormats[0] = DXGI_FORMAT_R10G10B10A2_UNORM;
++        g.targets.RTFormats[1] = DXGI_FORMAT_R8G8B8A8_UNORM;
++        g.targets.RTFormats[2] = DXGI_FORMAT_R8_UINT;
++        g.depth_format = DXGI_FORMAT_D32_FLOAT;
++        let declared = g.formats();
++        assert_eq!(declared, [24, 28, 0, 0, 0, 0, 0, 0, 40]);
++        assert!(!formats_differ(&declared, &declared));
++        assert!(!formats_differ(&declared, &[24, 0, 0, 0, 0, 0, 0, 0, 40]));
++        assert!(!formats_differ(&declared, &[0; 9]));
++        assert!(formats_differ(&declared, &[26, 28, 0, 0, 0, 0, 0, 0, 40]));
++        assert!(!formats_differ(&declared, &[24, 28, 28, 0, 0, 0, 0, 0, 40]));
++        assert!(!formats_differ(&declared, &[24, 28, 0, 0, 0, 0, 0, 0, 45]));
++        assert_eq!(formats_for(&declared, &[26, 28, 28, 0, 0, 0, 0, 0, 45]), [26, 28, 0, 0, 0, 0, 0, 0, 40]);
++        let v = g.with_formats(&formats_for(&declared, &[26, 0, 0, 0, 0, 0, 0, 0, 0]));
++        assert_eq!(v.formats(), [26, 28, 0, 0, 0, 0, 0, 0, 40]);
++        assert_ne!(v.describe(), g.describe());
++    }
++
+     /// A triangle mesh shader of our own and a pixel shader for it.
+     const MS: &str = "struct V { float4 p : SV_Position; };
+         [outputtopology(\"triangle\")] [numthreads(1, 1, 1)]
+diff -ruN '--exclude=target' V1base/crates/victory-gpu/src/pipeline/make.rs V1/crates/victory-gpu/src/pipeline/make.rs
+--- V1base/crates/victory-gpu/src/pipeline/make.rs	2026-11-25 22:15:46.000000000 +0200
++++ V1/crates/victory-gpu/src/pipeline/make.rs	2026-11-26 08:32:37.906826000 +0200
+@@ -21,7 +21,7 @@
+ use std::time::{Duration, Instant};
+ 
+ use super::Shader;
+-use super::host::{GraphicsState, HostPipeline};
++use super::host::{GraphicsState, HostPipeline, TargetFormats};
+ 
+ /// What a host pipeline is made from, and the host pipeline once made.
+ pub(crate) struct Pending {
+@@ -35,6 +35,11 @@
+     used: AtomicBool,
+     /// When a worker (or a thread making it itself) began it ([`slow`]).
+     begun: OnceLock<Instant>,
++    /// (fxceless a35c557) The formats its state declares for what a draw draws into
++    /// (zeros without a graphics state), and the same shaders and state for other formats
++    /// bound at a draw ([`for_formats`]): a chain, one link per set of formats met.
++    pub(crate) formats: TargetFormats,
++    variant: OnceLock<Arc<Pending>>,
+ }
+ 
+ // SAFETY: D3D12 objects are free-threaded; the graphics state (whose input
+@@ -57,6 +62,8 @@
+         }
+         key.update(graphics.as_ref().map(|g| g.describe()).unwrap_or_default().as_bytes());
+         Pending {
++            formats: graphics.as_ref().map_or([0; 9], |g| g.formats()),
++            variant: OnceLock::new(),
+             shaders,
+             graphics,
+             queue_state: AtomicU8::new(NOT_QUEUED),
+@@ -181,6 +188,53 @@
+     WAITING.load(Ordering::Relaxed)
+ }
+ 
++/// (fxceless a35c557) Pipelines made again for the formats bound at a draw, since the start.
++pub(crate) static VARIANTS: AtomicU64 = AtomicU64::new(0);
++
++/// Whether a draw into views of other formats than its pipeline declares gets a host
++/// pipeline for those formats ([`for_formats`]); `VICTORY_TARGET_VARIANTS=0` sends such a
++/// draw with the title's pipeline, as before.
++fn variants_on() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var_os("VICTORY_TARGET_VARIANTS").is_none_or(|v| v != "0"))
++}
++
++/// (fxceless a35c557) The host pipeline for a draw with `p` into views of the formats
++/// `bound`, which `p` does not declare (`host::formats_differ`): that of the same shaders
++/// and state for those formats, a pipeline like the title's own (queued at its first draw,
++/// the draw dropped while it is not there, [`ready`]).
++#[cold]
++pub(crate) fn for_formats<'a>(p: &'a Arc<Pending>, bound: &TargetFormats) -> Option<&'a HostPipeline> {
++    match p.graphics.as_deref() {
++        Some(g) if variants_on() => ready(variant(p, g, &super::host::formats_for(&p.formats, bound))),
++        _ => ready(p),
++    }
++}
++
++/// The pipeline of `p`'s shaders and its state `g` for the formats `bound`: found in the
++/// chain that starts at `p`, or added to it (logged then, once per pipeline and formats).
++fn variant<'a>(p: &'a Arc<Pending>, g: &GraphicsState, bound: &TargetFormats) -> &'a Arc<Pending> {
++    let mut at = p;
++    for _ in 0..64 {
++        let next = at.variant.get_or_init(|| {
++            let so_far = VARIANTS.fetch_add(1, Ordering::Relaxed) + 1;
++            tracing::info!(
++                pipeline = ?p.shaders.iter().map(|s| s.hash.as_str()).collect::<Vec<_>>(),
++                declared = ?p.formats,
++                bound = ?bound,
++                so_far,
++                "a pipeline is made again for the render target formats bound at its draw (eight render targets, then depth; VICTORY_TARGET_VARIANTS=0: the draw goes out with the title's pipeline)"
++            );
++            Arc::new(Pending::new(p.shaders.clone(), Some(Box::new(g.with_formats(bound)))))
++        });
++        if next.formats == *bound {
++            return next;
++        }
++        at = next;
++    }
++    p
++}
++
+ /// The host pipeline if it is made (or is made within the frame's budget);
+ /// queues it on first use.
+ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
+diff -ruN '--exclude=target' V1base/crates/victory-gpu/src/pipeline.rs V1/crates/victory-gpu/src/pipeline.rs
+--- V1base/crates/victory-gpu/src/pipeline.rs	2026-11-26 03:32:17.000000000 +0200
++++ V1/crates/victory-gpu/src/pipeline.rs	2026-11-26 08:34:33.024664400 +0200
+@@ -486,6 +486,29 @@
+     make::ready(&pipeline(this).host)
+ }
+ 
++/// (fxceless a35c557) As [`host_pipeline`], for a draw into render target and depth views
++/// of the formats `bound`: if a bound view has another format than the title's pipeline
++/// declares for its slot (`host::formats_differ`), the host pipeline of the same shaders
++/// and state made for the bound formats (`make::for_formats`). A draw whose views are as
++/// declared pays one comparison of nine words.
++#[cfg(windows)]
++pub(crate) fn host_pipeline_for<'a>(this: This, bound: &host::TargetFormats) -> Option<&'a host::HostPipeline> {
++    if this.is_null() {
++        return None;
++    }
++    let p = &pipeline(this).host;
++    if p.formats != *bound && host::formats_differ(&p.formats, bound) {
++        return make::for_formats(p, bound);
++    }
++    make::ready(p)
++}
++
++/// Pipelines made again for the formats bound at their draw, since the start.
++#[cfg(windows)]
++pub(crate) fn variants_made() -> u64 {
++    make::VARIANTS.load(std::sync::atomic::Ordering::Relaxed)
++}
++
+ /// Host pipelines queued and not made yet.
+ #[cfg(windows)]
+ pub(crate) fn making() -> u64 {
+diff -ruN '--exclude=target' V1base/crates/victory-gpu/src/texture.rs V1/crates/victory-gpu/src/texture.rs
+--- V1base/crates/victory-gpu/src/texture.rs	2026-11-26 04:21:00.000000000 +0200
++++ V1/crates/victory-gpu/src/texture.rs	2026-11-26 08:34:24.201151400 +0200
+@@ -557,6 +557,10 @@
+ // SAFETY: as above.
+ unsafe impl Sync for Through {}
+ 
++/// (fxceless 19a45d1) Since the start: copies [`alias`] made into a view the list had
++/// used before (an upload from title memory), which it skipped before.
++pub(crate) static ALIAS_AFTER_UPLOAD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
++
+ /// The copy buffers of [`alias`], by the placed view's texture.
+ static THROUGH: Mutex<Option<HashMap<usize, Arc<Through>>>> = Mutex::new(None);
+ 
+@@ -673,6 +677,14 @@
+         }
+     };
+     let first = list.first_use(placed as usize);
++    // (fxceless 19a45d1) An upload of this view from title memory earlier in the list has
++    // used its first use already: only a copy from the same card-written source satisfies
++    // this read (before: the copy was skipped and the shader read the uploaded bytes, zero
++    // where the card wrote packed light). Counted in [`ALIAS_AFTER_UPLOAD`].
++    let new_source = list.alias_source_changed(to, from);
++    if new_source && !first {
++        ALIAS_AFTER_UPLOAD.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
++    }
+     // Before the list touches either texture: the copy goes to the
+     // prelude, which leaves it out if the source was not written since.
+     if alias_once()
+@@ -706,7 +718,7 @@
+         unsafe { list.list.ResourceBarrier(&[barrier]) };
+         before
+     });
+-    if !first && before.is_none() {
++    if !new_source && before.is_none() {
+         return true;
+     }
+     card_writes(list, placed, to, None);
+diff -ruN '--exclude=target' V1base/crates/victory-gpu/src/tiles.rs V1/crates/victory-gpu/src/tiles.rs
+--- V1base/crates/victory-gpu/src/tiles.rs	2026-11-26 05:22:14.000000000 +0200
++++ V1/crates/victory-gpu/src/tiles.rs	2026-11-26 08:24:21.357445900 +0200
+@@ -778,11 +778,17 @@
+     }
+ }
+ 
++/// Views moved by [`show_from`] whose `ResourceMinLODClamp` was above 0 and
++/// is now kept as it is (before 41f9857 it was lowered by the shift).
++pub(crate) static KEPT_MIN_LOD: AtomicU64 = AtomicU64::new(0);
++
+ /// Keeps a two-dimensional shader view (2D or 2D array) from the levels
+ /// before `first` of a texture of `levels` levels: it starts at `first` if
+ /// it started before it, shows as many levels fewer (clamped to the
+-/// remaining levels), and reduces `ResourceMinLODClamp` by the same shift so
+-/// the effective minimum LOD stays at the same resource level.
++/// remaining levels). `ResourceMinLODClamp` is measured from mip 0 of the
++/// resource, so moving the start of the view keeps that field as the title
++/// set it (fxceless 41f9857): lowered, the view could sample a level the
++/// title held back. [`KEPT_MIN_LOD`] counts the views where that mattered.
+ pub(crate) fn show_from(desc: &mut D3D12_SHADER_RESOURCE_VIEW_DESC, first: u32, levels: u32) {
+     if first >= levels {
+         return;
+@@ -797,7 +803,7 @@
+             *mips = mips.saturating_sub(fewer).clamp(1, levels - first);
+         }
+         if *min_lod > 0.0 {
+-            *min_lod = (*min_lod - fewer as f32).max(0.0);
++            KEPT_MIN_LOD.fetch_add(1, Ordering::Relaxed);
+         }
+     };
+     match desc.ViewDimension {
+@@ -830,7 +836,8 @@
+          {} MB of the card not allocated for levels the title does not hold ({} MB if every level had memory); \
+          the pool's heaps {} MB ({} given back to the card so far); since the line before: {} calls of \
+          UpdateTileMappings in {} microseconds; in all {} calls, {} microseconds; {} uploads left a held \
+-         level without memory (no room on the card, or no heap), {} uploads were recorded again for one",
++         level without memory (no room on the card, or no heap), {} uploads were recorded again for one; \
++         {} views moved to their first level with memory kept the title's minimum level (ResourceMinLODClamp)",
+         s[0],
+         s[4],
+         s[2] >> 20,
+@@ -845,6 +852,7 @@
+         s[7],
+         s[9],
+         s[10],
++        KEPT_MIN_LOD.load(Ordering::Relaxed),
+     );
+ }
+ 
+@@ -1666,7 +1674,7 @@
+     }
+ 
+     #[test]
+-    fn show_from_clamps_2d_and_2d_array_and_adjusts_min_lod() {
++    fn show_from_clamps_2d_and_2d_array_and_keeps_min_lod() {
+         let mut srv2d = D3D12_SHADER_RESOURCE_VIEW_DESC {
+             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+             ViewDimension: D3D12_SRV_DIMENSION_TEXTURE2D,
+@@ -1686,7 +1694,7 @@
+         assert_eq!(v2d.MostDetailedMip, 3);
+         // Clamped to remaining levels (11 - 3 = 8), not 12 - 3 = 9.
+         assert_eq!(v2d.MipLevels, 8);
+-        assert_eq!(v2d.ResourceMinLODClamp, 0.5);
++        assert_eq!(v2d.ResourceMinLODClamp, 3.5);
+ 
+         let mut srv_arr = D3D12_SHADER_RESOURCE_VIEW_DESC {
+             Format: DXGI_FORMAT_R8G8B8A8_UNORM,
+@@ -1708,7 +1716,7 @@
+         let varr = unsafe { srv_arr.Anonymous.Texture2DArray };
+         assert_eq!(varr.MostDetailedMip, 2);
+         assert_eq!(varr.MipLevels, 4);
+-        assert_eq!(varr.ResourceMinLODClamp, 0.0);
++        assert_eq!(varr.ResourceMinLODClamp, 1.5);
+     }
+ 
+     #[test]

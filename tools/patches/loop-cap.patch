@@ -1,0 +1,852 @@
+diff --git a/crates/victory-gpu/src/shader_cache.rs b/crates/victory-gpu/src/shader_cache.rs
+index c5365c4..d2bb0d9 100644
+--- a/crates/victory-gpu/src/shader_cache.rs
++++ b/crates/victory-gpu/src/shader_cache.rs
+@@ -53,6 +53,15 @@ fn build() -> [u8; 32] {
+     if limit != victory_shader::emit::DEFAULT_LOOP_LIMIT {
+         WARNED.call_once(|| tracing::warn!(limit, "VICTORY_SHADER_LOOP_LIMIT: translated loops stop sooner"));
+     }
++    let caps = victory_shader::emit::stage_limits();
++    if caps != victory_shader::emit::StageLimits::DEFAULT {
++        static CAPS: std::sync::Once = std::sync::Once::new();
++        CAPS.call_once(|| {
++            let (pixel, geometry, compute) = (caps.pixel, caps.geometry, caps.compute);
++            let what = "VICTORY_LOOP_LIMIT_*: translated loops stop at other caps";
++            tracing::warn!(pixel, geometry, compute, "{what}");
++        });
++    }
+     static EXE: OnceLock<Option<[u8; 32]>> = OnceLock::new();
+     let exe = EXE.get_or_init(|| {
+         if std::env::var_os("VICTORY_SHADER_CACHE_KEY").is_some_and(|v| v == "exe") {
+@@ -95,10 +104,44 @@ pub fn warm(container: &[u8]) -> Result<bool, String> {
+ /// there is one.
+ pub(crate) fn host_shader(container: &[u8]) -> Result<HostShader, String> {
+     let translate = |c: &[u8]| victory_shader::emit::translate(c).map_err(|e| e.to_string());
+-    match CACHE.get() {
++    let shader = match CACHE.get() {
+         Some(cache) => cached(cache, &build(), container, translate),
+         None => translate(container),
++    }?;
++    log_capped_loops(container);
++    Ok(shader)
++}
++
++/// Once per program, on target `loop_cap`: its loops a lane can leave at
++/// their cap, cutting the program short (`victory_shader::emit::capped_loops`).
++/// For a translation from the cache too, so that every run's log lists the
++/// programs that can be cut short.
++fn log_capped_loops(container: &[u8]) {
++    type Seen = Option<std::collections::HashSet<[u8; 32]>>;
++    static SEEN: std::sync::Mutex<Seen> = std::sync::Mutex::new(None);
++    let hash = blake3::hash(container);
++    let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
++    if !seen.get_or_insert_with(Default::default).insert(*hash.as_bytes()) {
++        return;
++    }
++    drop(seen);
++    let Ok((stage, loops)) = victory_shader::emit::capped_loops(container) else {
++        return;
++    };
++    if loops.is_empty() {
++        return;
+     }
++    let list: Vec<String> = loops
++        .iter()
++        .map(|l| format!("{:#x} cap={} ({})", l.offset, l.cap, l.why))
++        .collect();
++    tracing::info!(
++        target: "loop_cap",
++        "a translated loop can stop at its cap: hash={} stage={stage:?} loops={} [{}]",
++        &hash.to_hex()[..16],
++        loops.len(),
++        list.join("; ")
++    );
+ }
+ 
+ /// The cache entry's converter: the build and the container in, the
+diff --git a/crates/victory-shader/src/emit/lower.rs b/crates/victory-shader/src/emit/lower.rs
+index b732729..990b859 100644
+--- a/crates/victory-shader/src/emit/lower.rs
++++ b/crates/victory-shader/src/emit/lower.rs
+@@ -10843,13 +10843,12 @@ impl<'a> Lower<'a> {
+         // 14-25 frames in, in a minimap or shadow mesh draw; with every
+         // loop cut at 64 it ran 90 frames. Raise them again once shaders
+         // stop reading data that is not there yet.)
+-        let limit = match super::loop_limit() {
+-            LOOP_LIMIT if self.s.pixel => 1 << 7,
+-            LOOP_LIMIT if self.s.mesh.is_some() || self.s.threads.is_none() => 1 << 8,
+-            LOOP_LIMIT if self.traces => TRACE_LOOP_LIMIT,
+-            LOOP_LIMIT => 1 << 12,
+-            named => named,
+-        };
++        // (Now per stage in `loop_cap`, compute 65,536, and a loop proven to
++        // stop by itself at its own bound.)
++        let geometry = self.s.mesh.is_some() || self.s.threads.is_none();
++        let class = super::loop_cap::Class::of(self.s.pixel, geometry);
++        let (limit, _) =
++            super::loop_cap::cap(self.x.p, &self.rpo, to, self.cur_ir, class, self.traces);
+         let limit = self.s.m.i32(limit);
+         self.counters
+             .get_mut(&to)
+diff --git a/crates/victory-shader/src/emit/mod.rs b/crates/victory-shader/src/emit/mod.rs
+index f0dee6d..b3751a4 100644
+--- a/crates/victory-shader/src/emit/mod.rs
++++ b/crates/victory-shader/src/emit/mod.rs
+@@ -95,6 +95,7 @@ mod intersect_tests;
+ pub mod host;
+ mod idiom;
+ mod link;
++mod loop_cap;
+ mod lower;
+ mod own_bits;
+ mod rect;
+@@ -117,6 +118,7 @@ use crate::{ShaderError, io, ir, resource, structure};
+ 
+ pub use bitcode::census;
+ pub use link::{link_mesh, mesh_fits};
++pub use loop_cap::{CappedLoop, StageLimits, capped_loops, stage_limits};
+ pub use sampler::StaticSampler;
+ pub use lower::set_host_max_wave;
+ pub use rect::rect_list_gs;
+@@ -218,6 +220,10 @@ pub fn translation_fingerprint() -> Vec<u8> {
+     out.extend_from_slice(&lower::host_max_wave().to_le_bytes());
+     out.extend_from_slice(&shader::view_heap_limit().to_le_bytes());
+     out.extend_from_slice(&loop_limit().to_le_bytes());
++    let caps = stage_limits();
++    for cap in [caps.pixel, caps.geometry, caps.compute] {
++        out.extend_from_slice(&cap.to_le_bytes());
++    }
+     out.push(group_sync());
+     out.extend_from_slice(&shader_opt().to_le_bytes());
+     out
+diff --git a/crates/victory-shader/src/emit/loop_cap.rs b/crates/victory-shader/src/emit/loop_cap.rs
+new file mode 100644
+index 0000000..812e7bd
+--- /dev/null
++++ b/crates/victory-shader/src/emit/loop_cap.rs
+@@ -0,0 +1,725 @@
++//! Loop caps: after how many iterations a translated loop is left, per lane
++//! and per entry into the loop ([`super::lower`]'s counters). The console
++//! runs a loop as long as its data says; data the host has not mirrored yet
++//! can make that billions of iterations, which hangs the host GPU until
++//! Windows resets the driver, so every loop has a cap:
++//! - a loop proven to stop by itself ([`counted`]) gets its own bound (when
++//!   above the stage's cap): it can never reach it;
++//! - any other loop gets its stage's cap: pixel [`PIXEL_DEFAULT`], vertex
++//!   and mesh [`GEOMETRY_DEFAULT`], compute [`COMPUTE_DEFAULT`], and a
++//!   program that tests rays against tree nodes (`image_bvh*`, outside the
++//!   pixel and geometry stages) [`TRACE_LOOP_LIMIT`], whatever the switches
++//!   say;
++//! - with the `diagnostics` feature, `VICTORY_SHADER_LOOP_LIMIT`
++//!   ([`super::loop_limit`]) names one cap for every loop, as before.
++//!
++//! The stage caps are switches in every build: `VICTORY_LOOP_LIMIT_PIXEL`,
++//! `VICTORY_LOOP_LIMIT_GEOMETRY` (vertex and mesh) and
++//! `VICTORY_LOOP_LIMIT_COMPUTE`, decimal or `0x` hex, read once, clamped to
++//! [`MIN_CAP`]..=[`LOOP_LIMIT`]; unset, unreadable or 0 is the default. They
++//! change the translation: the shader cache keys on them (the names are in
++//! `VICTORY_SHADER_SWITCHES`, the values in [`super::translation_fingerprint`]).
++//!
++//! A lane at the cap leaves the loop: through the loop's exit when the back
++//! edge is a branch, as killed (a pixel discards) when it is a jump.
++//! [`capped_loops`] lists a program's loops that can be cut so, for the log.
++
++use std::sync::OnceLock;
++
++use super::lower::{LOOP_LIMIT, TRACE_LOOP_LIMIT};
++use crate::gfx10::{Fields, NULL, Operand};
++use crate::ir::{Exit, Inst, Program, Reg, Value};
++use crate::native::HwStage;
++use crate::{Container, FourCC, ShaderError};
++
++/// The pixel cap. (It was 1,024: the opening cutscene lost the card 14-25
++/// frames in; see `count_iteration`.)
++pub const PIXEL_DEFAULT: u32 = 1 << 7;
++/// The vertex and mesh cap (it was 4,096).
++pub const GEOMETRY_DEFAULT: u32 = 1 << 8;
++/// The compute cap. It was 4,096, which a data-parallel kernel's per-lane
++/// loop over a long axis can pass: a 64-thread reduction over more than
++/// 2^18 elements was cut and its output left unwritten (the title's
++/// `compute_graph_ops:CS_Reduce*`). 2^16 covers 2^22 elements a 64-thread
++/// group and 2^26 a 1,024-stride copy (`CS_FormulaOperation`);
++/// compute was 65,536 before (the card losses then were in a minimap or
++/// shadow mesh draw). A runaway lane still stops, 16 times later than at
++/// 4,096.
++pub const COMPUTE_DEFAULT: u32 = 1 << 16;
++/// The smallest cap a switch can set.
++pub const MIN_CAP: u32 = 16;
++
++/// The stages with a cap of their own.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub(super) enum Class {
++    Pixel,
++    /// Vertex and mesh.
++    Geometry,
++    Compute,
++}
++
++impl Class {
++    pub(super) fn of(pixel: bool, geometry: bool) -> Self {
++        match (pixel, geometry) {
++            (true, _) => Class::Pixel,
++            (false, true) => Class::Geometry,
++            (false, false) => Class::Compute,
++        }
++    }
++
++    fn of_stage(stage: HwStage) -> Self {
++        Class::of(
++            stage == HwStage::Ps,
++            matches!(stage, HwStage::Vs | HwStage::Ms),
++        )
++    }
++}
++
++/// The stage caps in effect.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub struct StageLimits {
++    pub pixel: u32,
++    pub geometry: u32,
++    pub compute: u32,
++}
++
++impl StageLimits {
++    pub const DEFAULT: StageLimits = StageLimits {
++        pixel: PIXEL_DEFAULT,
++        geometry: GEOMETRY_DEFAULT,
++        compute: COMPUTE_DEFAULT,
++    };
++}
++
++/// The stage caps: the defaults, or what the switches say (read once).
++pub fn stage_limits() -> StageLimits {
++    static LIMITS: OnceLock<StageLimits> = OnceLock::new();
++    *LIMITS.get_or_init(|| {
++        let var = |name: &str| std::env::var(name).ok();
++        StageLimits {
++            pixel: parse_cap(var("VICTORY_LOOP_LIMIT_PIXEL").as_deref(), PIXEL_DEFAULT),
++            geometry: parse_cap(
++                var("VICTORY_LOOP_LIMIT_GEOMETRY").as_deref(),
++                GEOMETRY_DEFAULT,
++            ),
++            compute: parse_cap(
++                var("VICTORY_LOOP_LIMIT_COMPUTE").as_deref(),
++                COMPUTE_DEFAULT,
++            ),
++        }
++    })
++}
++
++/// A stage switch's value: `default` when unset, unreadable or 0, else
++/// clamped to [`MIN_CAP`]..=[`LOOP_LIMIT`]. Pure, for testing.
++fn parse_cap(value: Option<&str>, default: u32) -> u32 {
++    let parsed = value
++        .map(str::trim)
++        .and_then(|v| match v.strip_prefix("0x") {
++            Some(hex) => u32::from_str_radix(hex, 16).ok(),
++            None => v.parse().ok(),
++        });
++    match parsed {
++        Some(n) if n > 0 => n.clamp(MIN_CAP, LOOP_LIMIT),
++        _ => default,
++    }
++}
++
++#[cfg(test)]
++thread_local! {
++    /// Tests: stage caps instead of the switches', and the caps chosen.
++    pub(super) static TEST_LIMITS: std::cell::Cell<Option<StageLimits>> = const { std::cell::Cell::new(None) };
++    pub(super) static CHOSEN: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
++}
++
++/// The cap of the loop that `latch`'s back edge to `header` closes, and
++/// why it is not a bound the loop is proven to stay under (`None`: it is).
++pub(super) fn cap(
++    p: &Program,
++    rpo: &[usize],
++    header: usize,
++    latch: usize,
++    class: Class,
++    traces: bool,
++) -> (u32, Option<&'static str>) {
++    let limits = stage_limits();
++    #[cfg(test)]
++    let limits = TEST_LIMITS.with(|t| t.get()).unwrap_or(limits);
++    let r = cap_with(
++        p,
++        rpo,
++        header,
++        latch,
++        class,
++        traces,
++        super::loop_limit(),
++        limits,
++    );
++    #[cfg(test)]
++    CHOSEN.with(|c| c.borrow_mut().push(r.0));
++    r
++}
++
++#[allow(clippy::too_many_arguments)]
++fn cap_with(
++    p: &Program,
++    rpo: &[usize],
++    header: usize,
++    latch: usize,
++    class: Class,
++    traces: bool,
++    all: u32,
++    limits: StageLimits,
++) -> (u32, Option<&'static str>) {
++    if all != LOOP_LIMIT {
++        return (
++            all,
++            Some("VICTORY_SHADER_LOOP_LIMIT names the cap of every loop"),
++        );
++    }
++    let stage = match class {
++        Class::Pixel => limits.pixel,
++        Class::Geometry => limits.geometry,
++        // (while the title's tree builder is off, a walk can follow garbage)
++        Class::Compute if traces => TRACE_LOOP_LIMIT,
++        Class::Compute => limits.compute,
++    };
++    match counted(p, rpo, header, latch) {
++        Ok(runs) => (runs.max(stage), None),
++        Err(why) => (stage, Some(why)),
++    }
++}
++
++const LANES: &str = "a per-lane loop, no scalar compare closes its back edge";
++const BACK_EDGES: &str = "it has more than one back edge";
++const COUNTER: &str = "its compare is not of a counter stepped by a constant";
++const START: &str = "its counter does not start at a constant";
++const MEMORY: &str = "its bound is read from memory";
++const COMPUTED: &str = "its bound is computed";
++const GIVEN: &str = "its bound is user data or a system value";
++const LONG: &str = "its constant bound is past 2^20 iterations";
++
++/// The times the body of a counted loop runs, at most: a loop whose only back
++/// edge, from `latch` to `header`, is a branch on the SCC of an `s_cmp_*_{u32,i32}`
++/// of a header phi stepped by a constant (`s_add`/`s_sub`) with a constant,
++/// the phi starting at the same constant from every way in. Other exits only
++/// shorten it. The count is the console's, wrapping included (run step by
++/// step, up to [`LOOP_LIMIT`]). Err: why the loop is not one.
++pub(super) fn counted(
++    p: &Program,
++    rpo: &[usize],
++    header: usize,
++    latch: usize,
++) -> Result<u32, &'static str> {
++    let reachable = |b: usize| rpo.get(b).is_some_and(|&n| n != usize::MAX);
++    let preds = &p.blocks[header].preds;
++    if preds
++        .iter()
++        .filter(|&&q| reachable(q) && rpo[header] <= rpo[q])
++        .count()
++        != 1
++    {
++        return Err(BACK_EDGES);
++    }
++    let Exit::Branch { taken, not_taken } = p.blocks[latch].exit else {
++        return Err(LANES);
++    };
++    let branch = p.blocks[latch].insts.last().ok_or(LANES)?;
++    let on_set = match branch.name() {
++        "s_cbranch_scc1" => true,
++        "s_cbranch_scc0" => false,
++        _ => return Err(LANES),
++    };
++    // The back edge is taken while SCC is `go`.
++    let go = match (taken == header, not_taken == header) {
++        (true, false) => on_set,
++        (false, true) => !on_set,
++        _ => return Err(LANES),
++    };
++    let defs = definitions(p);
++    let cmp = defs
++        .get(&branch.read(Reg::Scc).ok_or(LANES)?)
++        .copied()
++        .ok_or(LANES)?;
++    let (op, signed) = compare(cmp.name()).ok_or(COUNTER)?;
++    let Fields::Sop { src, .. } = &cmp.fields else {
++        return Err(COUNTER);
++    };
++    let [a, b] = src.as_slice() else {
++        return Err(COUNTER);
++    };
++    let (next, bound, swapped) = match (term(cmp, a).ok_or(COUNTER)?, term(cmp, b).ok_or(COUNTER)?)
++    {
++        (Err(v), Ok(k)) => (v, k, false),
++        (Ok(k), Err(v)) => (v, k, true),
++        (Err(x), Err(y)) => {
++            // The counter is the stepped one; the other side says why.
++            let mut other = if step(&defs, x).is_some() { y } else { x };
++            // (through copies)
++            while let Some(i) = defs.get(&other).filter(|i| i.name() == "s_mov_b32")
++                && let Fields::Sop { src, .. } = &i.fields
++                && let [s] = src.as_slice()
++                && let Some(Err(v)) = term(i, s)
++            {
++                other = v;
++            }
++            let read = defs
++                .get(&other)
++                .is_some_and(|i| matches!(i.fields, Fields::Smem { .. }));
++            let given = p.inputs.iter().any(|&(_, v)| v == other);
++            return Err(if read {
++                MEMORY
++            } else if given {
++                GIVEN
++            } else {
++                COMPUTED
++            });
++        }
++        (Ok(_), Ok(_)) => return Err(COUNTER),
++    };
++    let (phi, delta) = step(&defs, next).ok_or(COUNTER)?;
++    let phi = p.blocks[header]
++        .phis
++        .iter()
++        .find(|f| f.value == phi)
++        .ok_or(COUNTER)?;
++    let mut start = None;
++    for (&q, &arg) in preds.iter().zip(&phi.args) {
++        if !reachable(q) {
++            continue;
++        }
++        if q == latch {
++            if arg != next {
++                return Err(COUNTER);
++            }
++            continue;
++        }
++        let k = defs.get(&arg).and_then(|i| constant_move(i)).ok_or(START)?;
++        if start.replace(k).is_some_and(|s| s != k) {
++            return Err(START);
++        }
++    }
++    let mut x = start.ok_or(START)?;
++    for runs in 1..=LOOP_LIMIT {
++        x = x.wrapping_add(delta);
++        let (l, r) = if swapped { (bound, x) } else { (x, bound) };
++        if holds(op, signed, l, r) != go {
++            return Ok(runs);
++        }
++    }
++    Err(LONG)
++}
++
++/// The instruction writing each value.
++fn definitions(p: &Program) -> std::collections::HashMap<Value, &Inst> {
++    p.blocks
++        .iter()
++        .flat_map(|b| &b.insts)
++        .flat_map(|i| i.writes.iter().map(move |w| (w.1, i)))
++        .collect()
++}
++
++/// A one-dword scalar operand: its constant, or the value it reads.
++fn term(inst: &Inst, op: &Operand) -> Option<Result<u32, Value>> {
++    match *op {
++        Operand::Scalar { code: NULL, .. } => Some(Ok(0)),
++        Operand::Scalar { code, dwords: 1 } => inst.read(Reg::S(code)).map(Err),
++        Operand::Const(c) => crate::resource::inline(c).map(Ok),
++        Operand::Literal(x) => Some(Ok(x)),
++        _ => None,
++    }
++}
++
++/// `v` as a value stepped by a constant: the stepped value and the step.
++fn step(defs: &std::collections::HashMap<Value, &Inst>, v: Value) -> Option<(Value, u32)> {
++    let inst = defs.get(&v)?;
++    let Fields::Sop { src, .. } = &inst.fields else {
++        return None;
++    };
++    let [a, b] = src.as_slice() else { return None };
++    let (a, b) = (term(inst, a)?, term(inst, b)?);
++    match (inst.name(), a, b) {
++        ("s_add_i32" | "s_add_u32", Err(x), Ok(k)) | ("s_add_i32" | "s_add_u32", Ok(k), Err(x)) => {
++            Some((x, k))
++        }
++        ("s_sub_i32" | "s_sub_u32", Err(x), Ok(k)) => Some((x, k.wrapping_neg())),
++        _ => None,
++    }
++}
++
++/// The constant an `s_mov_b32` of one writes.
++fn constant_move(inst: &Inst) -> Option<u32> {
++    let Fields::Sop { src, .. } = &inst.fields else {
++        return None;
++    };
++    match (inst.name(), src.as_slice()) {
++        ("s_mov_b32", [k]) => term(inst, k)?.ok(),
++        _ => None,
++    }
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum Op {
++    Eq,
++    Ne,
++    Lt,
++    Le,
++    Gt,
++    Ge,
++}
++
++/// An `s_cmp_*` of dwords: the relation and whether it is signed.
++fn compare(name: &str) -> Option<(Op, bool)> {
++    let rest = name.strip_prefix("s_cmp_")?;
++    let (rel, ty) = rest.split_once('_')?;
++    let signed = match ty {
++        "i32" => true,
++        "u32" => false,
++        _ => return None,
++    };
++    let op = match rel {
++        "eq" => Op::Eq,
++        "lg" => Op::Ne,
++        "lt" => Op::Lt,
++        "le" => Op::Le,
++        "gt" => Op::Gt,
++        "ge" => Op::Ge,
++        _ => return None,
++    };
++    Some((op, signed))
++}
++
++fn holds(op: Op, signed: bool, l: u32, r: u32) -> bool {
++    let ord = if signed {
++        (l as i32).cmp(&(r as i32))
++    } else {
++        l.cmp(&r)
++    };
++    match op {
++        Op::Eq => ord.is_eq(),
++        Op::Ne => ord.is_ne(),
++        Op::Lt => ord.is_lt(),
++        Op::Le => ord.is_le(),
++        Op::Gt => ord.is_gt(),
++        Op::Ge => ord.is_ge(),
++    }
++}
++
++/// A loop that can be left at its cap.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct CappedLoop {
++    /// Byte offset of the loop header's first instruction.
++    pub offset: usize,
++    pub cap: u32,
++    /// Why the loop is not proven to stay under it.
++    pub why: &'static str,
++}
++
++/// The stage of `container`'s vertex, pixel, compute or mesh program and its
++/// loops that can be left at their cap (every loop but the counted ones
++/// under it, as [`cap`] decides for the translation; found on the program
++/// as built, before the translation's other forms of it).
++pub fn capped_loops(container: &[u8]) -> Result<(HwStage, Vec<CappedLoop>), ShaderError> {
++    let c = Container::parse(container)?;
++    let dxil = c
++        .part(FourCC::DXIL)
++        .ok_or(ShaderError::Malformed("no DXIL part"))?;
++    let native = crate::native_programs(dxil.data)?
++        .into_iter()
++        .find(|p| {
++            matches!(
++                p.stage,
++                HwStage::Vs | HwStage::Ps | HwStage::Cs | HwStage::Ms
++            )
++        })
++        .ok_or(ShaderError::Malformed(
++            "no vertex, pixel, compute or mesh program",
++        ))?;
++    let p = crate::spill::build(&native)?;
++    Ok((
++        native.stage,
++        capped_loops_of(&p, Class::of_stage(native.stage)),
++    ))
++}
++
++fn capped_loops_of(p: &Program, class: Class) -> Vec<CappedLoop> {
++    let mut rpo = vec![usize::MAX; p.blocks.len()];
++    for (n, b) in crate::ir::reverse_postorder(&p.blocks)
++        .into_iter()
++        .enumerate()
++    {
++        rpo[b] = n;
++    }
++    let traces = p
++        .blocks
++        .iter()
++        .any(|b| b.insts.iter().any(|i| i.name().starts_with("image_bvh")));
++    let mut out = Vec::new();
++    for (h, block) in p.blocks.iter().enumerate() {
++        for &q in block
++            .preds
++            .iter()
++            .filter(|&&q| rpo[h] != usize::MAX && rpo[q] != usize::MAX && rpo[h] <= rpo[q])
++        {
++            if let (cap, Some(why)) = cap(p, &rpo, h, q, class, traces) {
++                out.push(CappedLoop {
++                    offset: block.offset,
++                    cap,
++                    why,
++                });
++            }
++        }
++    }
++    out.sort_by_key(|l| l.offset);
++    out
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use crate::native::{ComputeIo, NativeProgram, RootParam, StageIo};
++    use crate::{ResourceType, RootType, UsedResource, io, ir, resource, structure};
++
++    /// A wave64 compute program counting s2 from 0 by 1 while it differs
++    /// from `bound` (`s_cmp_lg_u32 s2, <bound>`: a 32-bit literal, or s4, a
++    /// copy of the group id), adding 1 to v1 each time, then storing v1.
++    fn counting(bound: Option<u32>) -> NativeProgram {
++        // s_mov_b32 s4, s1; s_mov_b32 s1, 0; s_load_dwordx4 s[8:11], s[0:1], 0;
++        // s_mov_b32 s2, 0; v_mov_b32 v1, 0
++        let mut words = vec![
++            0xBE84_0301,
++            0xBE81_0380,
++            0xF408_0200,
++            0xFA00_0000,
++            0xBE82_0380,
++            0x7E02_0280,
++        ];
++        // v_add_nc_u32 v1, 1, v1; s_add_i32 s2, s2, 1
++        words.extend_from_slice(&[0x4A02_0281, 0x8102_8102]);
++        match bound {
++            // s_cmp_lg_u32 s2, lit; s_cbranch_scc1 (to the v_add)
++            Some(k) => words.extend_from_slice(&[0xBF07_FF02, k, 0xBF85_FFFB]),
++            // s_cmp_lg_u32 s2, s4; s_cbranch_scc1
++            None => words.extend_from_slice(&[0xBF07_0402, 0xBF85_FFFC]),
++        }
++        // v_lshlrev_b32 v3, 2, v0; buffer_store_dword v1, v3, s[8:11], 0 offen; s_endpgm
++        words.extend_from_slice(&[0x3406_0082, 0xE070_1000, 0x8002_0103, 0xBF81_0000]);
++        NativeProgram {
++            stage: HwStage::Cs,
++            wave64: true,
++            vgprs: 4,
++            layout: vec![RootParam {
++                root: RootType::Table,
++                table_offset_dwords: 0,
++                sgprs: 1,
++                base_register: 0,
++                user_data: 0,
++                slot: 0,
++            }],
++            used: vec![UsedResource {
++                kind: ResourceType::Uav,
++                root: RootType::Table,
++                table_offset_dwords: 0,
++                lower_bound: 0,
++                stride: 0,
++                dwords: 4,
++                user_data: 0,
++                slot: 0,
++            }],
++            io: StageIo::Cs(ComputeIo {
++                // one user SGPR, then the group id x (s1)
++                rsrc2: 2 | 1 << 7,
++                threads: [64, 1, 1],
++            }),
++            code: words.iter().flat_map(|w| w.to_le_bytes()).collect(),
++        }
++    }
++
++    /// The caps the translation of `native` emits, with `limits` as the
++    /// stage caps.
++    fn emitted_caps(native: &NativeProgram, limits: StageLimits) -> Vec<u32> {
++        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
++        let res = resource::track(&p, &native.layout, native.stage, None).unwrap();
++        let io = io::raise(&p, native).unwrap();
++        let st = structure::structure(&p).unwrap();
++        let container = crate::dxbc::build(&[]);
++        let c = Container::parse(&container).unwrap();
++        TEST_LIMITS.with(|t| t.set(Some(limits)));
++        CHOSEN.with(|c| c.borrow_mut().clear());
++        let r = super::super::emit(&c, native, &p, &st, &io, &res);
++        TEST_LIMITS.with(|t| t.set(None));
++        r.unwrap();
++        let mut chosen = CHOSEN.with(|c| c.take());
++        assert!(!chosen.is_empty(), "no loop counted");
++        // (one per form the translation tried)
++        chosen.dedup();
++        chosen
++    }
++
++    /// The loop's cap as `cap_with` decides it for `class`.
++    fn cap_of(
++        native: &NativeProgram,
++        class: Class,
++        traces: bool,
++        limits: StageLimits,
++    ) -> (u32, Option<&'static str>) {
++        let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
++        let mut rpo = vec![usize::MAX; p.blocks.len()];
++        for (n, b) in crate::ir::reverse_postorder(&p.blocks)
++            .into_iter()
++            .enumerate()
++        {
++            rpo[b] = n;
++        }
++        let (h, q) = (0..p.blocks.len())
++            .flat_map(|h| p.blocks[h].preds.iter().map(move |&q| (h, q)))
++            .find(|&(h, q)| rpo[h] <= rpo[q])
++            .expect("a loop");
++        cap_with(&p, &rpo, h, q, class, traces, LOOP_LIMIT, limits)
++    }
++
++    /// A counted loop of 10,000 runs was cut at 4,096 in compute; now it
++    /// gets the compute cap, and one of 100,000 its own bound.
++    #[test]
++    fn a_counted_loop_is_not_cut_short() {
++        let d = StageLimits::DEFAULT;
++        assert_eq!(emitted_caps(&counting(Some(10_000)), d), [COMPUTE_DEFAULT]);
++        assert_eq!(emitted_caps(&counting(Some(100_000)), d), [100_000]);
++        assert_eq!(
++            cap_of(&counting(Some(100_000)), Class::Compute, false, d),
++            (100_000, None)
++        );
++        // (a pixel or geometry one too: its bound, over the stage cap)
++        assert_eq!(
++            cap_of(&counting(Some(1000)), Class::Pixel, false, d),
++            (1000, None)
++        );
++        assert_eq!(
++            cap_of(&counting(Some(1000)), Class::Geometry, false, d),
++            (1000, None)
++        );
++        // Past 2^20 runs (here 2^32, wrapping) it is not proven.
++        assert_eq!(
++            cap_of(&counting(Some(0)), Class::Compute, false, d),
++            (COMPUTE_DEFAULT, Some(LONG))
++        );
++    }
++
++    /// A bound the translation cannot see (here the group id): the compute
++    /// cap, 65,536.
++    #[test]
++    fn an_unbounded_compute_loop_gets_the_compute_cap() {
++        let d = StageLimits::DEFAULT;
++        assert_eq!(emitted_caps(&counting(None), d), [COMPUTE_DEFAULT]);
++        assert_eq!(
++            cap_of(&counting(None), Class::Compute, false, d),
++            (COMPUTE_DEFAULT, Some(GIVEN))
++        );
++    }
++
++    /// A program walking ray-tracing trees keeps 1,024, whatever the compute
++    /// switch says.
++    #[test]
++    fn a_ray_walk_keeps_its_cap() {
++        let mut limits = StageLimits::DEFAULT;
++        assert_eq!(
++            cap_of(&counting(None), Class::Compute, true, limits).0,
++            TRACE_LOOP_LIMIT
++        );
++        limits.compute = 1 << 20;
++        assert_eq!(
++            cap_of(&counting(None), Class::Compute, true, limits).0,
++            TRACE_LOOP_LIMIT
++        );
++        assert_eq!(TRACE_LOOP_LIMIT, 1024);
++    }
++
++    /// The stage switches' values are what the translation emits.
++    #[test]
++    fn the_stage_switches_change_the_emitted_cap() {
++        let limits = StageLimits {
++            pixel: 100,
++            geometry: 200,
++            compute: 5000,
++        };
++        assert_eq!(emitted_caps(&counting(None), limits), [5000]);
++        assert_eq!(cap_of(&counting(None), Class::Pixel, false, limits).0, 100);
++        assert_eq!(
++            cap_of(&counting(None), Class::Geometry, false, limits).0,
++            200
++        );
++        // (the old ones without the switches)
++        let d = StageLimits::DEFAULT;
++        assert_eq!(cap_of(&counting(None), Class::Pixel, false, d).0, 128);
++        assert_eq!(cap_of(&counting(None), Class::Geometry, false, d).0, 256);
++    }
++
++    /// The switches are in the shader cache's key: their names in the
++    /// switch list (each one's value goes into the fingerprint), the caps
++    /// in effect too.
++    #[test]
++    fn the_fingerprint_keys_on_the_cap_switches() {
++        let names: Vec<&str> = env!("VICTORY_SHADER_SWITCHES").split(',').collect();
++        for name in [
++            "VICTORY_LOOP_LIMIT_COMPUTE",
++            "VICTORY_LOOP_LIMIT_PIXEL",
++            "VICTORY_LOOP_LIMIT_GEOMETRY",
++            "VICTORY_SHADER_LOOP_LIMIT",
++        ] {
++            assert!(names.contains(&name), "{name}");
++        }
++        // (read before the switch is set, so no test takes it for its cap)
++        let _ = stage_limits();
++        let before = super::super::translation_fingerprint();
++        // SAFETY: nothing in this crate reads the variable after
++        // `stage_limits` has (above); Windows' environment calls are
++        // thread-safe.
++        unsafe { std::env::set_var("VICTORY_LOOP_LIMIT_COMPUTE", "12345") };
++        let set = super::super::translation_fingerprint();
++        unsafe { std::env::remove_var("VICTORY_LOOP_LIMIT_COMPUTE") };
++        assert_ne!(before, set);
++        assert_eq!(before, super::super::translation_fingerprint());
++    }
++
++    /// The log's list: a counted loop under its cap is left out.
++    #[test]
++    fn capped_loops_leaves_out_the_counted_ones() {
++        let loops = |native: &NativeProgram| {
++            let p = ir::build(&native.patched_code(), native.wave64, native.vgprs).unwrap();
++            capped_loops_of(&p, Class::Compute)
++        };
++        TEST_LIMITS.with(|t| t.set(Some(StageLimits::DEFAULT)));
++        let (counted, given) = (loops(&counting(Some(100))), loops(&counting(None)));
++        TEST_LIMITS.with(|t| t.set(None));
++        assert!(counted.is_empty(), "{counted:?}");
++        assert_eq!(
++            given,
++            [CappedLoop {
++                offset: 0x18,
++                cap: COMPUTE_DEFAULT,
++                why: GIVEN,
++            }]
++        );
++    }
++
++    #[test]
++    fn the_stage_switches_parse_clamp_or_fall_back() {
++        assert_eq!(parse_cap(None, 7), 7);
++        assert_eq!(parse_cap(Some("1000000"), 7), 1_000_000);
++        assert_eq!(parse_cap(Some(" 0x10000 "), 7), 1 << 16);
++        assert_eq!(parse_cap(Some("1"), 7), MIN_CAP);
++        assert_eq!(parse_cap(Some("4294967295"), 7), LOOP_LIMIT);
++        for bad in ["", "0", "-5", "lots", "0x", "4294967296"] {
++            assert_eq!(parse_cap(Some(bad), 7), 7, "{bad:?}");
++        }
++    }
++
++    #[test]
++    fn compares_hold_as_the_console_evaluates_them() {
++        assert_eq!(compare("s_cmp_lg_u32"), Some((Op::Ne, false)));
++        assert_eq!(compare("s_cmp_ge_i32"), Some((Op::Ge, true)));
++        assert_eq!(compare("s_cmp_eq_u64"), None);
++        assert!(holds(Op::Lt, true, u32::MAX, 0));
++        assert!(!holds(Op::Lt, false, u32::MAX, 0));
++    }
++}

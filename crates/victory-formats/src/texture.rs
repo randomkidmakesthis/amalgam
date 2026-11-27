@@ -639,7 +639,24 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk::<true>(tiled, linear, mip, slice, row_pitch, depth_pitch)
+        self.walk::<true>(tiled, linear, mip, slice, row_pitch, depth_pitch, None)
+    }
+
+    /// [`Layout::detile`] of rows `rows` only, of a subresource one slice
+    /// deep (a 2D mip of one array slice): `linear` starts at row
+    /// `rows.start`. The bands of a subresource can so be detiled apart,
+    /// on several threads, into disjoint parts of its rows, byte for byte
+    /// as the whole detile writes them.
+    pub fn detile_rows(
+        &self,
+        tiled: &[u8],
+        mip: u32,
+        slice: u32,
+        linear: &mut [u8],
+        row_pitch: usize,
+        rows: std::ops::Range<u32>,
+    ) -> Result<(), Error> {
+        self.walk::<true>(tiled, linear, mip, slice, row_pitch, 0, Some(rows))
     }
 
     /// The reverse of [`Layout::detile`]: linear rows into tiled memory.
@@ -652,10 +669,12 @@ impl Layout {
         row_pitch: usize,
         depth_pitch: usize,
     ) -> Result<(), Error> {
-        self.walk::<false>(linear, tiled, mip, slice, row_pitch, depth_pitch)
+        self.walk::<false>(linear, tiled, mip, slice, row_pitch, depth_pitch, None)
     }
 
-    /// Copies contiguous runs in one direction between the two layouts.
+    /// Copies contiguous runs in one direction between the two layouts;
+    /// with `band`, only those rows of a subresource one slice deep, linear
+    /// offsets counted from the band's first row.
     #[allow(clippy::too_many_arguments)]
     fn walk<const DETILE: bool>(
         &self,
@@ -665,9 +684,14 @@ impl Layout {
         slice: u32,
         row_pitch: usize,
         depth_pitch: usize,
+        band: Option<std::ops::Range<u32>>,
     ) -> Result<(), Error> {
         let m = self.mips.get(mip as usize).ok_or(Error::Invalid)?;
         let depth = m.depth;
+        let rows = band.clone().unwrap_or(0..m.height);
+        if band.is_some() && (depth != 1 || rows.start >= rows.end || rows.end > m.height) {
+            return Err(Error::Invalid);
+        }
         let first = if self.desc.dimension == Dimension::Tex3d {
             if slice != 0 {
                 return Err(Error::Invalid);
@@ -684,7 +708,8 @@ impl Layout {
         }
         let n = self.desc.element_bytes as usize;
         let bytes = m.width as usize * n;
-        let slice_bytes = (m.height as usize - 1)
+        // (with a band: its rows only)
+        let slice_bytes = (rows.len().max(1) - 1)
             .checked_mul(row_pitch)
             .and_then(|offset| offset.checked_add(bytes))
             .ok_or(Error::TooSmall)?;
@@ -735,8 +760,8 @@ impl Layout {
         for z in 0..depth {
             let (s, inner) = self.split(first + z);
             let base = u64::from(s) * self.slice_size + m.offset;
-            for y in 0..m.height {
-                let linear_row = z as usize * depth_pitch + y as usize * row_pitch;
+            for y in rows.clone() {
+                let linear_row = z as usize * depth_pitch + (y - rows.start) as usize * row_pitch;
                 if linear {
                     let tiled_row = base + u64::from(y) * u64::from(m.pitch) * n as u64;
                     copy_run::<DETILE>(src, dst, tiled_row as usize, linear_row, bytes);
@@ -1509,5 +1534,77 @@ mod tests {
             Err(Error::TooSmall)
         );
         assert_eq!(l.offset(0, 64, 0, 0), Err(Error::Invalid));
+    }
+
+    /// Detiling a subresource band by band gives the rows the whole
+    /// detile gives, whatever the bands: in every mode the layout can
+    /// address, every mip and slice, with block compression, 16-byte
+    /// elements and odd sizes (Trexies 58c7bb0, over all modes here).
+    #[test]
+    fn bands_detile_as_the_whole() {
+        let modes: Vec<Swizzle> = (0..32).map(Swizzle).filter(|s| s.block_log2().is_some()).collect();
+        let (mut addressed, mut seen) = (0, std::collections::BTreeSet::new());
+        for swizzle in modes {
+            let mut bc = desc(200, 136, 6, 16, swizzle);
+            bc.block = 4;
+            let mut array = desc(96, 70, 3, 8, swizzle);
+            array.depth = 3;
+            let cases = [
+                desc(300, 190, 5, 4, swizzle),
+                desc(64, 64, 7, 16, swizzle),
+                desc(130, 3, 2, 2, swizzle),
+                desc(77, 41, 4, 1, swizzle),
+                bc,
+                array,
+            ];
+            for d in cases {
+                let Ok(l) = Layout::new(&d) else {
+                    continue;
+                };
+                if !l.addressable() {
+                    continue;
+                }
+                addressed += 1;
+                seen.insert(swizzle.0);
+                let tiled: Vec<u8> = (0..l.size as usize).map(|i| (i * 131 + i / 7) as u8).collect();
+                for slice in 0..d.depth {
+                    for mip in 0..d.mips {
+                        let m = &l.mips[mip as usize];
+                        let pitch = (m.width * d.element_bytes) as usize + 12;
+                        let size = pitch * m.height as usize;
+                        let mut whole = vec![0x5Au8; size];
+                        l.detile(&tiled, mip, slice, &mut whole, pitch, size).unwrap();
+                        for band in [1u32, 2, 5, m.height] {
+                            let mut banded = vec![0x5Au8; size];
+                            let mut y = 0;
+                            while y < m.height {
+                                let end = (y + band).min(m.height);
+                                let part = &mut banded[y as usize * pitch..end as usize * pitch];
+                                l.detile_rows(&tiled, mip, slice, part, pitch, y..end).unwrap();
+                                y = end;
+                            }
+                            assert_eq!(banded, whole, "{d:?} slice {slice} mip {mip} bands of {band}");
+                        }
+                    }
+                }
+            }
+        }
+        println!("{addressed} layouts addressed: {seen:?}");
+        assert!(addressed >= 40, "only {addressed} layouts addressable");
+        // Rows outside the mip, an empty band, too short a buffer, a 3D
+        // subresource: refused.
+        let l = Layout::new(&desc(64, 64, 2, 4, Swizzle::SW_64KB_S)).unwrap();
+        let tiled = vec![0u8; l.size as usize];
+        let mut row = vec![0u8; 256];
+        assert_eq!(l.detile_rows(&tiled, 0, 0, &mut row, 256, 63..65), Err(Error::Invalid));
+        assert_eq!(l.detile_rows(&tiled, 0, 0, &mut row, 256, 3..3), Err(Error::Invalid));
+        assert_eq!(l.detile_rows(&tiled, 0, 0, &mut row[..255], 256, 0..1), Err(Error::TooSmall));
+        let mut thick = desc(32, 32, 1, 4, Swizzle::SW_64KB_S);
+        thick.dimension = Dimension::Tex3d;
+        thick.depth = 4;
+        let l = Layout::new(&thick).unwrap();
+        let tiled = vec![0u8; l.size as usize];
+        let mut rows = vec![0u8; 32 * 4 * 32];
+        assert_eq!(l.detile_rows(&tiled, 0, 0, &mut rows, 128, 0..32), Err(Error::Invalid));
     }
 }
