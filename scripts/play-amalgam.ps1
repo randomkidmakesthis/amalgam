@@ -102,7 +102,11 @@ if ($Dlss -ne 'off') {
 }
 if ($Fps -gt 0) { $settings.VICTORY_FRAME_INTERVAL_US = [string][int][math]::Round(1000000 / $Fps) }
 
-# The single-home buffer experiment.
+# The single-home buffer experiment. It is a direct-memory mode: the relay and
+# the late waits are turned off too (VICTORY_RELAY, VICTORY_RELAY_COPY removed),
+# because with flights in the air a home the card read before a landing holds
+# older bytes -- the reference memory core refuses the same combination. Pass
+# -More @{VICTORY_RELAY='2';VICTORY_INPLACE_RELAY='1'} to override knowingly.
 switch ($OneHome) {
     'small' {
         $settings.VICTORY_INPLACE = '1'; $settings.VICTORY_INPLACE_MB = "$InPlaceMb"
@@ -116,6 +120,10 @@ switch ($OneHome) {
         $settings.VICTORY_INPLACE = '2'; $settings.VICTORY_INPLACE_MB = "$InPlaceMb"
         $settings.VICTORY_WC_BAR = '1'; $settings.VICTORY_WINDOWS_BAR_MB = '2048'
     }
+}
+if ($OneHome -ne 'off' -and -not $More.ContainsKey('VICTORY_RELAY')) {
+    $settings.Remove('VICTORY_RELAY')
+    $settings.Remove('VICTORY_RELAY_COPY')
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
 # Unattended runs: <seconds>:<key> presses (0.2 s each), <from>-<to>:<key> holds.

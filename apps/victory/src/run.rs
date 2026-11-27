@@ -287,6 +287,16 @@ pub fn run(
     victory_hle::runtime::set_title_dll_loader(Box::new(move |file| {
         late.load(file, show).map_err(|e| format!("{e:#}"))
     }));
+    // The host GPU before any title code: the driver's time then does not
+    // count against the title's own start watchdog (VICTORY_HOST_EARLY).
+    #[cfg(windows)]
+    if let Some((made, took)) = victory_hle::modules::d3d12x::make_host_gpu_early() {
+        println!(
+            "host GPU       {} in {} ms (VICTORY_HOST_EARLY)",
+            if made { "made" } else { "not made" },
+            took.as_millis()
+        );
+    }
     // SAFETY: imports are bound; from here on we run title code.
     let main = unsafe { Arc::new(image).spawn_main(dlls)? };
     let code = main

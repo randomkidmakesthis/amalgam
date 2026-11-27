@@ -853,6 +853,23 @@ pub(crate) fn host() -> Option<&'static Host> {
     .as_ref()
 }
 
+/// Whether the runtime makes the host GPU before the title runs
+/// (`VICTORY_HOST_EARLY`, on unless `0`) instead of at the title's first
+/// command list. Made inside the title's start, the time the driver takes
+/// counts against the title's own watchdog, which ends the title (a write to
+/// address 0) when its start makes no progress for about 30 s; the driver
+/// alone can take that long (AMD's driver reads its whole on-disk pipeline
+/// cache first; runs whose cache had grown to a few GB took 5 to 10 s, over
+/// 30 s when those files came from the disk again).
+pub fn early() -> bool {
+    std::env::var_os("VICTORY_HOST_EARLY").is_none_or(|v| v != "0")
+}
+
+/// Makes the host GPU now if it is not made yet; whether there is one.
+pub fn prepare() -> bool {
+    host().is_some()
+}
+
 fn create() -> windows::core::Result<Host> {
     // SAFETY: plain D3D12 object creation with valid descriptions.
     unsafe {

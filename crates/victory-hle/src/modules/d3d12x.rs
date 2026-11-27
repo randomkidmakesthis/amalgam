@@ -79,6 +79,21 @@ pub fn use_shader_cache(dir: std::path::PathBuf) {
     let _ = dir;
 }
 
+/// Makes the host GPU now, before any title code runs, unless
+/// `VICTORY_HOST_EARLY=0` (then it is made at the title's first command
+/// list): whether there is one and how long making it took. Made inside the
+/// title's start, the driver's time counts against the title's own watchdog
+/// (`victory_gpu::host_early`).
+pub fn make_host_gpu_early() -> Option<(bool, std::time::Duration)> {
+    #[cfg(windows)]
+    if victory_gpu::host_early() {
+        let began = std::time::Instant::now();
+        let made = victory_gpu::prepare_host();
+        return Some((made, began.elapsed()));
+    }
+    None
+}
+
 pub(crate) fn module() -> HleModule {
     HleModule {
         name: "d3d12x",

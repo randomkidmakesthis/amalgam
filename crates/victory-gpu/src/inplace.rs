@@ -101,7 +101,7 @@ fn most() -> u64 {
 /// then, since the start: asks turned down because the memory is a view
 /// or not private memory committed whole, because the host refused,
 /// because of [`most`]; and what was let go because its memory changed.
-static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
+static STATS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
 
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
@@ -141,11 +141,26 @@ fn place_textures() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_TEXTURES").is_some_and(|v| v == "1"))
 }
 
+/// `VICTORY_INPLACE_RELAY=1` (off by default): homes are given even while the
+/// relay or the late waits are on. Refused otherwise, as the reference memory
+/// core does: with flights in the air, shader writes reach title memory at
+/// landings, and a home the card read before a landing holds older bytes.
+fn place_with_relay() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_RELAY").is_some_and(|v| v == "1"))
+}
+
 /// Title memory `[start, start + len)` in place, for a window outside
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     if level() < if window { 1 } else { 2 } {
+        return None;
+    }
+    // The relay and the late waits hold shader writes in flights; a home read
+    // before a landing would be stale ([`place_with_relay`]).
+    if !place_with_relay() && (crate::host::relay() || crate::host::late()) {
+        STATS[9].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     // View memory: known from the runtime without asking Windows.
@@ -226,7 +241,8 @@ fn say() {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
         "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
-         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed; {} windows kept as copies because a descriptor slot shows them as texture memory (VICTORY_INPLACE_TEXTURES=1 places those too)",
+         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed; {} windows kept as copies because a descriptor slot shows them as texture memory (VICTORY_INPLACE_TEXTURES=1 places those too); \
+         {} asked while the relay or late waits are on (VICTORY_INPLACE_RELAY=1 places then)",
         s[0],
         s[1] >> 20,
         s[2],
@@ -235,7 +251,8 @@ fn say() {
         s[5],
         s[6],
         s[7],
-        s[8]
+        s[8],
+        s[9]
     );
 }
 
