@@ -29,15 +29,28 @@ the tree merged file-for-file and the rest was integrated by hand:
   `VICTORY_FRAMEGEN`), the 1440p image patches (`VICTORY_NATIVE_1440P`),
   the ambient / reflection stand-ins (`VICTORY_AMBIENT`,
   `VICTORY_AMBIENT_SPECULAR`), early depth, soft views
-  (`VICTORY_SOFT_VIEWS=copies`), the scripted auto-input system, the
+  (`VICTORY_SOFT_VIEWS=copies`), levels-on-demand off
+  (`VICTORY_LEVELS_ON_DEMAND=0`), the scripted auto-input system, the
   `asked_for!` switch framework with `VICTORY_AB` diagnostics.
-- **scarlett side kept:** the read-back and lock hooks
-  (`VICTORY_READBACK_*`, `VICTORY_LOCK_METER`), the load meter, the chunk
-  meter, the page-kinds and known-writes hook infrastructure
-  (`VICTORY_GPU_ONLY`, `VICTORY_KNOWN_WRITES`, off by default), the
-  symbolizer, the NaN-origin listing (`VICTORY_NAN_ORIGIN`), banded
-  detiling (`Layout::detile_rows`), and the `Play-Scarlett.cmd` launcher
-  with shader pre-compilation.
+- **scarlett side kept:** the shader pre-compile launcher
+  (`Play-Scarlett.cmd` / `scripts/play-scarlett.ps1`), banded detiling
+  (`Layout::detile_rows`), the NaN-origin listing (`VICTORY_NAN_ORIGIN`),
+  the stack symbolizer, and its full `tools/` measurement suite and docs.
+- **scarlett hook/diagnostics modules carried in the tree but not yet wired**
+  (they target scarlett's private internals and were not safe by scarlett's
+  own measure): `shell`, `loadmeter`, `hangwatch`, `lockmeter`,
+  `knownwrites`, `pagekinds`, `hlehooks`, `chunks`, `copystep`, and the hle
+  side `readback`, `chunkmeter`, `lockhook`, `callhook`,
+  `modules/{mapdefer,pagekinds}`.
+- **scarlett's per-switch GPU optimisations still to port** (they sit in
+  files both forks restructured independently): `VICTORY_TABLE_MEMO`,
+  `VICTORY_LIST_ALIAS_EXACT`, `VICTORY_LIST_HOLD`,
+  `VICTORY_TABLE_NAMED_ONLY`, `VICTORY_PROBE_RAYS`, `VICTORY_PLANE_NOW`,
+  `VICTORY_SAMPLERS_MADE`, `VICTORY_TARGET_VARIANTS`, `VICTORY_HALF_VIEWS`,
+  `VICTORY_D16_BITS`, `VICTORY_NAN_GUARD`, `VICTORY_POOL_DISCARD`,
+  `VICTORY_MAP_LOCK_FINE`, `VICTORY_POOL_CAP`. Each is a focused patch
+  against the corresponding scarlett commit; `tools/docs/fox-port-*.md`
+  lists them.
 
 Both launchers are present:
 
