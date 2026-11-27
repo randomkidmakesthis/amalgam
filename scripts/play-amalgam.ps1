@@ -36,6 +36,11 @@ param(
     [switch]$FrameGen,
     [ValidateRange(1, 1000)][int]$Fps = 0,
     [ValidateSet('off', 'small', 'buffers', 'both')][string]$OneHome = 'off',
+    # Renderer port #6's fault half: write faults open their block without the
+    # guards' lock (the next holder settles it). Off by default: turning it on
+    # in the amalgam preset made textures shimmy on the test PC (2026-11-27),
+    # so it is A/B-only until the refresh side is understood.
+    [ValidateSet('on', 'off')][string]$FaultUnlocked = 'off',
     # With -OneHome: place windows that descriptor slots show as texture memory
     # too. Their placed copies are made due again after the card writes the
     # home (the reference's after-wait rule), two frames on.
@@ -79,8 +84,7 @@ $settings = @{
     # guards' lock (the block's bit and the protection change; the next holder
     # of the lock settles it). 510 faults a frame waited 48 ms for that lock
     # without it on the test PC.
-    VICTORY_FAULT_UNLOCKED = '1'
-    # Victory-Royale: 1 MiB+ buffer copies compared on the card; no address-space walk per memory line
+    VICTORY_FAULT_UNLOCKED = '1'    # Victory-Royale: 1 MiB+ buffer copies compared on the card; no address-space walk per memory line
     VICTORY_CARD_BUFFERS_MIN_MB = '1'; VICTORY_MEMORY_MAP = '0'
 }
 # Victory-Royale's 8-core tuning: thread counts the pools are sized from.
@@ -130,6 +134,7 @@ switch ($OneHome) {
         $settings.VICTORY_WC_BAR = '1'; $settings.VICTORY_WINDOWS_BAR_MB = '2048'
     }
 }
+if ($FaultUnlocked -eq 'off') { $settings.Remove('VICTORY_FAULT_UNLOCKED') }
 if ($OneHomeTextures -and $OneHome -ne 'off') {
     $settings.VICTORY_INPLACE_TEXTURES = '1'
     Write-Host 'one-home: texture windows placed too (placed copies re-uploaded after card writes)'
