@@ -124,6 +124,35 @@ placement book and adding the placed-texture invalidation to
 `descriptor/host.rs` (`placed_texture`) + `texture.rs` refresh. It is a
 multi-day port, not a copy.
 
+## Measured on the test PC (2026-11-27, Series S, RX 9060 XT / Ryzen 7 5700X3D)
+
+| Config | median ms | fps | draws | notes |
+|---|---|---|---|---|
+| `-OneHome off` (relay on) | 54.1 | 18.5 | 5,637 | smoke run; clean state |
+| `-OneHome off` after ~25 min of runs | 665 | 1.5 | 5,225 | 86 ms of it on the GPU: the card throttles under sustained load |
+| `-OneHome buffers` (homes, relay off) | 128-132 | 7.6-7.8 | 5,1-5,3 k | homes placed (75 windows, 356 MB), no errors |
+| `-OneHome small` (homes, relay off) | 212-303 | 3.3-4.7 | 5,0-5,4 k | 195 ms of preparing on the submitting thread in one block |
+
+Conclusions:
+
+- **The relay is worth ~2× on this PC.** Homes require it off (the reference's
+  rule, enforced here by `VICTORY_INPLACE_RELAY`), so the trade is direct
+  memory *instead of* late landings — and it loses badly at this stage.
+- Back-to-back runs are **thermally confounded**: the same config goes from
+  0 ms on the GPU to 86 ms after ~25 minutes of continuous load. Only short
+  blocks after a cooldown are comparable.
+- `VICTORY_HOST_EARLY` makes the host GPU in **384 ms** on this PC before any
+  title code (logged), so a slow driver cannot trip the title's start watchdog.
+- `VICTORY_INPLACE_TEXTURES=0` (default) plus the after-wait invalidation keep
+  the texture paths safe; with textures placed explicitly, no window was
+  refused and no errors appeared, but the mode remains relay-off and slow.
+
+For comparison, the Victory-Royale low-VRAM + FSR + FrameGen preset on the same
+PC measured 22.3 fps / 41.1 ms at 3,184 draws (different scene, different draw
+count; one later frame-gen run hit a device removal). Not apples to apples, but
+it confirms that the Avatarmanz-lineage port patches (DESCRIPTORS/GUARD/JOURNAL)
+are where the remaining CPU win is, not in the homes.
+
 
 ## Build
 
