@@ -46,11 +46,13 @@ the tree merged file-for-file and the rest was integrated by hand:
   files both forks restructured independently): `VICTORY_TABLE_MEMO`,
   `VICTORY_LIST_ALIAS_EXACT`, `VICTORY_LIST_HOLD`,
   `VICTORY_TABLE_NAMED_ONLY`, `VICTORY_PROBE_RAYS`, `VICTORY_PLANE_NOW`,
-  `VICTORY_SAMPLERS_MADE`, `VICTORY_TARGET_VARIANTS`, `VICTORY_HALF_VIEWS`,
+  `VICTORY_SAMPLERS_MADE` (already equivalent: foxhound's default-on
+  static-sampler handling), `VICTORY_TARGET_VARIANTS`, `VICTORY_HALF_VIEWS`,
   `VICTORY_D16_BITS`, `VICTORY_NAN_GUARD`, `VICTORY_POOL_DISCARD`,
   `VICTORY_MAP_LOCK_FINE`, `VICTORY_POOL_CAP`. Each is a focused patch
-  against the corresponding scarlett commit; `tools/docs/fox-port-*.md`
-  lists them.
+  against the corresponding scarlett commit; the mechanical port plan
+  (order, files, anchors, verification) is in
+  [docs/merge-status.md](docs/merge-status.md).
 
 Both launchers are present:
 
