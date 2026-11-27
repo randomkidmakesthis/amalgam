@@ -75,6 +75,11 @@ $settings = @{
     VICTORY_PIPELINE_BOOK = '1'
     # From hle-d3d12-7900xtx: ask once for the next submission's images, not twice
     VICTORY_ASK_EARLY = '2'
+    # Renderer port #6's fault half, our fork's form: a write fault takes no
+    # guards' lock (the block's bit and the protection change; the next holder
+    # of the lock settles it). 510 faults a frame waited 48 ms for that lock
+    # without it on the test PC.
+    VICTORY_FAULT_UNLOCKED = '1'
     # Victory-Royale: 1 MiB+ buffer copies compared on the card; no address-space walk per memory line
     VICTORY_CARD_BUFFERS_MIN_MB = '1'; VICTORY_MEMORY_MAP = '0'
 }
@@ -87,7 +92,7 @@ if ($Safe) {
     # The first thing to try when something is wrong: no thin lists, no relay, no on-card steps.
     foreach ($k in @('VICTORY_THIN', 'VICTORY_RELAY', 'VICTORY_RELAY_COPY', 'VICTORY_CARD_STEPS',
                      'VICTORY_JOIN_COPIES', 'VICTORY_INDIRECT_WINDOW', 'VICTORY_INDIRECT_BATCH',
-                     'VICTORY_ASK_EARLY', 'VICTORY_WC_NO_BACK')) {
+                     'VICTORY_ASK_EARLY', 'VICTORY_WC_NO_BACK', 'VICTORY_FAULT_UNLOCKED')) {
         $settings.Remove($k)
     }
 }

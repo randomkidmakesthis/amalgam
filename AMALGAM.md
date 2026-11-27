@@ -73,6 +73,23 @@ Measure with `-Log` and any frame-summary tool: the core logs
   `play-foxhound.ps1` (DLSS is NVIDIA-only; on AMD it runs without).
 - `-Cache`/`-Data` or `victory.toml` decide where cache and saves live.
 
+## Renderer port patches: where each stands
+
+The four Avatarmanz-lineage patches (Victory-Royale / Dark / hle) and what they
+are here. Their numbering is the one the forks use.
+
+| Patch | State here | Why |
+|---|---|---|
+| #1 `VICTORY_PORT_CONSTANTS` | **present** | our tree already carries the same `port.rs` renderer-port-1 module (the 174 MB constants heap read where the title writes it) |
+| #2 `VICTORY_PORT_DESCRIPTORS` | **not ported** | needs the loader's descriptor-store site hooks (`victory-loader/src/descriptor_sites.rs`, 456 lines of v1.0.2.1 call-site patterns) plus `port_descriptors.rs` (477 lines) to replace the heap pass's scan of ~600 k slots (31.7 ms/frame in our logs). Our core has the cheaper bookkeeping (`VICTORY_SPANS_QUICK`, heap records read in place, `VICTORY_TABLED_REREAD`) but still scans. |
+| #5 `VICTORY_PORT_CBV` | **not ported** | changes shader translation (`victory_shader::emit::constants_raw`) so constant buffers are read as raw bytes, plus the draw/descriptor side that makes raw twins and in-place root SRVs. A translation change: every pipeline is made again. |
+| #6 `VICTORY_PORT_GUARD` | **fault half present as `VICTORY_FAULT_UNLOCKED=1`**, now on in `play-amalgam.ps1`; refresh-shared half on the branch `port-guard-wip` | our fork already has the lock-free fault path (block bit + protection change; the next holder of the guards' lock settles it — the same rule as their port #6). It was off by default: 510 faults a frame waited 48 ms for the guards' lock in the one-home log. The refresh-shared/lock-splitting half is built structurally (Guards in `RwLock`, `Blocks` on the atomic `Bits`, `opened` behind its own lock) but inert, because without the shared refresh paths the atomics make the exclusive path slower. |
+| #7 `VICTORY_PORT_JOURNAL` | **heaps-records half present** (`VICTORY_HEAP_SYNC_AT_SUBMIT=1`, `VICTORY_ASK_EARLY=2`); journal lock split not ported | our log already reports rounds asked at submit ("16.1 preparings found theirs asked earlier"). Splitting the journal into per-part locks is the remaining half. |
+
+So the measurable Series S presets are: `VICTORY_FAULT_UNLOCKED=1` (port #6's
+fault half, on now), the heap-sync rounds (port #7's first half), and port #1.
+The next real work is #2's loader hooks and #5's translation switch.
+
 ## Still to port from the other families
 
 These need the avatarmanz-lineage internals and are not in this tree:
