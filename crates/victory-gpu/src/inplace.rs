@@ -101,7 +101,7 @@ fn most() -> u64 {
 /// then, since the start: asks turned down because the memory is a view
 /// or not private memory committed whole, because the host refused,
 /// because of [`most`]; and what was let go because its memory changed.
-static STATS: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static STATS: [AtomicU64; 9] = [const { AtomicU64::new(0) }; 9];
 
 /// A buffer placed over title memory, and its heap.
 pub(crate) struct Placed {
@@ -130,6 +130,17 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
     Ok(Placed { buffer, heap, gpu, bias: start - at })
 }
 
+/// `VICTORY_INPLACE_TEXTURES=1` (off by default): windows that a descriptor
+/// slot shows as texture memory may be placed in place too. Off: such a window
+/// keeps its copy. The card reading a placed window sees title memory as it
+/// is, but a texture's own host copy over the same pages is refreshed by the
+/// title's writes on its schedule, not the card's reads; placing those pages
+/// showed shimmery, late textures (run-1, 2026-11-27).
+fn place_textures() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_INPLACE_TEXTURES").is_some_and(|v| v == "1"))
+}
+
 /// Title memory `[start, start + len)` in place, for a window outside
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
@@ -140,6 +151,12 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     // View memory: known from the runtime without asking Windows.
     if cover(start as usize, len as usize) != Cover::None {
         STATS[4].fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+    // Texture memory: a window a descriptor slot shows keeps its copy unless
+    // asked otherwise ([`place_textures`]).
+    if !place_textures() && shown_bytes(start as usize, len as usize).is_some() {
+        STATS[8].fetch_add(1, Ordering::Relaxed);
         return None;
     }
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
@@ -209,7 +226,7 @@ fn say() {
     let s: Vec<u64> = STATS.iter().map(|s| s.load(Ordering::Relaxed)).collect();
     tracing::info!(
         "title memory in place: {} windows {} MB, {} title buffers {} MB (no copy, no refresh, no copy-back); turned down: {} view memory or not private memory committed whole, \
-         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed",
+         {} refused by the host, {} over VICTORY_INPLACE_MB; {} let go because their memory changed; {} windows kept as copies because a descriptor slot shows them as texture memory (VICTORY_INPLACE_TEXTURES=1 places those too)",
         s[0],
         s[1] >> 20,
         s[2],
@@ -217,7 +234,8 @@ fn say() {
         s[4],
         s[5],
         s[6],
-        s[7]
+        s[7],
+        s[8]
     );
 }
 
