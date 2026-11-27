@@ -122,7 +122,8 @@ switch ($OneHome) {
     }
 }
 if ($OneHome -ne 'off' -and -not $More.ContainsKey('VICTORY_RELAY')) {
-    $settings.Remove('VICTORY_RELAY')
+    # shadow::relay() is on by default: 0 turns it off, removing it would not.
+    $settings.VICTORY_RELAY = '0'
     $settings.Remove('VICTORY_RELAY_COPY')
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
