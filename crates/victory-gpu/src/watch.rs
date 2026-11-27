@@ -119,7 +119,7 @@ pub(crate) fn track(start: usize, len: usize, views: bool) -> Option<Tracked> {
 }
 
 struct Journal {
-    /// Page number → the asking that last found it written.
+    /// Page number â†’ the asking that last found it written.
     written: BTreeMap<usize, u64>,
     /// The same for each of a page's sixteen parts ([`KERNEL_PAGE`]), where
     /// the parts are known ([`parts_on`]); a page that is not here was
@@ -972,6 +972,77 @@ impl Bits {
         }
         first < last
     }
+
+    /// Sets it if it was not set: whether it was not (renderer port #6: a
+    /// block's claim).
+    fn try_set(&self, block: usize) -> bool {
+        self.set_was(block) == Some(false)
+    }
+
+    /// Sets it; whether it was set before (`None`: out of the address space).
+    fn set_was(&self, block: usize) -> Option<bool> {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, SeqCst};
+        let word = block / 64;
+        let place = self.0.get(word / Bits::WORDS)?;
+        if place.load(Acquire).is_null() {
+            let piece: Box<BitsPiece> = Box::new([const { std::sync::atomic::AtomicU64::new(0) }; Bits::WORDS]);
+            let piece = Box::into_raw(piece);
+            if place.compare_exchange(std::ptr::null_mut(), piece, AcqRel, Acquire).is_err() {
+                // SAFETY: made just now, and another thread's is there.
+                drop(unsafe { Box::from_raw(piece) });
+            }
+        }
+        let bit = 1 << (block % 64);
+        self.piece(word).map(|piece| piece[word % Bits::WORDS].fetch_or(bit, SeqCst) & bit != 0)
+    }
+
+    /// Whether it was set; it is not now.
+    fn clear_was(&self, block: usize) -> bool {
+        let word = block / 64;
+        let bit = 1 << (block % 64);
+        self.piece(word)
+            .is_some_and(|piece| piece[word % Bits::WORDS].fetch_and(!bit, std::sync::atomic::Ordering::SeqCst) & bit != 0)
+    }
+
+    /// Those set of `[first, last)`, in order (`last` at most the address
+    /// space's end).
+    fn set_in(&self, first: usize, last: usize) -> impl Iterator<Item = usize> + '_ {
+        let last = last.min(Bits::PIECES * Bits::WORDS * 64).max(first);
+        let mut word = first / 64;
+        let end = last.div_ceil(64);
+        let mut bits = 0u64;
+        std::iter::from_fn(move || loop {
+            if bits != 0 {
+                let bit = bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                return Some((word - 1) * 64 + bit);
+            }
+            if word >= end {
+                return None;
+            }
+            match self.piece(word) {
+                Some(piece) => {
+                    bits = piece[word % Bits::WORDS].load(std::sync::atomic::Ordering::SeqCst) & in_word(word * 64, first, last);
+                    word += 1;
+                }
+                None => word = (word / Bits::WORDS + 1) * Bits::WORDS,
+            }
+        })
+    }
+
+    /// How many are set.
+    fn count(&self) -> usize {
+        let mut n = 0;
+        for piece in 0..Bits::PIECES {
+            let Some(piece) = (unsafe { self.0[piece].load(std::sync::atomic::Ordering::Acquire).as_ref() }) else {
+                continue;
+            };
+            for word in piece {
+                n += word.load(std::sync::atomic::Ordering::Relaxed).count_ones() as usize;
+            }
+        }
+        n
+    }
 }
 
 /// The blocks that are read-only by our hand, not written since, and of
@@ -1466,7 +1537,7 @@ pub(crate) fn asks() -> [u64; 13] {
 }
 
 /// The guards' lock, the wait for it counted.
-fn guards_timed() -> std::sync::MutexGuard<'static, Guards> {
+fn guards_timed() -> std::sync::RwLockWriteGuard<'static, Guards> {
     #[cfg(feature = "diagnostics")]
     let started = std::time::Instant::now();
     let g = guards();
@@ -1478,19 +1549,19 @@ fn guards_timed() -> std::sync::MutexGuard<'static, Guards> {
 /// A set of blocks, a bit each: a fault, or a look at a range of thousands of
 /// blocks, is a few words of it and no walk through a tree of every guarded
 /// block there is.
-struct Blocks(BTreeMap<usize, Box<[u64; Blocks::WORDS]>>);
+struct Blocks(Bits);
 
 impl Blocks {
-    /// The words of 4 GiB.
-    const WORDS: usize = 1 << 10;
-    const IN_PIECE: usize = Blocks::WORDS * 64;
+    /// The blocks of 4 GiB (a piece of [`Bits`]).
+    #[cfg(test)]
+    const IN_PIECE: usize = Bits::WORDS * 64;
 
     const fn new() -> Blocks {
-        Blocks(BTreeMap::new())
+        Blocks(Bits::new())
     }
 
     fn word(&self, word: usize) -> u64 {
-        self.0.get(&(word / Blocks::WORDS)).map_or(0, |piece| piece[word % Blocks::WORDS])
+        self.0.word(word)
     }
 
     fn contains(&self, block: usize) -> bool {
@@ -1498,26 +1569,16 @@ impl Blocks {
     }
 
     /// Whether it was not there.
-    fn insert(&mut self, block: usize) -> bool {
-        let piece = self.0.entry(block / Blocks::IN_PIECE).or_insert_with(|| Box::new([0; Blocks::WORDS]));
-        let word = &mut piece[block % Blocks::IN_PIECE / 64];
-        let was = *word;
-        *word |= 1 << (block % 64);
-        was != *word
+    fn insert(&self, block: usize) -> bool {
+        self.0.set_was(block) == Some(false)
     }
 
     /// Whether it was there.
-    fn remove(&mut self, block: usize) -> bool {
-        let Some(piece) = self.0.get_mut(&(block / Blocks::IN_PIECE)) else {
-            return false;
-        };
-        let word = &mut piece[block % Blocks::IN_PIECE / 64];
-        let was = *word;
-        *word &= !(1 << (block % 64));
-        was != *word
+    fn remove(&self, block: usize) -> bool {
+        self.0.clear_was(block)
     }
 
-    fn insert_all(&mut self, blocks: std::ops::Range<usize>) {
+    fn insert_all(&self, blocks: std::ops::Range<usize>) {
         for block in blocks {
             self.insert(block);
         }
@@ -1537,20 +1598,11 @@ impl Blocks {
             Bound::Unbounded => usize::MAX,
         }
         .max(first);
-        self.0.range(first / Blocks::IN_PIECE..=last / Blocks::IN_PIECE).flat_map(move |(&piece, words)| {
-            let base = piece * Blocks::IN_PIECE;
-            let from = first.max(base) - base;
-            let to = last.min(base + Blocks::IN_PIECE).saturating_sub(base);
-            let words = if from < to { &words[from / 64..to.div_ceil(64)] } else { &[][..] };
-            words.iter().enumerate().flat_map(move |(k, &bits)| {
-                let at = (from / 64 + k) * 64;
-                BitsOf(bits & in_word(at, from, to)).map(move |bit| base + at + bit)
-            })
-        })
+        self.0.set_in(first, last)
     }
 
     fn len(&self) -> usize {
-        self.0.values().flat_map(|piece| piece.iter()).map(|word| word.count_ones() as usize).sum()
+        self.0.count()
     }
 }
 
@@ -1686,8 +1738,10 @@ struct Guards {
     /// these are looked up.)
     aliased: Blocks,
     /// Blocks opened by a write fault, when ([`rest`]), and how long they
-    /// rest for being written again and again ([`hot`]; zero if not).
-    opened: std::collections::HashMap<usize, (std::time::Instant, std::time::Duration), std::hash::BuildHasherDefault<PageHash>>,
+    /// rest for being written again and again ([`hot`]; zero if not). Behind
+    /// a lock of its own: with renderer port #6 the guards are read shared and
+    /// a fault changes only its block's state.
+    opened: std::sync::Mutex<std::collections::HashMap<usize, (std::time::Instant, std::time::Duration), std::hash::BuildHasherDefault<PageHash>>>,
 }
 
 impl Guards {
@@ -1697,7 +1751,12 @@ impl Guards {
 
     /// Whether `block` is left open for now: the title has just written it.
     fn rests(&self, block: usize, rest: std::time::Duration) -> bool {
-        self.opened.get(&block).is_some_and(|&(at, hot)| at.elapsed() < rest.max(hot))
+        self.opened_map().get(&block).is_some_and(|&(at, hot)| at.elapsed() < rest.max(hot))
+    }
+
+    /// [`Guards::opened`], taken.
+    fn opened_map(&self) -> std::sync::MutexGuard<'_, std::collections::HashMap<usize, (std::time::Instant, std::time::Duration), std::hash::BuildHasherDefault<PageHash>>> {
+        self.opened.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     /// A write fault opened `block`.
@@ -1709,10 +1768,11 @@ impl Guards {
     /// found [`hot`].
     fn opened_at(&mut self, block: usize, at: std::time::Instant, hot: Option<std::time::Duration>) {
         const MANY: usize = 1 << 13;
-        if self.opened.len() >= MANY {
-            self.opened.retain(|_, (at, hot)| at.elapsed() < (*hot).max(std::time::Duration::from_millis(50)));
-            if self.opened.len() >= MANY {
-                self.opened.clear();
+        let mut opened = self.opened_map();
+        if opened.len() >= MANY {
+            opened.retain(|_, (at, hot)| at.elapsed() < (*hot).max(std::time::Duration::from_millis(50)));
+            if opened.len() >= MANY {
+                opened.clear();
             }
         }
         put_count(block).store(0, std::sync::atomic::Ordering::Relaxed);
@@ -1720,10 +1780,10 @@ impl Guards {
         // long now.
         let hot = hot
             .filter(|&keep| {
-                self.opened.get(&block).is_some_and(|&(before, rested)| at.saturating_duration_since(before) < rested.max(rest()) + keep)
+                opened.get(&block).is_some_and(|&(before, rested)| at.saturating_duration_since(before) < rested.max(rest()) + keep)
             })
             .unwrap_or_default();
-        self.opened.insert(block, (at, hot));
+        opened.insert(block, (at, hot));
     }
 
     /// `block`'s page is guarded together with its other views ([`ALIASED`]
@@ -1740,7 +1800,7 @@ impl Guards {
     }
 }
 
-static GUARDS: Mutex<Guards> = Mutex::new(Guards {
+static GUARDS: std::sync::RwLock<Guards> = std::sync::RwLock::new(Guards {
     protected: Blocks::new(),
     clean: Blocks::new(),
     absent: Blocks::new(),
@@ -1749,20 +1809,30 @@ static GUARDS: Mutex<Guards> = Mutex::new(Guards {
     kernel: Vec::new(),
     changing: Vec::new(),
     aliased: Blocks::new(),
-    opened: std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new()),
+    opened: std::sync::Mutex::new(std::collections::HashMap::with_hasher(std::hash::BuildHasherDefault::new())),
 });
 
-/// The guards' lock, with what faults opened without it settled first
+/// The guards, alone, with what faults opened without it settled first
 /// ([`settle`]).
-fn guards() -> std::sync::MutexGuard<'static, Guards> {
-    let mut g = match GUARDS.try_lock() {
+fn guards() -> std::sync::RwLockWriteGuard<'static, Guards> {
+    let mut g = match GUARDS.try_write() {
         Ok(g) => g,
         // (Held by this, whoever panicked with it: not to be asked for again.)
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
-        Err(std::sync::TryLockError::WouldBlock) => waited(3, || GUARDS.lock().unwrap_or_else(|e| e.into_inner())),
+        Err(std::sync::TryLockError::WouldBlock) => waited(3, || GUARDS.write().unwrap_or_else(|e| e.into_inner())),
     };
     settle(&mut g);
     g
+}
+
+/// The guards, read shared (renderer port #6, [`port_guard`]): what changes a
+/// block's state holds its claim ([`Claims`]) rather than the lock.
+fn guards_shared() -> std::sync::RwLockReadGuard<'static, Guards> {
+    match GUARDS.try_read() {
+        Ok(g) => g,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => waited(3, || GUARDS.read().unwrap_or_else(|e| e.into_inner())),
+    }
 }
 
 /// The 4 KiB pages of title memory that what shaders wrote was put into,
@@ -2905,7 +2975,7 @@ fn allocation_end(at: usize, inside: usize) -> usize {
 
 /// Tells what keeps track of what title memory shows; the guards, with no
 /// block of the range known unmapped.
-fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static, Guards> {
+fn title_memory_changed(at: usize, len: usize) -> std::sync::RwLockWriteGuard<'static, Guards> {
     // A placed texture there arrives, goes or changes with no descriptor
     // written.
     crate::descriptor::host::remapped(at, len);
@@ -2936,7 +3006,7 @@ fn title_memory_changed(at: usize, len: usize) -> std::sync::MutexGuard<'static,
     }
     // What the title wrote again and again there was another page ([`hot`]).
     if hot().is_some() || cfg!(test) {
-        g.opened.retain(|block, (_, hot)| hot.is_zero() || !range.contains(block));
+        g.opened_map().retain(|block, (_, hot)| hot.is_zero() || !range.contains(block));
     }
     g
 }
