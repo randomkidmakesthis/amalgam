@@ -210,6 +210,17 @@ pub(crate) enum EarlyDepth {
     Exports,
 }
 
+/// (Fox T) A program's tag: FNV-1a of its console code, as the inspect tool
+/// and `VICTORY_NAN_ORIGIN` name it.
+pub fn code_tag(code: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in code {
+        h ^= u64::from(b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
 /// [`EarlyDepth`] of a pixel program with `db_shader_control` and these
 /// outputs, with [`early_depth`] `on`. Pure, for testing.
 pub(crate) fn early_depth_of(db_shader_control: u32, outputs: &[container::SigElement], on: bool) -> EarlyDepth {

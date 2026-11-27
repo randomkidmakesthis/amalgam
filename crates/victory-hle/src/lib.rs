@@ -13,12 +13,6 @@
 
 mod host;
 mod image_watch;
-#[cfg(windows)]
-pub mod readback;
-#[cfg(windows)]
-pub mod chunkmeter;
-#[cfg(windows)]
-pub mod lockhook; // (coder H) F23 engine buffer lock hooks (VICTORY_LOCK_METER)
 #[cfg(all(windows, feature = "diagnostics"))]
 pub use victory_gpu::frame_phase;
 pub use victory_gpu::frames_begun;

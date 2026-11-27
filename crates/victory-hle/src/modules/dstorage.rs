@@ -1469,35 +1469,7 @@ extern "system" fn close(this: QueueRef) {
 /// Reads, inflates and/or unpacks, and writes one request.
 fn execute(request: &Request) -> Result<(), HRESULT> {
     let result = execute_inner(request);
-    // (coder G, VICTORY_LOAD_READ_METER) The load is done: its pages are guarded for the meter.
-    if result.is_ok() && victory_gpu::loadmeter::on() {
-        load_read_meter(request);
-    }
-    // (coder G, VICTORY_PAGE_KINDS) Into GPU-only pages or CPU-visible ones.
-    if result.is_ok() && super::pagekinds::on() {
-        let size = if request.options & (ZLIB | BCPACK) == 0 { request.source_size } else { request.destination_size } as usize;
-        if request.options & PAGE_DESTINATION != 0 {
-            let offset = (request.page_offset & 0xffff) as usize;
-            let pages = read_list(request.destination.cast(), offset, size);
-            super::pagekinds::written(&super::xmem::page_keys(&pages, offset, size), &super::xmem::shown_at(&pages, offset, size));
-        } else {
-            super::pagekinds::written(&[], &[(request.destination as usize, size)]);
-        }
-    }
     result
-}
-
-/// Where the title sees a completed request's bytes now (all views), for the load-read meter.
-fn load_read_meter(request: &Request) {
-    let size = if request.options & (ZLIB | BCPACK) == 0 { request.source_size } else { request.destination_size } as usize;
-    let shown = if request.options & PAGE_DESTINATION != 0 {
-        let offset = (request.page_offset & 0xffff) as usize;
-        let pages = read_list(request.destination.cast(), offset, size);
-        super::xmem::shown_at(&pages, offset, size)
-    } else {
-        vec![(request.destination as usize, size)]
-    };
-    victory_gpu::loadmeter::loaded(&shown, request.options, size);
 }
 
 fn execute_inner(request: &Request) -> Result<(), HRESULT> {

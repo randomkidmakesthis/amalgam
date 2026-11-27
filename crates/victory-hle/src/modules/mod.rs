@@ -41,9 +41,6 @@ pub mod xgamesave;
 pub mod xgameui;
 #[cfg(windows)]
 pub mod xmem;
-#[cfg(windows)]
-pub(crate) mod mapdefer;
-pub(crate) mod pagekinds; // (coder G) VICTORY_PAGE_KINDS (F24/F25)
 pub mod xnetworking;
 pub mod xpackage;
 pub mod xstore;

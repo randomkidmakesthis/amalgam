@@ -146,17 +146,6 @@ pub fn run(
     drop(original);
     victory_hle::runtime::set_main_image(image.base());
     victory_hle::runtime::set_image_path(image.base(), exe);
-    // (Fox port A) The title-code hooks of `VICTORY_READBACK_SET`,
-    // `VICTORY_READBACK_LOCKS`, `VICTORY_STREAM_METER`, `VICTORY_CHUNK_METER`,
-    // `VICTORY_CHUNK_COUNT` (all off unless asked for).
-    // SAFETY: the mapped title image, none of whose code has run yet.
-    #[cfg(windows)]
-    unsafe { victory_hle::readback::install(image.base()) };
-    // (Coder H, F23) `VICTORY_LOCK_METER`: after the read-back hooks (they
-    // own the unlock with VICTORY_READBACK_LOCKS=1).
-    // SAFETY: as above.
-    #[cfg(windows)]
-    unsafe { victory_hle::lockhook::install(image.base()) };
     println!(
         "mapped at      {:#x} (preferred {:#x})",
         image.base(),
