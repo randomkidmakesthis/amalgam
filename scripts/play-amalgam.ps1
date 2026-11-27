@@ -43,6 +43,7 @@ param(
     [string]$Cache = '',
     [string]$Data = '',
     [string]$Log = '',
+    [string]$Keys = '',
     [hashtable]$More = @{}
 )
 $repo = Split-Path $PSScriptRoot -Parent
@@ -117,6 +118,9 @@ switch ($OneHome) {
     }
 }
 foreach ($k in $More.Keys) { $settings[$k] = $More[$k] }
+# Unattended runs: <seconds>:<key> presses (0.2 s each), <from>-<to>:<key> holds.
+#   e.g. "5:Enter,7:Enter,80-300:w"
+if ($Keys) { $settings.VICTORY_KEYS = $Keys }
 $console = if ($SeriesS) { 'series-s' } else { 'series-x' }
 
 $victory = Join-Path $repo "target\$Build\victory.exe"

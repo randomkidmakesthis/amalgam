@@ -93,6 +93,38 @@ These need the avatarmanz-lineage internals and are not in this tree:
    (Dark-Victory's 8 GB preset): partially present (`CARD_BUFFERS_MB`), the rest
    are their launcher's; use `-More` for the ones this core reads.
 
+## The reference single-home implementation (sennecools/victory-fork, `combined`)
+
+The person who recommended the one-home fix ships it in
+[sennecools/victory-fork `combined`](https://github.com/sennecools/victory-fork/tree/combined)
+(fxceless lineage) as a **memory core**, not as placements:
+
+| Switch | What it does |
+|---|---|
+| `VICTORY_MEMORY_CORE=1` | title buffers and windows in private title memory are read/written by the card in place (a heap opened on the title's pages, one buffer per home); `VICTORY_INPLACE` is ignored |
+| `VICTORY_MEMORY_POOL=1` | title pages in 256 MiB chunks, each a section and a heap with one buffer over the whole chunk; placed textures over card-written pages are re-uploaded |
+| `VICTORY_MEMORY_OWN=1` | the memory handed to the title is a write-watched region below 128 GiB the core can place |
+| `VICTORY_MEMORY_DIRECTORY=1` | raw-address shaders (ray tracing) resolve pool pages |
+| `VICTORY_MEMORY_RELEASE_AT_END` (default on) | homes and placements let go before the process ends (their run leaked 3.4 GB commit without it) |
+
+Their design differs from our `INPLACE` in the two things that matter:
+
+1. **Texture freshness.** A placed page the card writes makes the placed
+   textures over it re-upload; our `INPLACE` had no such rule, which is why
+   textures shimmied under `-OneHome`. Amalgam now refuses to place windows
+   that a descriptor slot shows as texture memory (`VICTORY_INPLACE_TEXTURES=0`,
+   the default) — the safe half of their rule without their tracking.
+2. **Chunk-level homes + release at end.** Ours opens per-window heaps and
+   releases them when idle (`let_go_idle`), not before exit.
+
+Port plan if this is taken further: their `home.rs` (core policy) and
+`card_home.rs` (GPU-side homes) are ~2 000 lines against fxceless internals;
+adapting them means mapping `home.rs` onto our `shadow.rs`/`inplace.rs`
+placement book and adding the placed-texture invalidation to
+`descriptor/host.rs` (`placed_texture`) + `texture.rs` refresh. It is a
+multi-day port, not a copy.
+
+
 ## Build
 
 ```powershell
